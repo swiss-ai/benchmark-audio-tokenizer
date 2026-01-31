@@ -1,0 +1,38 @@
+torch==2.6.0
+
+# Core dependencies (should already be installed, but listed for compilation)
+# torch>=2.0.0
+# torchaudio>=2.0.0
+numpy<2.0.0
+scipy
+soundfile
+pyyaml
+huggingface_hub
+transformers
+
+einops==0.8.1
+einx==0.3.0
+# numpy==2.2.3
+omegaconf==2.3.0
+packaging==24.2
+safetensors==0.5.2
+# soundfile==0.12.1
+soxr==0.5.0.post1
+# torch==2.5.1
+# torchaudio==2.5.1
+tqdm==4.66.5
+transformers==4.46.2
+gradio==5.18.0
+
+# For running examples/notebooks
+datasets==2.21.0  # For loading ESB diagnostic dataset (and for using ffmpeg instead of torchcodec)
+matplotlib  # For visualization in notebooks
+ipykernel  # For Jupyter kernel
+
+
+# For running scipts/tokenizer-evaluation.py
+static_ffmpeg
+stempeg
+pesq
+pystoi
+museval
