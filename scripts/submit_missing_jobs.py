@@ -38,6 +38,7 @@ TOKENIZERS = [
     'cosyvoice2',
     'wavtokenizer',
     'glm4voice',
+    'bicodec'
 ]
 
 # Dataset configurations (shared with tokenizer_evaluation.py and generate_samples.py)

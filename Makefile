@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 
 # create all venvs (executed from NGC-24.11)
-venvs: neucodec cosyvoice2 xcodec2 wavtokenizer glm4voice
+venvs: neucodec cosyvoice2 xcodec2 wavtokenizer glm4voice bicodec
 
 
 
@@ -91,6 +91,22 @@ cosyvoice2:
 	source .venv-cosyvoice2/bin/activate && \
 	uv pip install --no-deps --no-build-isolation git+https://github.com/pytorch/audio.git@release/2.6 && \
 	uv pip install --no-deps -r requirements-cosyvoice2-subdeps.txt && \
+	python -c "import torch; print(f'PyTorch Version: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}'); import torchaudio; print(f'torchaudio Version: {torchaudio.__version__}')"
+
+# bicodec
+bicodec:
+	mv .venv-bicodec .venv-bicodec-old || true
+	rm -rf .venv-bicodec-old &
+
+	uv venv .venv-bicodec --system-site-packages
+
+	uv pip compile requirements-bicodec-topdeps.txt -o requirements-bicodec-subdeps.txt
+	sed -i '/^torch==/d' requirements-bicodec-subdeps.txt
+	sed -i '/^torchaudio==/d' requirements-bicodec-subdeps.txt
+
+	source .venv-bicodec/bin/activate && \
+	uv pip install --no-deps --no-build-isolation git+https://github.com/pytorch/audio.git@release/2.6 && \
+	uv pip install --no-deps -r requirements-bicodec-subdeps.txt && \
 	python -c "import torch; print(f'PyTorch Version: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}'); import torchaudio; print(f'torchaudio Version: {torchaudio.__version__}')"
 
 
