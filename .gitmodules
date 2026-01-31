@@ -35,3 +35,6 @@
 [submodule "src/repos/MiMo-Audio"]
 	path = src/repos/MiMo-Audio
 	url = https://github.com/XiaomiMiMo/MiMo-Audio.git
+[submodule "src/repos/Spark-TTS"]
+	path = src/repos/Spark-TTS
+	url = https://github.com/SparkAudio/Spark-TTS.git
