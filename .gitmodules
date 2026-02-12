@@ -35,3 +35,6 @@
 [submodule "src/repos/MiMo-Audio"]
 	path = src/repos/MiMo-Audio
 	url = https://github.com/XiaomiMiMo/MiMo-Audio.git
+[submodule "src/repos/FlexiCodec"]
+	path = src/repos/FlexiCodec
+	url = https://github.com/amphionspace/FlexiCodec.git
