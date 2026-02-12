@@ -5,7 +5,7 @@ mounts = [
     "/iopsstor",
     "/users/${USER}/benchmark-audio-tokenizer",
     "/users/${USER}/.edf",
-    "/users/${USER}/.local/bin/uv",
+    "/users/${USER}/miniconda3/bin/uv:/users/${USER}/.local/bin/uv",
     "/users/${USER}/.cache"
 ] 
 

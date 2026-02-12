@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 
 # create all venvs (executed from NGC-24.11)
-venvs: neucodec cosyvoice2 xcodec2 wavtokenizer glm4voice
+venvs: neucodec cosyvoice2 xcodec2 wavtokenizer glm4voice flexicodec
 
 
 
@@ -91,6 +91,22 @@ cosyvoice2:
 	source .venv-cosyvoice2/bin/activate && \
 	uv pip install --no-deps --no-build-isolation git+https://github.com/pytorch/audio.git@release/2.6 && \
 	uv pip install --no-deps -r requirements-cosyvoice2-subdeps.txt && \
+	python -c "import torch; print(f'PyTorch Version: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}'); import torchaudio; print(f'torchaudio Version: {torchaudio.__version__}')"
+
+# flexicodec
+flexicodec:
+	mv .venv-flexicodec .venv-flexicodec-old || true
+	rm -rf .venv-flexicodec-old &
+
+	uv venv .venv-flexicodec --system-site-packages
+
+	uv pip compile requirements-flexicodec-topdeps.txt -o requirements-flexicodec-subdeps.txt
+	sed -i '/^torch==/d' requirements-flexicodec-subdeps.txt
+	sed -i '/^torchaudio==/d' requirements-flexicodec-subdeps.txt
+
+	source .venv-flexicodec/bin/activate && \
+	uv pip install --no-deps --no-build-isolation git+https://github.com/pytorch/audio.git@release/2.6 && \
+	uv pip install --no-deps -r requirements-flexicodec-subdeps.txt && \
 	python -c "import torch; print(f'PyTorch Version: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}'); import torchaudio; print(f'torchaudio Version: {torchaudio.__version__}')"
 
 

@@ -33,11 +33,12 @@ project_root = script_dir.parent
 
 # Tokenizer configurations
 TOKENIZERS = [
-    'neucodec',
-    'xcodec2',
-    'cosyvoice2',
-    'wavtokenizer',
-    'glm4voice',
+    # 'neucodec',
+    # 'xcodec2',
+    # 'cosyvoice2',
+    # 'wavtokenizer',
+    # 'glm4voice',
+    'flexicodec'
 ]
 
 # Dataset configurations (shared with tokenizer_evaluation.py and generate_samples.py)

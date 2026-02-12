@@ -1,0 +1,23 @@
+numpy<=1.26.4
+transformers==4.48.0
+datasets==2.21.0
+
+modelscope
+huggingface
+huggingface_hub
+gradio
+funasr>=1.1.2
+
+easydict
+descript-audio-codec
+pyyaml
+
+matplotlib
+ipykernel 
+
+# For running scipts/tokenizer-evaluation.py
+static_ffmpeg
+stempeg
+pesq
+pystoi
+museval
