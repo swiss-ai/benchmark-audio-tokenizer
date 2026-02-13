@@ -37,8 +37,8 @@ LANGUAGE COVERAGE ANALYSIS
 ============================================================
 
 Total unique languages: 77
-Languages in all tokenizers: 74
-  Animal Sound Archive, NatureLM, Watkins, blues, bosnia-herzegovina, bulgaria, classical, country, croatia, denmark... (+64 more)
+Languages in all tokenizers: 71
+  blues, bosnia-herzegovina, bulgaria, classical, country, croatia, denmark, disco, estonia, finland... (+61 more)
 
 Languages only in COSYVOICE2: 2
   Xeno-canto, iNaturalist
@@ -47,7 +47,7 @@ NOTE: Overall comparisons include ALL languages for each tokenizer.
       This means the comparison may not be perfectly fair if
       the tokenizers were tested on different language sets.
       See 'common_languages_comparison.png' for a fair comparison
-      using only the 74 languages all tokenizers have.
+      using only the 71 languages all tokenizers have.
 
 ============================================================
 COSYVOICE2 SUMMARY STATISTICS
@@ -230,6 +230,66 @@ TOKENS PER SECOND:
   Std:  0.04
 
 ============================================================
+VARSTOK SUMMARY STATISTICS
+============================================================
+Total languages tested: 71
+Total samples: 6350
+
+------------------------------------------------------------
+METRIC STATISTICS
+------------------------------------------------------------
+
+MSE:
+  Mean: 0.0166
+  Std:  0.0105
+  Min:  0.0060
+  Max:  0.0543
+  Median: 0.0124
+
+SNR_DB:
+  Mean: 0.4506
+  Std:  0.6142
+  Min:  -0.5213
+  Max:  1.8342
+  Median: 0.2762
+
+SDR_DB:
+  Mean: 0.4148
+  Std:  0.6066
+  Min:  -0.5262
+  Max:  1.8233
+  Median: 0.2296
+
+PESQ:
+  Mean: 1.2850
+  Std:  0.1095
+  Min:  1.0616
+  Max:  1.5311
+  Median: 1.2902
+
+STOI:
+  Mean: 0.6457
+  Std:  0.1224
+  Min:  0.2279
+  Max:  0.7973
+  Median: 0.6797
+
+ESTOI:
+  Mean: 0.4465
+  Std:  0.1194
+  Min:  0.1248
+  Max:  0.6210
+  Median: 0.4797
+
+COMPRESSION RATIO:
+  Mean: 616.71
+  Std:  105.96
+
+TOKENS PER SECOND:
+  Mean: 27.90
+  Std:  2.28
+
+============================================================
 WAVTOKENIZER SUMMARY STATISTICS
 ============================================================
 Total languages tested: 74
@@ -358,6 +418,7 @@ MSE:
   COSYVOICE2: 0.0390
   GLM4VOICE: 0.0358
   NEUCODEC: 0.0288
+  VARSTOK: 0.0166
   WAVTOKENIZER: 0.0156
   XCODEC2: 0.0200
   Best: WAVTOKENIZER
@@ -366,6 +427,7 @@ SNR_DB:
   COSYVOICE2: -3.5932
   GLM4VOICE: -3.4505
   NEUCODEC: -1.8354
+  VARSTOK: 0.4506
   WAVTOKENIZER: 1.1432
   XCODEC2: 0.3285
   Best: WAVTOKENIZER
@@ -374,6 +436,7 @@ SDR_DB:
   COSYVOICE2: -3.7290
   GLM4VOICE: -3.6191
   NEUCODEC: -1.8964
+  VARSTOK: 0.4148
   WAVTOKENIZER: 1.0927
   XCODEC2: 0.3002
   Best: WAVTOKENIZER
@@ -382,6 +445,7 @@ PESQ:
   COSYVOICE2: 1.1443
   GLM4VOICE: 1.0698
   NEUCODEC: 1.6671
+  VARSTOK: 1.2850
   WAVTOKENIZER: 1.5577
   XCODEC2: 1.9075
   Best: XCODEC2
@@ -390,6 +454,7 @@ STOI:
   COSYVOICE2: 0.6332
   GLM4VOICE: 0.4751
   NEUCODEC: 0.7239
+  VARSTOK: 0.6457
   WAVTOKENIZER: 0.6906
   XCODEC2: 0.7656
   Best: XCODEC2
@@ -398,59 +463,66 @@ ESTOI:
   COSYVOICE2: 0.4542
   GLM4VOICE: 0.2590
   NEUCODEC: 0.5748
+  VARSTOK: 0.4465
   WAVTOKENIZER: 0.5123
   XCODEC2: 0.6277
   Best: XCODEC2
 
 ============================================================
-FAIR COMPARISON (Common Languages Only, n=74)
+FAIR COMPARISON (Common Languages Only, n=71)
 ============================================================
-Common languages: Animal Sound Archive, NatureLM, Watkins, blues, bosnia-herzegovina, bulgaria, classical, country, croatia, denmark... (+64 more)
+Common languages: blues, bosnia-herzegovina, bulgaria, classical, country, croatia, denmark, disco, estonia, finland... (+61 more)
 
 MSE:
-  COSYVOICE2: 0.0395
-  GLM4VOICE: 0.0356
-  NEUCODEC: 0.0288
-  WAVTOKENIZER: 0.0156
-  XCODEC2: 0.0198
+  COSYVOICE2: 0.0382
+  GLM4VOICE: 0.0339
+  NEUCODEC: 0.0272
+  VARSTOK: 0.0166
+  WAVTOKENIZER: 0.0141
+  XCODEC2: 0.0182
   Best: WAVTOKENIZER
 
 SNR_DB:
-  COSYVOICE2: -3.5730
-  GLM4VOICE: -3.4356
-  NEUCODEC: -1.8279
-  WAVTOKENIZER: 1.1432
-  XCODEC2: 0.3660
+  COSYVOICE2: -3.5955
+  GLM4VOICE: -3.4483
+  NEUCODEC: -1.8141
+  VARSTOK: 0.4506
+  WAVTOKENIZER: 1.2081
+  XCODEC2: 0.4705
   Best: WAVTOKENIZER
 
 SDR_DB:
-  COSYVOICE2: -3.6971
-  GLM4VOICE: -3.5950
-  NEUCODEC: -1.8881
-  WAVTOKENIZER: 1.0927
-  XCODEC2: 0.3390
+  COSYVOICE2: -3.7019
+  GLM4VOICE: -3.6012
+  NEUCODEC: -1.8727
+  VARSTOK: 0.4148
+  WAVTOKENIZER: 1.1455
+  XCODEC2: 0.4228
   Best: WAVTOKENIZER
 
 PESQ:
-  COSYVOICE2: 1.1443
-  GLM4VOICE: 1.0672
-  NEUCODEC: 1.6713
-  WAVTOKENIZER: 1.5577
-  XCODEC2: 1.9141
+  COSYVOICE2: 1.1441
+  GLM4VOICE: 1.0651
+  NEUCODEC: 1.6887
+  VARSTOK: 1.2850
+  WAVTOKENIZER: 1.5694
+  XCODEC2: 1.9389
   Best: XCODEC2
 
 STOI:
-  COSYVOICE2: 0.6332
-  GLM4VOICE: 0.4794
-  NEUCODEC: 0.7275
-  WAVTOKENIZER: 0.6906
-  XCODEC2: 0.7693
+  COSYVOICE2: 0.6516
+  GLM4VOICE: 0.4953
+  NEUCODEC: 0.7446
+  VARSTOK: 0.6457
+  WAVTOKENIZER: 0.7100
+  XCODEC2: 0.7869
   Best: XCODEC2
 
 ESTOI:
-  COSYVOICE2: 0.4542
-  GLM4VOICE: 0.2619
-  NEUCODEC: 0.5789
-  WAVTOKENIZER: 0.5123
-  XCODEC2: 0.6323
+  COSYVOICE2: 0.4697
+  GLM4VOICE: 0.2721
+  NEUCODEC: 0.5948
+  VARSTOK: 0.4465
+  WAVTOKENIZER: 0.5293
+  XCODEC2: 0.6493
   Best: XCODEC2

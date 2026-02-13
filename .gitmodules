@@ -35,3 +35,6 @@
 [submodule "src/repos/MiMo-Audio"]
 	path = src/repos/MiMo-Audio
 	url = https://github.com/XiaomiMiMo/MiMo-Audio.git
+[submodule "src/repos/FunResearch"]
+	path = src/repos/FunResearch
+	url = https://github.com/FunAudioLLM/FunResearch.git
