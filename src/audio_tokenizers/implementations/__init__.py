@@ -19,6 +19,7 @@ _TOKENIZER_IMPORTS = {
     'wavtokenizer': ('wavtokenizer', ['WavTokenizerWrapper']),
     'stepaudioeditx': ('stepaudioeditx', ['StepAudioEditXWrapper']),
     'mimoaudio': ('mimoaudio', ['MiMoAudioTokenizer']),
+    'varstok': ('varstok', ['VARSTokWrapper'])
 }
 
 # Try to import all tokenizers, but don't fail if dependencies are missing

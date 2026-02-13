@@ -1,0 +1,31 @@
+# torch
+# torchaudio
+
+numpy>=1.26.0,<2.0      
+scipy>=1.12.0           
+pandas>=2.2.0           
+matplotlib>=3.8.0       
+
+einops                 
+pyyaml>=6.0.1           
+huggingface_hub>=0.23.0
+soundfile               
+tensorboardX            
+
+transformers>=4.37.2
+encodec                 
+
+pytorch-lightning>=2.1.0
+jsonargparse[signatures]>=4.27.0
+
+fairseq
+torchcrepe
+librosa
+datasets>=2.14.0
+ipykernel
+
+static_ffmpeg
+stempeg
+pesq
+pystoi
+museval

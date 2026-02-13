@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 
 # create all venvs (executed from NGC-24.11)
-venvs: neucodec cosyvoice2 xcodec2 wavtokenizer glm4voice
+venvs: neucodec cosyvoice2 xcodec2 wavtokenizer glm4voice varstok
 
 
 
@@ -91,6 +91,22 @@ cosyvoice2:
 	source .venv-cosyvoice2/bin/activate && \
 	uv pip install --no-deps --no-build-isolation git+https://github.com/pytorch/audio.git@release/2.6 && \
 	uv pip install --no-deps -r requirements-cosyvoice2-subdeps.txt && \
+	python -c "import torch; print(f'PyTorch Version: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}'); import torchaudio; print(f'torchaudio Version: {torchaudio.__version__}')"
+
+# VARSTok
+varstok:
+	mv .venv-varstok .venv-varstok-old || true
+	rm -rf .venv-varstok-old &
+
+	uv venv .venv-varstok --system-site-packages
+
+	uv pip compile requirements-varstok-topdeps.txt -o requirements-varstok-subdeps.txt
+	sed -i '/^torch==/d' requirements-varstok-subdeps.txt
+	sed -i '/^torchaudio==/d' requirements-varstok-subdeps.txt
+
+	source .venv-varstok/bin/activate && \
+	uv pip install --no-deps --no-build-isolation git+https://github.com/pytorch/audio.git@release/2.6 && \
+	uv pip install --no-deps -r requirements-varstok-subdeps.txt && \
 	python -c "import torch; print(f'PyTorch Version: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}'); import torchaudio; print(f'torchaudio Version: {torchaudio.__version__}')"
 
 
