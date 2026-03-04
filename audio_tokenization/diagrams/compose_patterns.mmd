@@ -1,0 +1,36 @@
+---
+config:
+  flowchart:
+    padding: 24
+    nodeSpacing: 20
+    rankSpacing: 40
+---
+flowchart LR
+    PQ[("Parquet Cache<br/>audio_tokens · text_tokens<br/>source_id · clip_num")]
+    PQ --> SORT["Sort by<br/>source_id<br/>clip_num"]
+    SORT --> DETECT["Detect<br/>consecutive runs"]
+    DETECT --> SLIDE["Slide window<br/>window = len(pattern)<br/>full = run // window<br/>remainder = run % window"]
+
+    SLIDE --> APPLY["Apply patterns<br/>A → audio, T → text<br/>switch at A→T"]
+    SLIDE --> REM{"Remainder?"}
+
+    APPLY --> WRITE["pattern<br/>.bin/.idx"]
+    REM -- "2+" --> CASCADE["Cascade<br/>sub-patterns"] --> WRITE_C["sub-pattern<br/>.bin/.idx"]
+    REM -- "1" --> TRANSCRIBE["Single-clip<br/>fallback"] --> WRITE_T["transcribe<br/>.bin/.idx"]
+    REM -- "0" --> DONE["None"]
+
+    WRITE & WRITE_C & WRITE_T --> TRAIN(["Megatron-LM<br/>Training"])
+
+    classDef store fill:#fefce8,stroke:#e0d060,stroke-width:1.4px,color:#6b5c00
+    classDef process fill:#f0f7ff,stroke:#a3c4f3,stroke-width:1.4px,color:#1a3a5c
+    classDef decision fill:#faf5ff,stroke:#d4b8f0,stroke-width:1.4px,color:#3a1a5c
+    classDef output fill:#ecfdf5,stroke:#6ee7b7,stroke-width:1.4px,color:#065f46
+    classDef train fill:#ecfdf5,stroke:#34d399,stroke-width:2px,color:#065f46
+    classDef skip fill:#f9fafb,stroke:#d1d5db,stroke-width:1px,color:#9ca3af
+
+    class PQ store
+    class SORT,DETECT,SLIDE,APPLY,CASCADE,TRANSCRIBE process
+    class REM decision
+    class WRITE,WRITE_C,WRITE_T output
+    class TRAIN train
+    class DONE skip

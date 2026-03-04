@@ -303,12 +303,12 @@ Each Parquet row stores one clip:
 flowchart TD
     PQ[("Parquet Cache")] --> SORT["Sort clips by<br>source_id, clip_num"]
     SORT --> DETECT["Detect consecutive runs<br>(same source, sequential clip_num)"]
-    DETECT --> SLIDE["Slide window across each run<br>(window size = pattern length)"]
+    DETECT --> CHUNK["Chunk each run<br>(chunk size = pattern length)"]
 
-    SLIDE --> APPLY["Apply each pattern<br>to the window"]
+    CHUNK --> APPLY["Apply each pattern<br>to the chunk"]
     APPLY --> WRITE["Write to<br>pattern.bin/.idx"]
 
-    SLIDE --> REM{"Leftover clips?"}
+    CHUNK --> REM{"Leftover clips?"}
     REM -->|"2+ clips"| CASCADE["Cascade: truncated<br>sub-patterns"]
     REM -->|"1 clip"| TRANSCRIBE["Transcribe:<br>single-clip fallback"]
     REM -->|"0"| NONE["Nothing"]
@@ -342,12 +342,14 @@ A podcast episode with 9 clips, `--patterns ATAT TATA`:
 Source: podcast_ep42    →  one run of 9 clips: [c0, c1, c2, c3, c4, c5, c6, c7, c8]
 ```
 
-**Step 2 — Slide windows.** Pattern length = 4, so window size = 4:
+**Step 2 — Chunk the run.** Pattern length = 4, so chunk size = 4 (non-overlapping). The number of full chunks is `run_length // chunk` and the remainder is `run_length % chunk`:
 
 ```
-Window 1:  [c0, c1, c2, c3]
-Window 2:  [c4, c5, c6, c7]
-Remainder: [c8]              ← doesn't fill a window
+9 // 4 = 2 full chunks,  9 % 4 = 1 remainder clip
+
+Chunk 1:   [c0, c1, c2, c3]
+Chunk 2:   [c4, c5, c6, c7]
+Remainder: [c8]              ← doesn't fill a chunk
 ```
 
 **Step 3 — Apply patterns.** Each character maps a clip to a modality (`A` = audio tokens, `T` = text tokens). A `[switch]` token is inserted at every A-to-T transition:
@@ -371,7 +373,7 @@ TATA on [c0, c1, c2, c3]:
 For 2-3 leftover clips, **cascade sub-patterns** (truncated prefixes) handle them:
 
 ```
-Main patterns:     ATAT, TATA  (window=4)
+Main patterns:     ATAT, TATA  (chunk=4)
 Cascade (size 3):  ATA,  TAT   (first 3 chars)
 Cascade (size 2):  AT,   TA    (first 2 chars)
 Single-clip:       transcribe
