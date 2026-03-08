@@ -83,6 +83,36 @@ def parse_aishell_clip_id(clip_id: str) -> Tuple[str, int]:
     return source_id, clip_num
 
 
+def parse_legco_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse LegCo speech clip IDs.
+
+    Format: ``{recording_id}_{clip_num}`` with optional dedup suffix.
+    e.g. ``rIa-Qb8EYsA_123`` -> ``("rIa-Qb8EYsA", 123)``
+         ``rIa-Qb8EYsA_123-0`` -> ``("rIa-Qb8EYsA", 123)``
+    """
+    match = re.match(r"^(.+?)_(\d+)(?:-\d+)?$", clip_id)
+    if match is None:
+        raise ValueError(f"Cannot parse LegCo clip ID: {clip_id!r}")
+    source_id = match.group(1)
+    clip_num = int(match.group(2))
+    return source_id, clip_num
+
+
+def parse_coral_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse CoRal conversation clip IDs.
+
+    Format: ``{source_id}_{clip_num}`` with optional dedup suffix.
+    e.g. ``conv_07f9708fc0b8316a9dea85d473db112b_00005``
+      -> ``("conv_07f9708fc0b8316a9dea85d473db112b", 5)``
+    """
+    match = re.match(r"^(.+?)_(\d+)(?:-\d+)?$", clip_id)
+    if match is None:
+        raise ValueError(f"Cannot parse CoRal clip ID: {clip_id!r}")
+    source_id = match.group(1)
+    clip_num = int(match.group(2))
+    return source_id, clip_num
+
+
 def parse_generic_clip_id(clip_id: str) -> Tuple[str, int]:
     """Fallback parser: treats entire clip ID as source, clip_num=0."""
     return clip_id, 0
@@ -98,6 +128,8 @@ _PARSERS = {
     "wenetspeech": parse_wenetspeech_clip_id,
     "spc": parse_spc_clip_id,
     "aishell": parse_aishell_clip_id,
+    "legco": parse_legco_clip_id,
+    "coral": parse_coral_clip_id,
     "generic": parse_generic_clip_id,
 }
 
@@ -106,7 +138,8 @@ def get_clip_id_parser(name: str):
     """Look up a clip ID parser by name.
 
     Args:
-        name: One of ``"emilia"``, ``"peoples_speech"``, ``"wenetspeech"``, ``"spc"``, ``"aishell"``, ``"generic"``.
+        name: One of ``"emilia"``, ``"peoples_speech"``, ``"wenetspeech"``,
+            ``"spc"``, ``"aishell"``, ``"legco"``, ``"coral"``, ``"generic"``.
 
     Returns:
         Callable[[str], Tuple[str, int]]

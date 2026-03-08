@@ -40,6 +40,25 @@ from .data import build_cutset
 logger = logging.getLogger(__name__)
 
 
+def _normalize_batch(batch: dict, target_db: float) -> dict:
+    """Peak-normalize audio in a batch dict (works for all handler modes).
+
+    Matches WavTokenizer training: SOX ``norm`` to *target_db* dBFS.
+    """
+    from audio_tokenization.utils.prepare_data.common import normalize_batch_peak
+
+    if "audio" in batch:
+        # audio_only: keys are "audio" (B, T) and "audio_lens" (B,)
+        audio_lens = batch["audio_lens"].tolist()
+        batch["audio"] = normalize_batch_peak(batch["audio"], audio_lens, target_db)
+    elif "inputs" in batch:
+        # audio_text: keys are "inputs" (B, T) and "supervisions"
+        cuts = batch["supervisions"]["cut"]
+        audio_lens = [c.num_samples for c in cuts]
+        batch["inputs"] = normalize_batch_peak(batch["inputs"], audio_lens, target_db)
+    return batch
+
+
 # ---------------------------------------------------------------------------
 # Main tokenization loop (per-rank)
 # ---------------------------------------------------------------------------
@@ -220,9 +239,18 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     max_consecutive_errors = cfg.get("max_consecutive_errors", 50)
     _loop_error = None
 
+    normalize_rms_db = cfg.get("normalize_rms_db")
+    if normalize_rms_db is not None:
+        normalize_rms_db = float(normalize_rms_db)
+        logger.info(f"[rank {rank}] Peak normalization enabled: target {normalize_rms_db} dBFS")
+
     try:
         for batch in dataloader:
             try:
+                # Normalize audio volume before tokenization (all modes).
+                if normalize_rms_db is not None:
+                    batch = _normalize_batch(batch, normalize_rms_db)
+
                 batch_audio_secs = handler.process_batch(
                     batch, tokenizer, stats, target_sr, device,
                 )

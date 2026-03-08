@@ -42,22 +42,34 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import shutil
+import struct
 import time
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import polars as pl
-import torch
 from transformers import AutoTokenizer
 
 from audio_tokenization.utils.indexed_dataset.indexed_dataset_megatron import (
+    _INDEX_HEADER,
     DType,
     IndexedDatasetBuilder,
     get_bin_path,
     get_idx_path,
 )
 
+
+# ---------------------------------------------------------------------------
+# Module-level globals for fork-based sharing (set before Pool creation)
+# ---------------------------------------------------------------------------
+
+_shared_audio_arrow = None
+_shared_text_arrow = None
+_shared_run_starts = None
+_shared_run_lengths = None
 
 # ---------------------------------------------------------------------------
 # Core helpers
@@ -177,6 +189,249 @@ def _pattern_constants(pat: str) -> tuple[list[int], list[int], int]:
     t_pos = [i for i, c in enumerate(pat) if c == "T"]
     n_sw = sum(1 for i in range(1, len(pat)) if pat[i - 1] == "A" and pat[i] == "T")
     return a_pos, t_pos, n_sw
+
+
+# ---------------------------------------------------------------------------
+# Parallel helpers
+# ---------------------------------------------------------------------------
+
+
+def _partition_runs(
+    run_lengths: np.ndarray, num_workers: int,
+) -> list[tuple[int, int]]:
+    """Partition runs into balanced chunks by cumulative clip count.
+
+    Returns a list of (start_run, end_run) tuples — one per worker.
+    """
+    n_runs = len(run_lengths)
+    total_clips = int(run_lengths.sum())
+    clips_per_worker = total_clips // num_workers
+    cum_clips = np.cumsum(run_lengths)
+
+    boundaries = [0]
+    for w in range(1, num_workers):
+        target = w * clips_per_worker
+        idx = int(np.searchsorted(cum_clips, target))
+        boundaries.append(min(idx, n_runs))
+    boundaries.append(n_runs)
+
+    return [
+        (boundaries[w], boundaries[w + 1])
+        for w in range(num_workers)
+        if boundaries[w] < boundaries[w + 1]
+    ]
+
+
+def _process_run_chunk(
+    worker_id: int,
+    run_start: int,
+    run_end: int,
+    all_keys: list[str],
+    patterns_by_size: dict[int, list[str]],
+    sub_patterns_by_size: dict[int, list[str]],
+    min_window: int,
+    bos_id: int,
+    eos_id: int,
+    switch_id: int,
+    transcribe_id: int,
+    dtype: type,
+    tmp_dir: str,
+) -> dict[str, dict]:
+    """Process a contiguous range of runs; write shard .bin + sidecar .npy.
+
+    Reads Arrow / run arrays from module-level globals (inherited via fork COW).
+    Returns lightweight counters + shard path info — no large lists cross the
+    pickle boundary.
+    """
+    audio_arrow = _shared_audio_arrow
+    text_arrow = _shared_text_arrow
+    run_starts = _shared_run_starts
+    run_lengths_arr = _shared_run_lengths
+
+    # Open per-pattern builders writing to shard files
+    builders: dict[str, IndexedDatasetBuilder] = {}
+    counters: dict[str, dict[str, int]] = {}
+    for key in all_keys:
+        shard_prefix = f"{tmp_dir}/{key}_shard{worker_id:04d}"
+        builders[key] = IndexedDatasetBuilder(
+            get_bin_path(shard_prefix), dtype=dtype,
+        )
+        counters[key] = {"seqs": 0, "tokens": 0}
+
+    for r in range(run_start, run_end):
+        rs = int(run_starts[r])
+        rl = int(run_lengths_arr[r])
+
+        run_audio: list[list[int]] = audio_arrow[rs : rs + rl].to_pylist()
+        run_text: list[list[int]] = text_arrow[rs : rs + rl].to_pylist()
+
+        # --- main interleaved windows ---
+        for wsz, pats in patterns_by_size.items():
+            if rl < wsz:
+                continue
+            for w_start in range(0, rl - wsz + 1, wsz):
+                for pat in pats:
+                    seq: list[int] = [bos_id]
+                    prev: str | None = None
+                    for k, mode in enumerate(pat):
+                        if mode == "A":
+                            seq.extend(run_audio[w_start + k])
+                        else:
+                            if prev == "A":
+                                seq.append(switch_id)
+                            seq.extend(run_text[w_start + k])
+                        prev = mode
+                    seq.append(eos_id)
+
+                    builders[pat].add_item(seq)
+                    builders[pat].end_document()
+                    counters[pat]["seqs"] += 1
+                    counters[pat]["tokens"] += len(seq)
+
+        # --- cascade remainder ---
+        n_rem = rl % min_window
+        if n_rem >= 2:
+            sub_pats = sub_patterns_by_size.get(n_rem, [])
+            rem_off = rl - n_rem
+            for sp in sub_pats:
+                seq = [bos_id]
+                prev = None
+                for k, mode in enumerate(sp):
+                    if mode == "A":
+                        seq.extend(run_audio[rem_off + k])
+                    else:
+                        if prev == "A":
+                            seq.append(switch_id)
+                        seq.extend(run_text[rem_off + k])
+                    prev = mode
+                seq.append(eos_id)
+
+                builders[sp].add_item(seq)
+                builders[sp].end_document()
+                counters[sp]["seqs"] += 1
+                counters[sp]["tokens"] += len(seq)
+
+        elif n_rem == 1:
+            seq = [bos_id]
+            seq.extend(run_audio[-1])
+            seq.append(transcribe_id)
+            seq.extend(run_text[-1])
+            seq.append(eos_id)
+
+            builders[TR_KEY].add_item(seq)
+            builders[TR_KEY].end_document()
+            counters[TR_KEY]["seqs"] += 1
+            counters[TR_KEY]["tokens"] += len(seq)
+
+    # Save sidecar .npy files, close .bin (do NOT call finalize)
+    result: dict[str, dict] = {}
+    for key in all_keys:
+        b = builders[key]
+        b.data_file.close()
+        shard_prefix = f"{tmp_dir}/{key}_shard{worker_id:04d}"
+        np.save(f"{shard_prefix}_seqlens.npy", np.array(b.sequence_lengths, dtype=np.int32))
+        np.save(f"{shard_prefix}_docidx.npy", np.array(b.document_indices, dtype=np.int64))
+        result[key] = {
+            "seqs": counters[key]["seqs"],
+            "tokens": counters[key]["tokens"],
+            "shard_prefix": shard_prefix,
+        }
+
+    return result
+
+
+def _write_idx_file(
+    idx_path: str,
+    dtype: type,
+    sequence_lengths: np.ndarray,
+    document_indices: np.ndarray,
+) -> None:
+    """Write a Megatron .idx file from numpy arrays."""
+    itemsize = DType.size(dtype)
+    pointers = np.zeros(len(sequence_lengths), dtype=np.int64)
+    if len(sequence_lengths) > 0:
+        np.cumsum(sequence_lengths.astype(np.int64) * itemsize, out=pointers)
+        # shift right: pointers[i] = cumsum[i-1], pointers[0] = 0
+        pointers = np.roll(pointers, 1)
+        pointers[0] = 0
+
+    with open(idx_path, "wb") as f:
+        f.write(_INDEX_HEADER)
+        f.write(struct.pack("<Q", 1))  # version
+        f.write(struct.pack("<B", DType.code_from_dtype(dtype)))
+        f.write(struct.pack("<Q", len(sequence_lengths)))
+        f.write(struct.pack("<Q", len(document_indices)))
+        f.write(sequence_lengths.astype(np.int32).tobytes(order="C"))
+        f.write(pointers.tobytes(order="C"))
+        f.write(document_indices.astype(np.int64).tobytes(order="C"))
+
+
+def _merge_shards(
+    worker_results: list[dict[str, dict]],
+    all_keys: list[str],
+    output_dir: Path,
+    dtype: type,
+    tmp_dir: Path,
+) -> dict[str, dict[str, int]]:
+    """Concatenate shard .bin + sidecar .npy files into final output."""
+    counters: dict[str, dict[str, int]] = {k: {"seqs": 0, "tokens": 0} for k in all_keys}
+    copy_buf = 64 * 1024 * 1024  # 64 MB
+
+    for key in all_keys:
+        # Collect shard info in worker order
+        shard_prefixes: list[str] = []
+        for wr in worker_results:
+            info = wr[key]
+            counters[key]["seqs"] += info["seqs"]
+            counters[key]["tokens"] += info["tokens"]
+            if info["seqs"] > 0:
+                shard_prefixes.append(info["shard_prefix"])
+
+        if not shard_prefixes:
+            # No data for this key — write empty files
+            open(get_bin_path(str(output_dir / key)), "wb").close()
+            _write_idx_file(
+                get_idx_path(str(output_dir / key)),
+                dtype,
+                np.array([], dtype=np.int32),
+                np.array([0], dtype=np.int64),
+            )
+            continue
+
+        # Concatenate .bin shards
+        bin_path = get_bin_path(str(output_dir / key))
+        with open(bin_path, "wb") as out_f:
+            for sp in shard_prefixes:
+                src = get_bin_path(sp)
+                with open(src, "rb") as in_f:
+                    shutil.copyfileobj(in_f, out_f, copy_buf)
+
+        # Load and merge sidecar .npy files
+        all_seqlens: list[np.ndarray] = []
+        all_docidx: list[np.ndarray] = []
+        seq_offset = 0
+        for i, sp in enumerate(shard_prefixes):
+            sl = np.load(f"{sp}_seqlens.npy")
+            di = np.load(f"{sp}_docidx.npy")
+            all_seqlens.append(sl)
+            if i == 0:
+                all_docidx.append(di)
+            else:
+                # Drop leading 0, apply offset
+                all_docidx.append(di[1:] + seq_offset)
+            seq_offset += len(sl)
+
+        merged_seqlens = np.concatenate(all_seqlens)
+        merged_docidx = np.concatenate(all_docidx)
+
+        _write_idx_file(
+            get_idx_path(str(output_dir / key)),
+            dtype,
+            merged_seqlens,
+            merged_docidx,
+        )
+
+    return counters
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +762,13 @@ def main() -> None:
         action="store_true",
         help="Print per-pattern statistics without writing bin/idx files.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Parallel workers for building indexed datasets. "
+        "0 (default) = auto (cpu_count - 2), 1 = single-threaded.",
+    )
     args = parser.parse_args()
 
     parquet_dir = Path(args.parquet_dir)
@@ -554,7 +816,10 @@ def main() -> None:
     print(f"\nFound {len(parquet_files)} parquet files in {parquet_dir}")
 
     t0 = time.time()
-    df = pl.read_parquet(parquet_files)
+    df = pl.read_parquet(
+        parquet_files,
+        columns=["source_id", "clip_num", "audio_tokens", "text_tokens"],
+    )
     elapsed = time.time() - t0
     print(f"Loaded {len(df):,} clips in {elapsed:.1f}s")
 
@@ -586,113 +851,109 @@ def main() -> None:
     n_runs = len(run_starts)
     print(f"  {n_runs:,} runs")
 
-    # Extract token columns as flat lists-of-lists (one-time O(N))
-    audio_col: list[list[int]] = df["audio_tokens"].to_list()
-    text_col: list[list[int]] = df["text_tokens"].to_list()
+    # Cache metadata before releasing the DataFrame
+    n_clips = len(df)
+    n_sources = df["source_id"].n_unique()
+
+    # Keep token columns as PyArrow chunked arrays (~50 GB in compact
+    # binary buffers).  We batch-extract per run below instead of
+    # converting all 42M rows to Python lists (~200+ GB OOM).
+    import pyarrow as pa
+    _audio_raw = df["audio_tokens"].to_arrow()
+    _text_raw = df["text_tokens"].to_arrow()
+    audio_arrow = _audio_raw.combine_chunks() if isinstance(_audio_raw, pa.ChunkedArray) else _audio_raw
+    text_arrow = _text_raw.combine_chunks() if isinstance(_text_raw, pa.ChunkedArray) else _text_raw
+    del _audio_raw, _text_raw
+
+    # Free the polars DataFrame — token data lives in the Arrow arrays
+    del df
 
     # ------------------------------------------------------------------
-    # 5. Open builders: main + sub-patterns + transcribe
+    # 5. Collect all pattern keys
     # ------------------------------------------------------------------
     all_keys: list[str] = list(args.patterns)
     for subs in sub_patterns_by_size.values():
         all_keys.extend(subs)
     all_keys.append(TR_KEY)
 
-    builders: dict[str, IndexedDatasetBuilder] = {}
-    counters: dict[str, dict[str, int]] = {}
-    for key in all_keys:
-        builders[key] = IndexedDatasetBuilder(
-            get_bin_path(str(output_dir / key)), dtype=dtype
-        )
-        counters[key] = {"seqs": 0, "tokens": 0}
+    # ------------------------------------------------------------------
+    # 6. Determine worker count
+    # ------------------------------------------------------------------
+    num_workers = args.num_workers
+    if num_workers <= 0:
+        num_workers = max(1, multiprocessing.cpu_count() - 2)
+    print(f"\nUsing {num_workers} worker(s)")
 
     # ------------------------------------------------------------------
-    # 6. Iterate runs → windows + cascade + transcribe
+    # 7. Build indexed datasets (always via fork workers)
     # ------------------------------------------------------------------
-    t0 = time.time()
+    global _shared_audio_arrow, _shared_text_arrow
+    global _shared_run_starts, _shared_run_lengths
+    _shared_audio_arrow = audio_arrow
+    _shared_text_arrow = text_arrow
+    _shared_run_starts = run_starts
+    _shared_run_lengths = run_lengths
 
-    for r in range(n_runs):
-        rs = int(run_starts[r])
-        rl = int(run_lengths[r])
+    run_ranges = _partition_runs(run_lengths, num_workers)
+    actual_workers = len(run_ranges)
+    print(f"  Partitioned {n_runs:,} runs into {actual_workers} chunks")
 
-        # --- main interleaved windows ---
-        for wsz, pats in patterns_by_size.items():
-            if rl < wsz:
-                continue
-            for w_start in range(0, rl - wsz + 1, wsz):
-                for pat in pats:
-                    seq: list[int] = [bos_id]
-                    prev: str | None = None
-                    for k, mode in enumerate(pat):
-                        idx = rs + w_start + k
-                        if mode == "A":
-                            seq.extend(audio_col[idx])
-                        else:
-                            if prev == "A":
-                                seq.append(switch_id)
-                            seq.extend(text_col[idx])
-                        prev = mode
-                    seq.append(eos_id)
-
-                    builders[pat].add_item(
-                        torch.tensor(seq, dtype=torch.int64)
-                    )
-                    builders[pat].end_document()
-                    counters[pat]["seqs"] += 1
-                    counters[pat]["tokens"] += len(seq)
-
-        # --- cascade remainder ---
-        n_rem = rl % min_window
-        if n_rem >= 2:
-            sub_pats = sub_patterns_by_size.get(n_rem, [])
-            rem_start = rs + rl - n_rem
-            for sp in sub_pats:
-                seq = [bos_id]
-                prev = None
-                for k, mode in enumerate(sp):
-                    idx = rem_start + k
-                    if mode == "A":
-                        seq.extend(audio_col[idx])
-                    else:
-                        if prev == "A":
-                            seq.append(switch_id)
-                        seq.extend(text_col[idx])
-                    prev = mode
-                seq.append(eos_id)
-
-                builders[sp].add_item(
-                    torch.tensor(seq, dtype=torch.int64)
-                )
-                builders[sp].end_document()
-                counters[sp]["seqs"] += 1
-                counters[sp]["tokens"] += len(seq)
-
-        elif n_rem == 1:
-            idx = rs + rl - 1
-            seq = [bos_id]
-            seq.extend(audio_col[idx])
-            seq.append(transcribe_id)
-            seq.extend(text_col[idx])
-            seq.append(eos_id)
-
-            builders[TR_KEY].add_item(
-                torch.tensor(seq, dtype=torch.int64)
+    if actual_workers == 0:
+        # Empty input — write empty bin/idx for every key
+        counters: dict[str, dict[str, int]] = {}
+        for key in all_keys:
+            open(get_bin_path(str(output_dir / key)), "wb").close()
+            _write_idx_file(
+                get_idx_path(str(output_dir / key)),
+                dtype,
+                np.array([], dtype=np.int32),
+                np.array([0], dtype=np.int64),
             )
-            builders[TR_KEY].end_document()
-            counters[TR_KEY]["seqs"] += 1
-            counters[TR_KEY]["tokens"] += len(seq)
+            counters[key] = {"seqs": 0, "tokens": 0}
+    else:
+        tmp_dir = output_dir / "_tmp_shards"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        if r > 0 and r % 1_000_000 == 0:
-            elapsed = time.time() - t0
-            print(f"  {r:,}/{n_runs:,} runs ({elapsed:.1f}s)")
+        worker_args = [
+            (
+                wid,
+                rng[0],
+                rng[1],
+                all_keys,
+                patterns_by_size,
+                sub_patterns_by_size,
+                min_window,
+                bos_id,
+                eos_id,
+                switch_id,
+                transcribe_id,
+                dtype,
+                str(tmp_dir),
+            )
+            for wid, rng in enumerate(run_ranges)
+        ]
 
-    elapsed = time.time() - t0
-    print(f"\nProcessed {n_runs:,} runs in {elapsed:.1f}s")
+        t0 = time.time()
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(actual_workers) as pool:
+            worker_results = pool.starmap(_process_run_chunk, worker_args)
+        elapsed = time.time() - t0
+        print(f"\nWorkers finished in {elapsed:.1f}s")
+
+        t_merge = time.time()
+        counters = _merge_shards(worker_results, all_keys, output_dir, dtype, tmp_dir)
+        print(f"Merged shards in {time.time() - t_merge:.1f}s")
+
+        shutil.rmtree(tmp_dir)
+
+    _shared_audio_arrow = None
+    _shared_text_arrow = None
+    _shared_run_starts = None
+    _shared_run_lengths = None
 
     # ------------------------------------------------------------------
-    # 7. Finalize all builders + write metadata
+    # 8. Write metadata
     # ------------------------------------------------------------------
-    n_sources = df["source_id"].n_unique()
     metadata: dict = {
         "tokenizer_path": args.tokenizer_path,
         "parquet_dir": str(parquet_dir),
@@ -703,7 +964,7 @@ def main() -> None:
         "switch_id": switch_id,
         "transcribe_id": transcribe_id,
         "min_window_size": min_window,
-        "total_clips": len(df),
+        "total_clips": n_clips,
         "total_sources": n_sources,
         "patterns": {},
     }
@@ -713,8 +974,6 @@ def main() -> None:
         }
 
     for key in all_keys:
-        idx_path = get_idx_path(str(output_dir / key))
-        builders[key].finalize(idx_path)
         c = counters[key]
         metadata["patterns"][key] = {
             "window_size": len(key) if key != TR_KEY else 1,

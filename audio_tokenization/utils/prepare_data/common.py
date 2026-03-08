@@ -54,6 +54,60 @@ def make_text_tokenize_fn(tokenizer):
     return _tokenize_text
 
 
+def normalize_batch_peak(audios, audio_lens, target_db: float = -3.0):
+    """Peak-normalize each sample in a padded batch.
+
+    Matches WavTokenizer's training preprocessing: SOX ``norm`` to a target
+    peak dB below full scale.  Guarantees no clipping (peaks ≤ target_db dBFS).
+
+    Args:
+        audios: (B, T) float tensor on CPU.
+        audio_lens: list of int, original sample counts per item.
+        target_db: target peak in dBFS (default -3.0, matching WavTokenizer val).
+
+    Returns:
+        New tensor with each sample scaled so its peak matches *target_db* dBFS.
+        Near-silence (peak < -100 dB) is left unchanged.
+    """
+    target_peak = 10 ** (target_db / 20.0)
+    result = audios.clone()
+    for i, length in enumerate(audio_lens):
+        segment = result[i, :length]
+        peak = segment.abs().max().item()
+        if peak > 1e-10:  # skip near-silence
+            result[i, :length] = segment * (target_peak / peak)
+    return result
+
+
+def rms_db(cut) -> float:
+    """Compute RMS level in dB for a cut's audio.
+
+    Returns a finite float (closer to 0 = louder).  Silent audio returns
+    approximately -200 dB.
+    """
+    import numpy as np
+
+    audio = cut.load_audio()          # (channels, samples)
+    rms = float(np.sqrt(np.mean(audio ** 2)))
+    return 20.0 * np.log10(rms + 1e-10)
+
+
+def make_rms_filter(min_rms_db: float, stats=None):
+    """Return a filter function that rejects cuts quieter than *min_rms_db*.
+
+    Works both in eager loops (``if not filt(cut): continue``) and with
+    lazy CutSet chains (``cuts.filter(filt)``).
+    """
+    def _filt(cut) -> bool:
+        db = rms_db(cut)
+        if db < min_rms_db:
+            if stats is not None:
+                stats["skipped_quiet"] += 1
+            return False
+        return True
+    return _filt
+
+
 def to_mono(cut, mono_downmix=True, stats=None):
     """Convert a multi-channel cut to mono.
 
@@ -167,6 +221,7 @@ def build_shar_index_from_parts(
 ) -> tuple[Path, int]:
     """Build a merged ``shar_index.json`` from expected partition directories."""
     fields = defaultdict(list)
+    shar_root = shar_root.resolve()
 
     for part_dir in part_dirs:
         if not part_dir.is_dir():
@@ -182,11 +237,19 @@ def build_shar_index_from_parts(
         for p in sorted(part_dir.iterdir()):
             if not p.is_file() or p.name == success_marker_name:
                 continue
+            abs_p = p.resolve()
+            try:
+                index_path = str(abs_p.relative_to(shar_root))
+            except ValueError as e:
+                raise RuntimeError(
+                    f"Index entry is outside shar_root and cannot be made relative: {abs_p} "
+                    f"(shar_root={shar_root})"
+                ) from e
             field = p.name.split(".")[0]
             if field == "cuts" and p.suffix == ".gz":
-                fields["cuts"].append(str(p))
+                fields["cuts"].append(index_path)
             elif p.suffix in (".tar", ".gz"):
-                fields[field].append(str(p))
+                fields[field].append(index_path)
 
     if not fields.get("cuts"):
         raise FileNotFoundError(f"No Shar cuts found under {shar_root}")
@@ -245,8 +308,8 @@ def build_shar_index(
     """Build a merged ``shar_index.json`` from all ``worker_*`` directories.
 
     The index maps field names (``cuts``, ``recording``, ...) to sorted lists
-    of absolute file paths, so that ``CutSet.from_shar(fields=...)`` can load
-    all worker outputs as a single logical CutSet.
+    of SHAR-root-relative file paths (portable across root moves). Consumers
+    should resolve relative entries against the SHAR root before loading.
     """
     worker_dirs = [shar_root / worker_dir_fmt.format(wid) for wid in range(num_workers)]
     index_path, cuts_count = build_shar_index_from_parts(

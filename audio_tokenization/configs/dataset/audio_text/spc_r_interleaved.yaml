@@ -4,7 +4,7 @@ output_name: spc_r_interleaved
 clip_id_parser: spc
 
 shar_dir:
-  - /iopsstor/scratch/cscs/xyixuan/audio-datasets/spc_r_segmented_shar
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/spc_r_segmented
 shar_index_filename: shar_index.json
 
 # Filtering

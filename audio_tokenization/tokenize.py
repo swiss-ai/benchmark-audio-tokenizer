@@ -86,6 +86,8 @@ def main(cfg: DictConfig):
         "min_duration": cfg.dataset.get("min_duration"),
         "max_duration": cfg.dataset.get("max_duration"),
         "min_sample_rate": cfg.dataset.get("min_sample_rate", min_sample_rate),
+        "min_rms_db": cfg.dataset.get("min_rms_db"),
+        "normalize_rms_db": cfg.dataset.get("normalize_rms_db"),
         # Shar data (pre-built by prepare_hf_to_shar / prepare_wds_to_shar)
         "shar_dir": list(cfg.dataset.shar_dir) if isinstance(cfg.dataset.shar_dir, (list, ListConfig)) else cfg.dataset.shar_dir,
         "shar_index_filename": cfg.dataset.get("shar_index_filename", "shar_index.json"),

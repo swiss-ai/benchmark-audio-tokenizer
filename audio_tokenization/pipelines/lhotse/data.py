@@ -18,6 +18,32 @@ SHAR_INDEX_FILENAME = "shar_index.json"
 
 
 # ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_index_paths(shar_root: Path, fields: Dict[str, list]) -> Dict[str, list]:
+    """Resolve relative paths in shar_index fields against *shar_root*.
+
+    Absolute index entries are rejected to keep SHAR fully relocatable.
+    """
+    resolved: Dict[str, list] = {}
+    for field, paths in fields.items():
+        out = []
+        for p in paths:
+            pp = Path(p)
+            if pp.is_absolute():
+                raise ValueError(
+                    f"Absolute path in shar index is not allowed: {pp}. "
+                    f"Rebuild {shar_root / SHAR_INDEX_FILENAME} with relative paths."
+                )
+            pp = shar_root / pp
+            out.append(str(pp))
+        resolved[field] = out
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -54,6 +80,12 @@ def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int):
             return True
 
         cuts = cuts.filter(_dur_filter)
+
+    # Drop quiet audio (e.g. coral conversation at -30 dB reconstructs to silence).
+    min_rms_db = cfg.get("min_rms_db")
+    if min_rms_db is not None:
+        from audio_tokenization.utils.prepare_data.common import make_rms_filter
+        cuts = cuts.filter(make_rms_filter(float(min_rms_db)))
 
     return cuts
 
@@ -97,6 +129,7 @@ def _load_shar_cutset(cfg, rank, world_size=1):
                 fields = json.load(f).get("fields", {})
             if "cuts" not in fields:
                 raise ValueError(f"Shar index missing required 'cuts' field: {index_path}")
+            fields = _resolve_index_paths(shar_path, fields)
             logger.info(f"[rank {rank}] Loading Shar index from {index_path}")
         elif _shar_exists(sd):
             raise FileNotFoundError(
