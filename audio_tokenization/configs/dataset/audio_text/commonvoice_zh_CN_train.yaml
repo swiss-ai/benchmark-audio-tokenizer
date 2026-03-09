@@ -15,7 +15,7 @@ min_sample_rate: 16000
 
 # Dynamic bucketing sampler
 max_batch_duration: 1500.0
-num_buckets: 20
+num_buckets: 40
 bucket_buffer_size: 20000
 sampler_shuffle: true
 sampler_seed: 42

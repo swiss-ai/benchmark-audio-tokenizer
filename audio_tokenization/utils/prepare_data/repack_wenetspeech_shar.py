@@ -166,8 +166,15 @@ def main(argv=None):
     )
 
     # Build shar_index.json
-    index_cuts = sorted(str(p) for p in args.output_dir.glob("cuts.*.jsonl.gz"))
-    index_recs = sorted(str(p) for p in args.output_dir.glob("recording.*.tar"))
+    out_root = args.output_dir.resolve()
+    index_cuts = sorted(
+        str(p.resolve().relative_to(out_root))
+        for p in args.output_dir.glob("cuts.*.jsonl.gz")
+    )
+    index_recs = sorted(
+        str(p.resolve().relative_to(out_root))
+        for p in args.output_dir.glob("recording.*.tar")
+    )
     payload = {
         "version": 1,
         "fields": {

@@ -16,7 +16,7 @@ normalize_rms_db: -3           # peak normalize to -3 dBFS (matches WavTokenizer
 
 # Dynamic bucketing sampler
 max_batch_duration: 2000.0
-num_buckets: 20
+num_buckets: 40
 bucket_buffer_size: 20000
 sampler_shuffle: true
 sampler_seed: 42

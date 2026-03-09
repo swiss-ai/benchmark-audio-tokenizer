@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Convert interleaved-tokenization parquet files to Megatron indexed datasets (bin/idx).
+"""Fixed-window pattern-based interleaved indexed dataset builder.
 
 Groups consecutive clips from the same source and applies cross-clip interleaving
 patterns to produce one bin/idx pair per pattern.  Remainder clips that don't fill
@@ -10,31 +9,37 @@ as same-clip transcription sequences into ``transcribe.bin/.idx``.
 Pattern string rules:
   - Each character is 'A' (audio) or 'T' (text)
   - len(pattern) = window size (clips per sequence)
-  - A→T transition: insert <|speech_switch|> between audio_end and text tokens
-  - T→A transition: no extra token (audio_tokens start with <|audio_start|>)
+  - A→T transition: insert <|stt_continue|> between audio_end and text tokens
+  - T→A transition: insert <|tts_continue|> between text_end and audio tokens
   - A→A, T→T: no extra tokens
 
 Remainder cascade (example with --patterns ATAT TATA, window=4):
   - 3 clips left → ATA.bin + TAT.bin  (first 3 chars of each main pattern)
   - 2 clips left → AT.bin + TA.bin    (first 2 chars)
-  - 1 clip left  → transcribe.bin     [BOS, audio, speech_transcribe, text, EOS]
+  - 1 clip left  → transcribe.bin     [BOS, audio, stt_transcribe, text, EOS]
   - 0 clips left → nothing
+
+``--transcribe-ratio``: guarantee a minimum fraction of transcribe sequences
+by converting randomly-selected multi-clip runs to individual transcribe
+sequences (each clip becomes its own sequence, preserving all data).  Acts as
+a floor — if the natural ratio already meets the target, no conversion is done.
 
 Usage
 -----
     # Dry run — print statistics without writing any files
-    python -m audio_tokenization.utils.build_interleaved_indexed \
-        --parquet-dir /path/to/emilia_yodas_interleaved_dur2-200 \
-        --output-dir /path/to/emilia_yodas_indexed \
-        --tokenizer-path /path/to/apertus_emu3.5_wavtok \
-        --patterns ATAT TATA \
+    python -m audio_tokenization.utils.build_interleaved.pattern \\
+        --parquet-dir /path/to/emilia_yodas_interleaved_dur2-200 \\
+        --output-dir /path/to/emilia_yodas_indexed \\
+        --tokenizer-path /path/to/apertus_emu3.5_wavtok \\
+        --patterns ATAT TATA \\
+        --transcribe-ratio 0.5 \\
         --dry-run
 
     # Full run — build bin/idx files
-    python -m audio_tokenization.utils.build_interleaved_indexed \
-        --parquet-dir /path/to/emilia_yodas_interleaved_dur2-200 \
-        --output-dir /path/to/emilia_yodas_indexed \
-        --tokenizer-path /path/to/apertus_emu3.5_wavtok \
+    python -m audio_tokenization.utils.build_interleaved.pattern \\
+        --parquet-dir /path/to/emilia_yodas_interleaved_dur2-200 \\
+        --output-dir /path/to/emilia_yodas_indexed \\
+        --tokenizer-path /path/to/apertus_emu3.5_wavtok \\
         --patterns ATAT TATA
 """
 
@@ -44,23 +49,27 @@ import argparse
 import json
 import multiprocessing
 import shutil
-import struct
 import time
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import polars as pl
-from transformers import AutoTokenizer
 
-from audio_tokenization.utils.indexed_dataset.indexed_dataset_megatron import (
-    _INDEX_HEADER,
+from audio_tokenization.utils.build_interleaved.common import (
+    TR_KEY,
     DType,
     IndexedDatasetBuilder,
+    _detect_runs,
+    _merge_shards,
+    _partition_runs,
+    _write_idx_file,
+    compute_ratio_adjustment,
     get_bin_path,
     get_idx_path,
+    load_parquets,
+    load_token_ids,
+    prepare_arrow_and_runs,
 )
-
 
 # ---------------------------------------------------------------------------
 # Module-level globals for fork-based sharing (set before Pool creation)
@@ -70,12 +79,11 @@ _shared_audio_arrow = None
 _shared_text_arrow = None
 _shared_run_starts = None
 _shared_run_lengths = None
+_shared_transcribe_only_runs: set[int] = set()
 
 # ---------------------------------------------------------------------------
-# Core helpers
+# Pattern helpers
 # ---------------------------------------------------------------------------
-
-TR_KEY = "transcribe"
 
 
 def build_sequence(
@@ -84,7 +92,8 @@ def build_sequence(
     pattern: str,
     bos_id: int,
     eos_id: int,
-    switch_id: int,
+    stt_continue_id: int,
+    tts_continue_id: int,
 ) -> list[int]:
     """Build a token sequence from parallel audio/text token lists.
 
@@ -93,40 +102,23 @@ def build_sequence(
       A → audio_tokens[i]  (already includes [audio_start, ..., audio_end])
       T → text_tokens[i]
 
-    A ``<|speech_switch|>`` token is inserted at every A→T transition.
+    A ``<|stt_continue|>`` token is inserted at every A→T transition.
+    A ``<|tts_continue|>`` token is inserted at every T→A transition.
     """
     seq: list[int] = [bos_id]
     prev_mode: str | None = None
     for i, mode in enumerate(pattern):
         if mode == "A":
+            if prev_mode == "T":
+                seq.append(tts_continue_id)
             seq.extend(audio_tokens[i])
         else:  # T
             if prev_mode == "A":
-                seq.append(switch_id)
+                seq.append(stt_continue_id)
             seq.extend(text_tokens[i])
         prev_mode = mode
     seq.append(eos_id)
     return seq
-
-
-def find_consecutive_runs(sorted_clip_nums: list[int]) -> list[list[int]]:
-    """Split sorted clip numbers into runs of consecutive integers.
-
-    >>> find_consecutive_runs([3, 4, 5, 8, 9, 15])
-    [[3, 4, 5], [8, 9], [15]]
-    """
-    if not sorted_clip_nums:
-        return []
-    runs: list[list[int]] = []
-    current: list[int] = [sorted_clip_nums[0]]
-    for prev, cur in zip(sorted_clip_nums, sorted_clip_nums[1:]):
-        if cur == prev + 1:
-            current.append(cur)
-        else:
-            runs.append(current)
-            current = [cur]
-    runs.append(current)
-    return runs
 
 
 def group_patterns_by_size(patterns: list[str]) -> dict[int, list[str]]:
@@ -161,65 +153,22 @@ def derive_sub_patterns(
     return sub_pats
 
 
-def load_token_ids(tokenizer_path: str) -> tuple[int, int, int, int, int]:
-    """Load BOS, EOS, speech_switch, speech_transcribe IDs and vocab_size."""
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
+def _pattern_constants(pat: str) -> tuple[list[int], list[int], int, int]:
+    """Return (audio_positions, text_positions, n_at, n_ta) for a pattern.
 
-    bos_id = tokenizer.bos_token_id
-    eos_id = tokenizer.eos_token_id
-    switch_id = tokenizer.convert_tokens_to_ids("<|speech_switch|>")
-    transcribe_id = tokenizer.convert_tokens_to_ids("<|speech_transcribe|>")
-
-    assert bos_id is not None, "BOS token must be defined in tokenizer"
-    assert eos_id is not None, "EOS token must be defined in tokenizer"
-    assert switch_id != tokenizer.unk_token_id, (
-        "<|speech_switch|> not found in tokenizer"
-    )
-    assert transcribe_id != tokenizer.unk_token_id, (
-        "<|speech_transcribe|> not found in tokenizer"
-    )
-
-    vocab_size = len(tokenizer)
-    return bos_id, eos_id, switch_id, transcribe_id, vocab_size
-
-
-def _pattern_constants(pat: str) -> tuple[list[int], list[int], int]:
-    """Return (audio_positions, text_positions, n_switches) for a pattern."""
+    ``n_at`` = number of A→T transitions (each gets a ``<|stt_continue|>``).
+    ``n_ta`` = number of T→A transitions (each gets a ``<|tts_continue|>``).
+    """
     a_pos = [i for i, c in enumerate(pat) if c == "A"]
     t_pos = [i for i, c in enumerate(pat) if c == "T"]
-    n_sw = sum(1 for i in range(1, len(pat)) if pat[i - 1] == "A" and pat[i] == "T")
-    return a_pos, t_pos, n_sw
+    n_at = sum(1 for i in range(1, len(pat)) if pat[i - 1] == "A" and pat[i] == "T")
+    n_ta = sum(1 for i in range(1, len(pat)) if pat[i - 1] == "T" and pat[i] == "A")
+    return a_pos, t_pos, n_at, n_ta
 
 
 # ---------------------------------------------------------------------------
-# Parallel helpers
+# Worker function
 # ---------------------------------------------------------------------------
-
-
-def _partition_runs(
-    run_lengths: np.ndarray, num_workers: int,
-) -> list[tuple[int, int]]:
-    """Partition runs into balanced chunks by cumulative clip count.
-
-    Returns a list of (start_run, end_run) tuples — one per worker.
-    """
-    n_runs = len(run_lengths)
-    total_clips = int(run_lengths.sum())
-    clips_per_worker = total_clips // num_workers
-    cum_clips = np.cumsum(run_lengths)
-
-    boundaries = [0]
-    for w in range(1, num_workers):
-        target = w * clips_per_worker
-        idx = int(np.searchsorted(cum_clips, target))
-        boundaries.append(min(idx, n_runs))
-    boundaries.append(n_runs)
-
-    return [
-        (boundaries[w], boundaries[w + 1])
-        for w in range(num_workers)
-        if boundaries[w] < boundaries[w + 1]
-    ]
 
 
 def _process_run_chunk(
@@ -232,8 +181,9 @@ def _process_run_chunk(
     min_window: int,
     bos_id: int,
     eos_id: int,
-    switch_id: int,
-    transcribe_id: int,
+    stt_continue_id: int,
+    stt_transcribe_id: int,
+    tts_continue_id: int,
     dtype: type,
     tmp_dir: str,
 ) -> dict[str, dict]:
@@ -247,6 +197,7 @@ def _process_run_chunk(
     text_arrow = _shared_text_arrow
     run_starts = _shared_run_starts
     run_lengths_arr = _shared_run_lengths
+    transcribe_only_runs = _shared_transcribe_only_runs
 
     # Open per-pattern builders writing to shard files
     builders: dict[str, IndexedDatasetBuilder] = {}
@@ -265,6 +216,21 @@ def _process_run_chunk(
         run_audio: list[list[int]] = audio_arrow[rs : rs + rl].to_pylist()
         run_text: list[list[int]] = text_arrow[rs : rs + rl].to_pylist()
 
+        # Ratio-adjusted: convert entire run to individual transcribe seqs
+        if r in transcribe_only_runs:
+            for c in range(rl):
+                seq: list[int] = [bos_id]
+                seq.extend(run_audio[c])
+                seq.append(stt_transcribe_id)
+                seq.extend(run_text[c])
+                seq.append(eos_id)
+
+                builders[TR_KEY].add_item(seq)
+                builders[TR_KEY].end_document()
+                counters[TR_KEY]["seqs"] += 1
+                counters[TR_KEY]["tokens"] += len(seq)
+            continue
+
         # --- main interleaved windows ---
         for wsz, pats in patterns_by_size.items():
             if rl < wsz:
@@ -275,10 +241,12 @@ def _process_run_chunk(
                     prev: str | None = None
                     for k, mode in enumerate(pat):
                         if mode == "A":
+                            if prev == "T":
+                                seq.append(tts_continue_id)
                             seq.extend(run_audio[w_start + k])
                         else:
                             if prev == "A":
-                                seq.append(switch_id)
+                                seq.append(stt_continue_id)
                             seq.extend(run_text[w_start + k])
                         prev = mode
                     seq.append(eos_id)
@@ -298,10 +266,12 @@ def _process_run_chunk(
                 prev = None
                 for k, mode in enumerate(sp):
                     if mode == "A":
+                        if prev == "T":
+                            seq.append(tts_continue_id)
                         seq.extend(run_audio[rem_off + k])
                     else:
                         if prev == "A":
-                            seq.append(switch_id)
+                            seq.append(stt_continue_id)
                         seq.extend(run_text[rem_off + k])
                     prev = mode
                 seq.append(eos_id)
@@ -314,7 +284,7 @@ def _process_run_chunk(
         elif n_rem == 1:
             seq = [bos_id]
             seq.extend(run_audio[-1])
-            seq.append(transcribe_id)
+            seq.append(stt_transcribe_id)
             seq.extend(run_text[-1])
             seq.append(eos_id)
 
@@ -340,122 +310,42 @@ def _process_run_chunk(
     return result
 
 
-def _write_idx_file(
-    idx_path: str,
-    dtype: type,
-    sequence_lengths: np.ndarray,
-    document_indices: np.ndarray,
-) -> None:
-    """Write a Megatron .idx file from numpy arrays."""
-    itemsize = DType.size(dtype)
-    pointers = np.zeros(len(sequence_lengths), dtype=np.int64)
-    if len(sequence_lengths) > 0:
-        np.cumsum(sequence_lengths.astype(np.int64) * itemsize, out=pointers)
-        # shift right: pointers[i] = cumsum[i-1], pointers[0] = 0
-        pointers = np.roll(pointers, 1)
-        pointers[0] = 0
-
-    with open(idx_path, "wb") as f:
-        f.write(_INDEX_HEADER)
-        f.write(struct.pack("<Q", 1))  # version
-        f.write(struct.pack("<B", DType.code_from_dtype(dtype)))
-        f.write(struct.pack("<Q", len(sequence_lengths)))
-        f.write(struct.pack("<Q", len(document_indices)))
-        f.write(sequence_lengths.astype(np.int32).tobytes(order="C"))
-        f.write(pointers.tobytes(order="C"))
-        f.write(document_indices.astype(np.int64).tobytes(order="C"))
-
-
-def _merge_shards(
-    worker_results: list[dict[str, dict]],
-    all_keys: list[str],
-    output_dir: Path,
-    dtype: type,
-    tmp_dir: Path,
-) -> dict[str, dict[str, int]]:
-    """Concatenate shard .bin + sidecar .npy files into final output."""
-    counters: dict[str, dict[str, int]] = {k: {"seqs": 0, "tokens": 0} for k in all_keys}
-    copy_buf = 64 * 1024 * 1024  # 64 MB
-
-    for key in all_keys:
-        # Collect shard info in worker order
-        shard_prefixes: list[str] = []
-        for wr in worker_results:
-            info = wr[key]
-            counters[key]["seqs"] += info["seqs"]
-            counters[key]["tokens"] += info["tokens"]
-            if info["seqs"] > 0:
-                shard_prefixes.append(info["shard_prefix"])
-
-        if not shard_prefixes:
-            # No data for this key — write empty files
-            open(get_bin_path(str(output_dir / key)), "wb").close()
-            _write_idx_file(
-                get_idx_path(str(output_dir / key)),
-                dtype,
-                np.array([], dtype=np.int32),
-                np.array([0], dtype=np.int64),
-            )
-            continue
-
-        # Concatenate .bin shards
-        bin_path = get_bin_path(str(output_dir / key))
-        with open(bin_path, "wb") as out_f:
-            for sp in shard_prefixes:
-                src = get_bin_path(sp)
-                with open(src, "rb") as in_f:
-                    shutil.copyfileobj(in_f, out_f, copy_buf)
-
-        # Load and merge sidecar .npy files
-        all_seqlens: list[np.ndarray] = []
-        all_docidx: list[np.ndarray] = []
-        seq_offset = 0
-        for i, sp in enumerate(shard_prefixes):
-            sl = np.load(f"{sp}_seqlens.npy")
-            di = np.load(f"{sp}_docidx.npy")
-            all_seqlens.append(sl)
-            if i == 0:
-                all_docidx.append(di)
-            else:
-                # Drop leading 0, apply offset
-                all_docidx.append(di[1:] + seq_offset)
-            seq_offset += len(sl)
-
-        merged_seqlens = np.concatenate(all_seqlens)
-        merged_docidx = np.concatenate(all_docidx)
-
-        _write_idx_file(
-            get_idx_path(str(output_dir / key)),
-            dtype,
-            merged_seqlens,
-            merged_docidx,
-        )
-
-    return counters
-
-
 # ---------------------------------------------------------------------------
-# Vectorized run detection
+# Per-run stats for transcribe-ratio adjustment
 # ---------------------------------------------------------------------------
 
 
-def _detect_runs(df: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
-    """Sort by (source_id, clip_num) and detect consecutive-clip runs.
+def _compute_per_run_stats_pattern(
+    run_lengths: np.ndarray,
+    patterns_by_size: dict[int, list[str]],
+    min_window: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pre-pass: compute per-run interleaved and transcribe sequence counts.
 
-    A new run starts whenever the source changes **or** clip_num is not the
-    previous clip_num + 1.
+    Fully vectorized — O(n_patterns) numpy passes, no Python loop over runs.
 
-    Returns (sorted_df, run_starts, run_lengths) where *run_starts* and
-    *run_lengths* are 1-D int arrays indexing into the sorted dataframe.
+    Returns (il_per_run, tr_per_run) arrays of shape (n_runs,).
     """
-    df = df.sort(["source_id", "clip_num"])
-    is_new_run = (
-        (df["source_id"] != df["source_id"].shift(1))
-        | (df["clip_num"] != (df["clip_num"].shift(1) + 1))
-    ).fill_null(True)  # first row is always a run start
-    starts = np.where(is_new_run.to_numpy())[0]
-    lengths = np.diff(np.append(starts, len(df)))
-    return df, starts, lengths
+    rl = run_lengths  # alias for brevity
+    il_per_run = np.zeros(len(rl), dtype=np.int64)
+
+    # Main patterns: for each window size, runs with rl >= wsz contribute
+    for wsz, pats in patterns_by_size.items():
+        mask = rl >= wsz
+        il_per_run[mask] += (rl[mask] // wsz) * len(pats)
+
+    # Cascade sub-patterns from remainders
+    sub_patterns_by_size = derive_sub_patterns(
+        [p for pats in patterns_by_size.values() for p in pats], min_window,
+    )
+    n_rem = rl % min_window
+    for k, subs in sub_patterns_by_size.items():
+        il_per_run[n_rem == k] += len(subs)
+
+    # Transcribe: exactly 1-clip remainders
+    tr_per_run = (n_rem == 1).astype(np.int64)
+
+    return il_per_run, tr_per_run
 
 
 # ---------------------------------------------------------------------------
@@ -464,25 +354,29 @@ def _detect_runs(df: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray, np.ndarray
 
 
 def _dry_run(
-    df: pl.DataFrame,
+    df,
     patterns: list[str],
     patterns_by_size: dict[int, list[str]],
     min_window: int,
     sub_patterns_by_size: dict[int, list[str]],
     bos_id: int,
     eos_id: int,
-    switch_id: int,
-    transcribe_id: int,
+    stt_continue_id: int,
+    stt_transcribe_id: int,
+    tts_continue_id: int,
     dtype: type,
     parquet_dir: Path,
+    transcribe_ratio: float | None = None,
 ) -> None:
     """Compute and print per-pattern + cascade + transcribe statistics.
 
     Only materialises token *lengths* (integers), never the token lists
     themselves, so memory stays at ~2 GB instead of ~78 GB.
 
-    Saves a ``dry_run_stats.json`` to *parquet_dir* for later reference.
+    Saves a ``dry_run_stats.txt`` to *parquet_dir* for later reference.
     """
+    import polars as pl
+
     # 1. Compute list lengths, drop heavy list columns -----------------
     print("Computing token lengths (dropping raw tokens) ...")
     df = df.with_columns(
@@ -499,12 +393,29 @@ def _dry_run(
     n_runs = len(run_starts)
     print(f"  {n_runs:,} runs across {len(df):,} clips")
 
+    # 2b. Transcribe-ratio adjustment (pre-pass) ----------------------
+    transcribe_only_runs: set[int] = set()
+    if transcribe_ratio is not None:
+        print(f"\nComputing per-run stats for --transcribe-ratio {transcribe_ratio} ...")
+        t_pre = time.time()
+        il_per_run, tr_per_run = _compute_per_run_stats_pattern(
+            run_lengths, patterns_by_size, min_window,
+        )
+        print(f"  Pre-pass done in {time.time() - t_pre:.1f}s")
+        transcribe_only_runs = compute_ratio_adjustment(
+            il_per_run, tr_per_run, run_lengths, transcribe_ratio,
+        )
+        if transcribe_only_runs:
+            print(f"  Converting {len(transcribe_only_runs):,} runs to transcribe-only")
+        else:
+            print("  Natural ratio already meets target — no adjustment needed")
+
     # 3. Pre-compute constants for all patterns + sub-patterns ---------
     all_interleaved: list[str] = list(patterns)
     for subs in sub_patterns_by_size.values():
         all_interleaved.extend(subs)
 
-    pat_info: dict[str, tuple[list[int], list[int], int]] = {}
+    pat_info: dict[str, tuple[list[int], list[int], int, int]] = {}
     for pat in all_interleaved:
         pat_info[pat] = _pattern_constants(pat)
 
@@ -528,6 +439,19 @@ def _dry_run(
         run_a = audio_lens[rs : rs + rl]
         run_t = text_lens[rs : rs + rl]
 
+        # Ratio-adjusted: convert entire run to individual transcribe seqs
+        if r in transcribe_only_runs:
+            for c in range(rl):
+                a_val = int(run_a[c])
+                t_val = int(run_t[c])
+                sl_val = 3 + a_val + t_val  # BOS + stt_transcribe + EOS
+                tr_counter["seqs"] += 1
+                tr_counter["tokens"] += sl_val
+                tr_counter["audio_tokens"] += a_val
+                tr_counter["text_tokens"] += t_val
+                tr_seq_lens_parts.append(np.array([sl_val]))
+            continue
+
         # --- main interleaved windows ---
         for wsz, pats in patterns_by_size.items():
             if rl < wsz:
@@ -537,10 +461,10 @@ def _dry_run(
             a_mat = run_a[:u].reshape(n_win, wsz)
             t_mat = run_t[:u].reshape(n_win, wsz)
             for pat in pats:
-                a_pos, t_pos, n_sw = pat_info[pat]
+                a_pos, t_pos, n_at, n_ta = pat_info[pat]
                 a_sum = a_mat[:, a_pos].sum(axis=1)
                 t_sum = t_mat[:, t_pos].sum(axis=1)
-                per_win = np.int64(2 + n_sw) + a_sum + t_sum
+                per_win = np.int64(2 + n_at + n_ta) + a_sum + t_sum
                 counters[pat]["seqs"] += n_win
                 counters[pat]["tokens"] += int(per_win.sum())
                 counters[pat]["audio_tokens"] += int(a_sum.sum())
@@ -556,10 +480,10 @@ def _dry_run(
                 rem_a = run_a[rem_off : rem_off + n_rem].reshape(1, n_rem)
                 rem_t = run_t[rem_off : rem_off + n_rem].reshape(1, n_rem)
                 for sp in sub_pats:
-                    a_pos, t_pos, n_sw = pat_info[sp]
+                    a_pos, t_pos, n_at, n_ta = pat_info[sp]
                     a_s = rem_a[:, a_pos].sum(axis=1)
                     t_s = rem_t[:, t_pos].sum(axis=1)
-                    sl = np.int64(2 + n_sw) + a_s + t_s
+                    sl = np.int64(2 + n_at + n_ta) + a_s + t_s
                     counters[sp]["seqs"] += 1
                     counters[sp]["tokens"] += int(sl.sum())
                     counters[sp]["audio_tokens"] += int(a_s.sum())
@@ -670,6 +594,12 @@ def _dry_run(
     print(f"    Sequences:    {total_seqs:>14,}")
     print(f"    Tokens:       {total_toks:>14,}")
     print(f"    Est disk:     {total_bytes / 1e9:>13.2f} GB")
+    if total_seqs > 0:
+        actual_ratio = tr_counter["seqs"] / total_seqs
+        print(f"    Transcribe ratio: {actual_ratio:.4f} ({actual_ratio * 100:.2f}%)")
+        if transcribe_ratio is not None:
+            print(f"    Target ratio:     {transcribe_ratio:.4f} ({transcribe_ratio * 100:.2f}%)")
+            print(f"    Runs converted:   {len(transcribe_only_runs):,}")
     n_sources = df["source_id"].n_unique()
     print(f"\n  Sources: {n_sources:,}  |  Time: {elapsed:.1f}s")
     print("=" * 70)
@@ -731,7 +661,7 @@ def _dry_run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert interleaved parquet tokens to Megatron indexed datasets."
+        description="Convert interleaved parquet tokens to Megatron indexed datasets (pattern mode)."
     )
     parser.add_argument(
         "--parquet-dir",
@@ -763,6 +693,16 @@ def main() -> None:
         help="Print per-pattern statistics without writing bin/idx files.",
     )
     parser.add_argument(
+        "--transcribe-ratio",
+        type=float,
+        default=None,
+        help="Minimum fraction of transcribe sequences (e.g. 0.1 = 10%%). "
+        "If the natural ratio is already at or above the target, no "
+        "adjustment is made. Otherwise, multi-clip runs are randomly "
+        "converted to individual transcribe sequences until the target "
+        "is met.",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=0,
@@ -774,6 +714,10 @@ def main() -> None:
     parquet_dir = Path(args.parquet_dir)
     output_dir = Path(args.output_dir)
     dry_run = args.dry_run
+    transcribe_ratio: float | None = args.transcribe_ratio
+
+    if transcribe_ratio is not None and not (0.0 < transcribe_ratio < 1.0):
+        parser.error("--transcribe-ratio must be between 0 and 1 (exclusive).")
 
     # Validate patterns
     for p in args.patterns:
@@ -794,12 +738,13 @@ def main() -> None:
     # 1. Load tokenizer metadata
     # ------------------------------------------------------------------
     print(f"Loading tokenizer from {args.tokenizer_path} ...")
-    bos_id, eos_id, switch_id, transcribe_id, vocab_size = load_token_ids(
+    bos_id, eos_id, stt_continue_id, stt_transcribe_id, tts_continue_id, vocab_size = load_token_ids(
         args.tokenizer_path
     )
     print(
-        f"  bos_id={bos_id}  eos_id={eos_id}  switch_id={switch_id}  "
-        f"transcribe_id={transcribe_id}  vocab_size={vocab_size}"
+        f"  bos_id={bos_id}  eos_id={eos_id}  stt_continue_id={stt_continue_id}  "
+        f"stt_transcribe_id={stt_transcribe_id}  tts_continue_id={tts_continue_id}  "
+        f"vocab_size={vocab_size}"
     )
 
     dtype = DType.optimal_dtype(vocab_size)
@@ -808,20 +753,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Load all parquets
     # ------------------------------------------------------------------
-    parquet_files = sorted(
-        p
-        for p in parquet_dir.glob("rank_*_chunk_*.parquet")
-        if not p.name.endswith(".tmp")
-    )
-    print(f"\nFound {len(parquet_files)} parquet files in {parquet_dir}")
-
-    t0 = time.time()
-    df = pl.read_parquet(
-        parquet_files,
-        columns=["source_id", "clip_num", "audio_tokens", "text_tokens"],
-    )
-    elapsed = time.time() - t0
-    print(f"Loaded {len(df):,} clips in {elapsed:.1f}s")
+    df = load_parquets(parquet_dir)
 
     # ------------------------------------------------------------------
     # 3. Patterns + cascade sub-patterns
@@ -838,35 +770,39 @@ def main() -> None:
     if dry_run:
         _dry_run(
             df, args.patterns, patterns_by_size, min_window,
-            sub_patterns_by_size, bos_id, eos_id, switch_id,
-            transcribe_id, dtype, parquet_dir,
+            sub_patterns_by_size, bos_id, eos_id, stt_continue_id,
+            stt_transcribe_id, tts_continue_id, dtype, parquet_dir,
+            transcribe_ratio=transcribe_ratio,
         )
         return
 
     # ------------------------------------------------------------------
-    # 4. Vectorized run detection
+    # 4. Prepare Arrow arrays + run detection
     # ------------------------------------------------------------------
-    print("\nDetecting consecutive runs ...")
-    df, run_starts, run_lengths = _detect_runs(df)
-    n_runs = len(run_starts)
-    print(f"  {n_runs:,} runs")
-
-    # Cache metadata before releasing the DataFrame
-    n_clips = len(df)
-    n_sources = df["source_id"].n_unique()
-
-    # Keep token columns as PyArrow chunked arrays (~50 GB in compact
-    # binary buffers).  We batch-extract per run below instead of
-    # converting all 42M rows to Python lists (~200+ GB OOM).
-    import pyarrow as pa
-    _audio_raw = df["audio_tokens"].to_arrow()
-    _text_raw = df["text_tokens"].to_arrow()
-    audio_arrow = _audio_raw.combine_chunks() if isinstance(_audio_raw, pa.ChunkedArray) else _audio_raw
-    text_arrow = _text_raw.combine_chunks() if isinstance(_text_raw, pa.ChunkedArray) else _text_raw
-    del _audio_raw, _text_raw
-
-    # Free the polars DataFrame — token data lives in the Arrow arrays
+    audio_arrow, text_arrow, run_starts, run_lengths, n_clips, n_sources = (
+        prepare_arrow_and_runs(df)
+    )
     del df
+    n_runs = len(run_starts)
+
+    # ------------------------------------------------------------------
+    # 4b. Transcribe-ratio adjustment (if requested)
+    # ------------------------------------------------------------------
+    transcribe_only_runs: set[int] = set()
+    if transcribe_ratio is not None:
+        print(f"\nComputing per-run stats for --transcribe-ratio {transcribe_ratio} ...")
+        t_pre = time.time()
+        il_per_run, tr_per_run = _compute_per_run_stats_pattern(
+            run_lengths, patterns_by_size, min_window,
+        )
+        print(f"  Pre-pass done in {time.time() - t_pre:.1f}s")
+        transcribe_only_runs = compute_ratio_adjustment(
+            il_per_run, tr_per_run, run_lengths, transcribe_ratio,
+        )
+        if transcribe_only_runs:
+            print(f"  Converting {len(transcribe_only_runs):,} runs to transcribe-only")
+        else:
+            print("  Natural ratio already meets target — no adjustment needed")
 
     # ------------------------------------------------------------------
     # 5. Collect all pattern keys
@@ -889,10 +825,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     global _shared_audio_arrow, _shared_text_arrow
     global _shared_run_starts, _shared_run_lengths
+    global _shared_transcribe_only_runs
     _shared_audio_arrow = audio_arrow
     _shared_text_arrow = text_arrow
     _shared_run_starts = run_starts
     _shared_run_lengths = run_lengths
+    _shared_transcribe_only_runs = transcribe_only_runs
 
     run_ranges = _partition_runs(run_lengths, num_workers)
     actual_workers = len(run_ranges)
@@ -925,8 +863,9 @@ def main() -> None:
                 min_window,
                 bos_id,
                 eos_id,
-                switch_id,
-                transcribe_id,
+                stt_continue_id,
+                stt_transcribe_id,
+                tts_continue_id,
                 dtype,
                 str(tmp_dir),
             )
@@ -950,6 +889,7 @@ def main() -> None:
     _shared_text_arrow = None
     _shared_run_starts = None
     _shared_run_lengths = None
+    _shared_transcribe_only_runs = set()
 
     # ------------------------------------------------------------------
     # 8. Write metadata
@@ -961,9 +901,12 @@ def main() -> None:
         "dtype": dtype.__name__,
         "bos_id": bos_id,
         "eos_id": eos_id,
-        "switch_id": switch_id,
-        "transcribe_id": transcribe_id,
+        "stt_continue_id": stt_continue_id,
+        "stt_transcribe_id": stt_transcribe_id,
+        "tts_continue_id": tts_continue_id,
         "min_window_size": min_window,
+        "transcribe_ratio": transcribe_ratio,
+        "runs_converted_to_transcribe": len(transcribe_only_runs),
         "total_clips": n_clips,
         "total_sources": n_sources,
         "patterns": {},
