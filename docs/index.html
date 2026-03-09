@@ -1,0 +1,1132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Apertus Audio Stage 2 &mdash; Ablation Report (v2)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --brand: #4f6df5;
+    --brand-light: #eef1fe;
+    --brand-soft: #dbe1fc;
+    --teal: #0ea5a0;
+    --teal-light: #e6f7f6;
+    --amber: #d97706;
+    --amber-light: #fef9ec;
+    --purple: #8b5cf6;
+    --purple-light: #f3f0ff;
+    --rose: #e11d48;
+    --text: #334155;
+    --text-light: #64748b;
+    --text-muted: #94a3b8;
+    --bg: #f8fafc;
+    --card: #ffffff;
+    --border: #e2e8f0;
+    --border-light: #f1f5f9;
+    --radius: 16px;
+    --radius-sm: 10px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.03);
+    --shadow-md: 0 4px 16px rgba(0,0,0,0.06);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text);
+    padding: 40px 32px; max-width: 1440px; margin: 0 auto;
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+
+  /* Header */
+  .header {
+    text-align: center; margin-bottom: 40px; padding: 48px 32px;
+    background: linear-gradient(135deg, var(--brand-light) 0%, #f0e6ff 50%, var(--teal-light) 100%);
+    border-radius: var(--radius); border: 1px solid var(--border);
+  }
+  .header h1 {
+    font-size: 32px; font-weight: 700; color: var(--text);
+    margin-bottom: 8px; letter-spacing: -0.5px;
+  }
+  .header .subtitle {
+    color: var(--text-light); font-size: 16px; font-weight: 400;
+  }
+
+  /* Info cards */
+  .info-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 20px; margin-bottom: 32px;
+  }
+  .info-card {
+    background: var(--card); border-radius: var(--radius); padding: 24px;
+    border: 1px solid var(--border); transition: box-shadow 0.2s ease;
+  }
+  .info-card:hover { box-shadow: var(--shadow-md); }
+  .info-card .card-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 36px; height: 36px; border-radius: 10px; margin-bottom: 14px;
+    font-size: 18px;
+  }
+  .info-card .card-icon.setup { background: var(--brand-light); }
+  .info-card .card-icon.ckpt { background: var(--purple-light); }
+  .info-card .card-icon.task { background: var(--amber-light); }
+  .info-card h3 {
+    font-size: 15px; font-weight: 600; color: var(--text);
+    margin-bottom: 10px;
+  }
+  .info-card p { font-size: 13.5px; color: var(--text-light); line-height: 1.65; }
+  .info-card p + p { margin-top: 10px; }
+  .info-card code {
+    background: var(--border-light); padding: 2px 7px; border-radius: 5px;
+    font-size: 12px; font-weight: 500; color: var(--text);
+  }
+  .info-card strong { color: var(--text); font-weight: 600; }
+
+  /* Legend */
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 24px; margin-bottom: 28px;
+    background: var(--card); padding: 14px 24px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); font-size: 13px; align-items: center;
+    color: var(--text-light);
+  }
+  .legend strong { color: var(--text); }
+  .legend-item { display: flex; align-items: center; gap: 8px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .legend-dot.gt { background: var(--teal); }
+  .legend-dot.w0 { background: var(--purple); }
+  .legend-dot.w1 { background: var(--brand); }
+
+  /* Dataset tabs */
+  .tabs {
+    display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 0;
+    padding: 6px; background: var(--card); border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    border: 1px solid var(--border); border-bottom: none;
+  }
+  .tab {
+    padding: 9px 18px; background: transparent; border: none; cursor: pointer;
+    font-size: 13px; font-weight: 500; color: var(--text-light);
+    border-radius: 8px; transition: all 0.15s ease;
+    font-family: inherit;
+  }
+  .tab:hover { background: var(--border-light); color: var(--text); }
+  .tab.active {
+    background: var(--brand); color: #fff; font-weight: 600;
+    box-shadow: 0 2px 8px rgba(79,109,245,0.25);
+  }
+  .tab-content {
+    display: none; padding: 24px;
+    background: var(--card); border: 1px solid var(--border); border-top: none;
+    border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  }
+  .tab-content.active { display: block; }
+
+  /* Task sections */
+  .task-section { margin-bottom: 36px; }
+  .task-section:last-child { margin-bottom: 0; }
+  .task-header {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 16px;
+  }
+  .task-badge {
+    display: inline-block; padding: 5px 14px; border-radius: 20px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.8px;
+  }
+  .task-badge.transcribe { background: var(--teal-light); color: var(--teal); }
+  .task-badge.continue { background: var(--amber-light); color: var(--amber); }
+  .task-title { font-size: 17px; font-weight: 600; color: var(--text); }
+
+  /* Tables */
+  table {
+    border-collapse: separate; border-spacing: 0; width: 100%;
+    background: var(--card); border-radius: var(--radius-sm);
+    border: 1px solid var(--border); overflow: hidden;
+  }
+  thead th {
+    background: var(--border-light); color: var(--text);
+    padding: 12px 16px; text-align: left;
+    font-size: 11.5px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.6px;
+    border-bottom: 2px solid var(--border);
+  }
+  thead th.w0-col { color: var(--purple); }
+  thead th.w1-col { color: var(--brand); }
+  tbody td {
+    padding: 14px 16px; border-bottom: 1px solid var(--border-light);
+    font-size: 13.5px; vertical-align: top;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: #fafbff; }
+  .gt-text { color: var(--teal); }
+  .w0-text { color: var(--purple); }
+  .w1-text { color: var(--brand); }
+  .meta { color: var(--text-muted); font-size: 11px; margin-top: 4px; }
+  audio {
+    height: 34px; width: 200px; border-radius: 8px;
+  }
+  .sample-info { font-weight: 600; font-size: 14px; color: var(--text); }
+
+  /* Footer */
+  .footer {
+    text-align: center; margin-top: 48px; padding: 20px;
+    color: var(--text-muted); font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Apertus Audio Stage 2 &mdash; Ablation Report</h1>
+  <p class="subtitle">Qualitative evaluation of speech understanding across 6 multilingual benchmarks</p>
+</div>
+
+<div class="info-grid">
+  <div class="info-card">
+    <div class="card-icon setup">&#9881;</div>
+    <h3>Experiment Setup</h3>
+    <p>Both models are trained on the <strong>same 50/50 audio + text data mix</strong> (36.5 B audio tokens
+       interleaved with text data) for continued pretraining from the Apertus-1.5 8B Stage 1 checkpoint.
+       The only difference is whether the model <em>learns from</em> audio tokens or ignores them.</p>
+  </div>
+  <div class="info-card">
+    <div class="card-icon ckpt">&#9878;</div>
+    <h3>Checkpoints</h3>
+    <p><code>weight-0</code> &mdash; <strong>Audio loss weight = 0.</strong>
+       Audio data is present in the training mix, but the loss on audio tokens is zeroed out.
+       The model sees audio context but is not trained to predict audio tokens.</p>
+    <p><code>weight-1</code> &mdash; <strong>Audio loss weight = 1.</strong>
+       Standard training where the model learns from both audio and text tokens equally.
+       This is the full multimodal training objective.</p>
+  </div>
+  <div class="info-card">
+    <div class="card-icon task">&#9836;</div>
+    <h3>Tasks</h3>
+    <p><strong>Transcribe</strong> &mdash; Given an audio clip, the model produces a text transcription.
+       Prompt: <code>[audio] &lt;|stt_transcribe|&gt;</code>. Measures speech recognition quality.</p>
+    <p><strong>Continue</strong> &mdash; Given an audio clip, the model generates
+       a natural text continuation of what was said.
+       Prompt: <code>[audio] &lt;|stt_continue|&gt;</code>. Measures speech understanding and coherence.</p>
+  </div>
+</div>
+
+<div class="legend">
+  <strong>Legend:</strong>
+  <div class="legend-item"><div class="legend-dot gt"></div> Ground truth / transcription</div>
+  <div class="legend-item"><div class="legend-dot w0"></div> weight-0 prediction</div>
+  <div class="legend-item"><div class="legend-dot w1"></div> weight-1 prediction</div>
+</div>
+
+<div class="tabs">
+<button class="tab active" onclick="switchTab('fleurs_en_us')">FLEURS (English)</button>
+<button class="tab" onclick="switchTab('commonvoice_de')">CommonVoice (German)</button>
+<button class="tab" onclick="switchTab('commonvoice_fr')">CommonVoice (French)</button>
+<button class="tab" onclick="switchTab('eurospeech_uk')">EuroSpeech (Ukrainian)</button>
+<button class="tab" onclick="switchTab('aishell1_test')">AISHELL-1 (Mandarin)</button>
+<button class="tab" onclick="switchTab('spc_r_test')">SPC-R (Swiss German)</button>
+</div>
+<div class="tab-content active" id="tab-fleurs_en_us">
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge transcribe">transcribe</span>
+<span class="task-title">Speech-to-text transcription</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Ground Truth</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">14.28s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1082.wav"></audio></td>
+<td class="gt-text">it can be made very thin and stuck onto other metal it can be made so thin that it was sometimes used to decorate the hand-painted pictures in books called illuminated manuscripts</td>
+<td><span class="w0-text">It can be made very thin and stuck onto other metal; it can be made so thin that it was sometimes used to decorate the hand-painted pictures in books called illuminated manuscripts.&lt;/s&gt;</span><div class="meta">4.7s</div></td>
+<td><span class="w1-text">It can be made very thin and stuck onto other metal, it can be made so thin that it was sometimes used to decorate the hand-painted pictures and books called illuminated manuscripts.&lt;/s&gt;</span><div class="meta">4.58s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">14.04s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1142.wav"></audio></td>
+<td class="gt-text">we will endeavour to cut carbon dioxide emissions per unit of gdp by a notable margin by 2020 from the 2005 level hu said</td>
+<td><span class="w0-text">We will endeavour to cut carbon dioxide emissions per unit of GDP by a notable margin by 2020 from the 2005 level, he said.&lt;/s&gt;</span><div class="meta">2.24s</div></td>
+<td><span class="w1-text">We were endeavoured to cut carbon dioxide emissions per unit of GDP by a notable margin by twenty twenty from the two thousand five level. He said.&lt;/s&gt;</span><div class="meta">1.58s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">14.4s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1155.wav"></audio></td>
+<td class="gt-text">examples include control planning and scheduling the ability to answer customer diagnoses and questions as well as handwriting recognition voice and face</td>
+<td><span class="w0-text">examples include control, planning, and scheduling, ability to answer customers&#x27; diagnosis and questions, as well as handwriting recognition, voice, and face.&lt;/s&gt;</span><div class="meta">1.71s</div></td>
+<td><span class="w1-text">Examples include control, planning, scheduling, ability to add subscribers, and notices, and questions, as well as handwritten or handwriting recognition voice and things.&lt;/s&gt;</span><div class="meta">1.84s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">15.54s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1241.wav"></audio></td>
+<td class="gt-text">summits include breath-taking views from peaks climbers from all parts of the world are continually establishing new routes amongst its endless potential of walls</td>
+<td><span class="w0-text">Summers include breathtaking views from peaks, climbers from all parts of the world are continually establishing new routes, amongst its endless potential of walls.&lt;/s&gt;</span><div class="meta">2.5s</div></td>
+<td><span class="w1-text">Some of its include breakfasting views from peaks, climbers from all parts of the world, are continually establishing new routes, amongst its penless potential of walls.&lt;/s&gt;</span><div class="meta">2.36s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">16.02s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1372.wav"></audio></td>
+<td class="gt-text">its status declined during the twelfth century mainly due to the fact that crusaders had returned bearing gifts such as silks and spices that were valued more than what byzantine markets offered</td>
+<td><span class="w0-text">the set is declined during the twelfth century mainly due to the fact that crusaders had returned bearing gifts such as silks and spices that were valued more than what byzantine markets offered&lt;/s&gt;</span><div class="meta">2.68s</div></td>
+<td><span class="w1-text">The status declined during the Toxentry, mainly due to the fact that crusaders had returned bearing gifts such as silks and spices that were valued more than what Byzantine markets offered.&lt;/s&gt;</span><div class="meta">2.52s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">6</span><div class="meta">13.98s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_373.wav"></audio></td>
+<td class="gt-text">other scientists argue that these plants are very poisonous so it is unlikely that any dinosaur ate them even though today the sloth and other animals like the parrot a descendant of the dinosaurs can eat poisonous leaves or fruit</td>
+<td><span class="w0-text">Other scientists argue that these plants are very poisonous so it is unlikely that any dinosaurs ate them. Even though today the sloth and other animals like the parrot, the cinnamon of the dinosaurs, can eat poisonous leaves and fruit.&lt;/s&gt;</span><div class="meta">2.87s</div></td>
+<td><span class="w1-text">other sides are argued that these plants are very poisonous so it is unlikely that any dinosaur ate them even though today the sloth and other animals like the parrot and the cinnamon of the dinosaurs can eat poisonous leaves and fruit&lt;/s&gt;</span><div class="meta">2.47s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">7</span><div class="meta">15.3s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_46.wav"></audio></td>
+<td class="gt-text">on september 24 1759 arthur guinness signed a 9,000 year lease for the st james&#x27; gate brewery in dublin ireland</td>
+<td><span class="w0-text">October twenty-fourth seventeen fifty nine arthur ginnis signed a nine thousand year lease for the st james gate brewery in dublin&lt;/s&gt;</span><div class="meta">1.65s</div></td>
+<td><span class="w1-text">On September 24, 1753, Arthur Guinness signed a nine-thousand-year lease for the same James Gate brewery in Dublin, Ireland.&lt;/s&gt;</span><div class="meta">1.72s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">8</span><div class="meta">13.92s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_521.wav"></audio></td>
+<td class="gt-text">some people believe that experiencing many artificially induced lucid dreams often enough can be very exhausting</td>
+<td><span class="w0-text">some people believe that the sprays in many of the official and useful lucid dreams offer the nerve and the very exhausting&lt;/s&gt;</span><div class="meta">1.43s</div></td>
+<td><span class="w1-text">Some people believe that this proves him to be a fictional and useless leader, or a very excellent&lt;/s&gt;</span><div class="meta">1.0s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">9</span><div class="meta">14.46s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_761.wav"></audio></td>
+<td class="gt-text">joining such a network usually just requires filling out an online form although some networks offer or require additional verification</td>
+<td><span class="w0-text">Joining such a network usually just requires filling out an online form, although some networks offer or require additional verification.&lt;/s&gt;</span><div class="meta">1.31s</div></td>
+<td><span class="w1-text">Joining such an effort usually just requires filling out an online form, other subnetworks offer or require additional verification.&lt;/s&gt;</span><div class="meta">1.25s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">10</span><div class="meta">14.16s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_781.wav"></audio></td>
+<td class="gt-text">this gives resolution almost four times that of a 35 mm negative 3136 mm2 versus 864</td>
+<td><span class="w0-text">The scale&#x27;s resolution, almost four times that of a thirty-five millimeter negative, three thousand one hundred thirty six millimeter square versus eight hundred sixty four.&lt;/s&gt;</span><div class="meta">1.79s</div></td>
+<td><span class="w1-text">The skills resolution almost four times that of a thirty-five millimeter negative, three thousand one hundred thirty-six millimeters squared versus eight hundred sixty-four.&lt;/s&gt;</span><div class="meta">1.56s</div></td>
+</tr>
+</tbody></table>
+</div>
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge continue">continue</span>
+<span class="task-title">Text continuation from speech</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Transcription</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">14.28s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1082.wav"></audio></td>
+<td class="gt-text">it can be made very thin and stuck onto other metal it can be made so thin that it was sometimes used to decorate the hand-painted pictures in books called illuminated manuscripts</td>
+<td><span class="w0-text">The book was published in 1974 and is still in print.&lt;/s&gt;</span><div class="meta">3.78s</div></td>
+<td><span class="w1-text">The first thing to do is to create a new document.&lt;/s&gt;</span><div class="meta">3.38s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">14.04s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1142.wav"></audio></td>
+<td class="gt-text">we will endeavour to cut carbon dioxide emissions per unit of gdp by a notable margin by 2020 from the 2005 level hu said</td>
+<td><span class="w0-text">We will endeavour to cut carbon dioxide emissions per unit of GDP by a notable margin by 2020 from the 2005 level.&lt;/s&gt;</span><div class="meta">1.77s</div></td>
+<td><span class="w1-text">The United States is the world&#x27;s largest producer of natural gas, and the largest exporter of liquefied natural gas.&lt;/s&gt;</span><div class="meta">1.51s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">14.4s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1155.wav"></audio></td>
+<td class="gt-text">examples include control planning and scheduling the ability to answer customer diagnoses and questions as well as handwriting recognition voice and face</td>
+<td><span class="w0-text">The ability to have customers diagnose and fix problems themselves is a key differentiator for the company.&lt;/s&gt;</span><div class="meta">1.05s</div></td>
+<td><span class="w1-text">The first is the use of the word, and. The second is the use of the word, but. The third is the use of the word, and. The fourth is the use of the word, and. The fifth is the use of the word, and. The sixth is the use of the word, and. The seventh is the use of the word, and. The eighth is the use of the word, and. The ninth is the use of the word, and. The tenth is the use of the word, and. The eleventh is the use of the word, and. The twelfth is the use of the word, and. The thirteenth is the use of the word, and. The fourteenth is the use of the word, and. The fifteenth is the use of the word, and. The sixteenth is the use of the word, and. The seventeenth is the use of the word, and. The eighteenth is the use of the word, and. The nineteenth is the use of the word, and. The twentieth is the use of the word, and. The twenty-first is the use of the word, and. The twenty-second is the use of the word, and. The twenty-third is the use of the word, and. The twenty-fourth is the use of the word, and. The twenty-fifth is the use of the word, and. The twenty-sixth is the use of the word, and. The twenty-seventh is the use of the word, and. The twenty-eighth is the use of the word, and. The twenty-ninth is the use of the word, and. The thirtieth is the use of the word, and. The thirty-first is the use of the word, and. The thirty-second is the use of the word, and. The thirty-third is the use of the word, and. The thirty-fourth is the use of the word, and. The thirty-fifth is the use of the word, and. The thirty-sixth is the use of the word, and. The thirty-seventh is the use of the word, and. The thirty-eighth is the use of the word, and. The thirty-ninth is the use of the word, and. The forty-tenth is the use of the word, and. The forty-first is the use of the word, and. The forty-second is the use of the word, and. The forty-third is the use of the word, and. The</span><div class="meta">27.94s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">15.54s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1241.wav"></audio></td>
+<td class="gt-text">summits include breath-taking views from peaks climbers from all parts of the world are continually establishing new routes amongst its endless potential of walls</td>
+<td><span class="w0-text">Some of the most important routes are the ones that connect the most remote areas of the world to the rest of the world.&lt;/s&gt;</span><div class="meta">2.02s</div></td>
+<td><span class="w1-text">The first is the use of the word, which is a noun, and the second is the use of the word, which is a verb.&lt;/s&gt;</span><div class="meta">2.41s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">16.02s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_1372.wav"></audio></td>
+<td class="gt-text">its status declined during the twelfth century mainly due to the fact that crusaders had returned bearing gifts such as silks and spices that were valued more than what byzantine markets offered</td>
+<td><span class="w0-text">The status decline during the 20th century may have been due to the fact that crusaders had returned bearing gifts such as silks and spices that were valued more than the zelks and spices that were offered.&lt;/s&gt;</span><div class="meta">3.05s</div></td>
+<td><span class="w1-text">The first is the 2017-2018 school year. The second is the 2018-2019 school year. The third is the 2019-2020 school year.&lt;/s&gt;</span><div class="meta">3.4s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">6</span><div class="meta">13.98s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_373.wav"></audio></td>
+<td class="gt-text">other scientists argue that these plants are very poisonous so it is unlikely that any dinosaur ate them even though today the sloth and other animals like the parrot a descendant of the dinosaurs can eat poisonous leaves or fruit</td>
+<td><span class="w0-text"> The most common poisonous plants are the hemlock, the hemlock water dropwort, the water hemlock, and the poison hemlock.&lt;/s&gt;</span><div class="meta">1.77s</div></td>
+<td><span class="w1-text">The first is that the sun is a star, and the second is that the sun is a star.&lt;/s&gt;</span><div class="meta">1.15s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">7</span><div class="meta">15.3s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_46.wav"></audio></td>
+<td class="gt-text">on september 24 1759 arthur guinness signed a 9,000 year lease for the st james&#x27; gate brewery in dublin ireland</td>
+<td><span class="w0-text">Arthur Guinness signed a nine thousand year lease for the St. James Gate Brewery in Dublin, Ireland in 1759.&lt;/s&gt;</span><div class="meta">1.48s</div></td>
+<td><span class="w1-text">The 1920s saw the rise of the automobile, which led to the construction of roads and highways.&lt;/s&gt;</span><div class="meta">1.33s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">8</span><div class="meta">13.92s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_521.wav"></audio></td>
+<td class="gt-text">some people believe that experiencing many artificially induced lucid dreams often enough can be very exhausting</td>
+<td><span class="w0-text">The most common type of dream is the dream that is a reflection of the dreamer&#x27;s own life.&lt;/s&gt;</span><div class="meta">1.15s</div></td>
+<td><span class="w1-text">The first thing to do is to make sure that the patient is not in any danger.&lt;/s&gt;</span><div class="meta">1.0s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">9</span><div class="meta">14.46s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_761.wav"></audio></td>
+<td class="gt-text">joining such a network usually just requires filling out an online form although some networks offer or require additional verification</td>
+<td><span class="w0-text">Joining such a network usually just requires filling out an online form. Although some networks offer a physical verification process, such as mailing a CD or DVD to a central location, most networks simply require the user to provide a mailing address.&lt;/s&gt;</span><div class="meta">2.5s</div></td>
+<td><span class="w1-text">The first is a new product, a new product that is being developed by the company. The second is a new service that is being offered by the company.&lt;/s&gt;</span><div class="meta">1.73s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">10</span><div class="meta">14.16s</div></td>
+<td><audio controls src="samples/fleurs_en_us/sample_781.wav"></audio></td>
+<td class="gt-text">this gives resolution almost four times that of a 35 mm negative 3136 mm2 versus 864</td>
+<td><span class="w0-text">The scale is resolution 1024x768.&lt;/s&gt;</span><div class="meta">0.78s</div></td>
+<td><span class="w1-text">The 2018-19 school year was a challenging one for the district. The district was forced to close schools due to the COVID-19 pandemic.&lt;/s&gt;</span><div class="meta">1.92s</div></td>
+</tr>
+</tbody></table>
+</div>
+</div>
+<div class="tab-content" id="tab-commonvoice_de">
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge transcribe">transcribe</span>
+<span class="task-title">Speech-to-text transcription</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Ground Truth</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">14.62s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43333147.mp3"></audio></td>
+<td class="gt-text">Die Niederländer erreichten das Halbfinale als Gruppenzweite hinter den Deutschen.</td>
+<td><span class="w0-text">Die Niederländer erreichten das Halbfinale als Gruppenzweite hinter den Deutschen.&lt;/s&gt;</span><div class="meta">3.74s</div></td>
+<td><span class="w1-text">Die Niederländer erreichten das Halbfinale als Gruppenzweite hinter den Deutschen.&lt;/s&gt;</span><div class="meta">3.63s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">14.47s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43339826.mp3"></audio></td>
+<td class="gt-text">Benazir Bhutto kämpfte für ein demokratisches Pakistan und einen friedlichen Übergang zu einer Zivilregierung.</td>
+<td><span class="w0-text">Der Nasir-Buto kämpfte für ein demokratisches Pakistan und einen friedlichen Übergang zu einer Zivilregierung.&lt;/s&gt;</span><div class="meta">1.21s</div></td>
+<td><span class="w1-text">Danazolbuton kämpfte für ein demokratisches Afghanistan und einen friedlichen Übergangs zur einer zivilen Regierung.&lt;/s&gt;</span><div class="meta">1.47s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">14.94s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43341579.mp3"></audio></td>
+<td class="gt-text">Dort besuchte sie das College und studierte Theaterwissenschaften an der &quot;University of Winnipeg&quot;.</td>
+<td><span class="w0-text">Dort besuchte sie das College und studierte Theaterwissenschaften an der University of Winnipeg.&lt;/s&gt;</span><div class="meta">0.95s</div></td>
+<td><span class="w1-text">Dort besuchten sie das College und studierte die Orthodoxen. Eine Universität.&lt;/s&gt;</span><div class="meta">1.11s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">14.83s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43342596.mp3"></audio></td>
+<td class="gt-text">Seine vielfältige Nahrung lässt auf einen Opportunisten schließen, der jedes verfügbare Futter nimmt.</td>
+<td><span class="w0-text">Seine vielfältige Nahrung lässt auf einen Opportunisten schließen, der jedes verfügbare Futter nimmt.&lt;/s&gt;</span><div class="meta">1.09s</div></td>
+<td><span class="w1-text">Seine vierfältige Nahrung lässt auf einen Okkupisten hinausgehen, der jedes verfügbare Fodern nimmt.&lt;/s&gt;</span><div class="meta">1.66s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">15.34s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43342998.mp3"></audio></td>
+<td class="gt-text">Daher bemüht sich China nach Kräften darum, eine ständige Präsenz in Afrika aufzubauen.</td>
+<td><span class="w0-text">Daher bemüht sich China nach Kräften, darum, eine ständige Präsenz in Afrika aufzubauen.&lt;/s&gt;</span><div class="meta">1.35s</div></td>
+<td><span class="w1-text">Gerade wenn du mit siehst, ich ihn nach kräftender Ruhm an der Stände gepreßt, sie nach Rika aufzubauen.&lt;/s&gt;</span><div class="meta">2.01s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">6</span><div class="meta">14.8s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43343789.mp3"></audio></td>
+<td class="gt-text">Wir haben das in unserer Stellungnahme auch dem Bericht hinzugefügt.</td>
+<td><span class="w0-text">Wir haben das in unserer Stellungnahme auch dem Bericht hinzugefügt.&lt;/s&gt;</span><div class="meta">0.79s</div></td>
+<td><span class="w1-text">Wir haben das in unserer Stellungnahme auch dem Bericht hinzugefügt.&lt;/s&gt;</span><div class="meta">0.94s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">7</span><div class="meta">15.44s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43363349.mp3"></audio></td>
+<td class="gt-text">Seitdem widmete er sich ganz dem ihm anvertrauten Lehramt und literarischen Arbeiten.</td>
+<td><span class="w0-text">Seitdem widmete er sich ganz den ihm anvertrauten Lehrahmen der privaten Arbeiten.&lt;/s&gt;</span><div class="meta">1.04s</div></td>
+<td><span class="w1-text">Seitdem widmete er sich ganz den ihm anvertrauten Lehramten in der beruflichen Arbeit.&lt;/s&gt;</span><div class="meta">1.39s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">8</span><div class="meta">14.8s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43371808.mp3"></audio></td>
+<td class="gt-text">Der große Kopf ist oft abgeplattet, teilweise gepanzert und trägt Stacheln.</td>
+<td><span class="w0-text">Der große Kopf ist oft abgeblattet, teilweise gepanzerter und trägt Stacheln.&lt;/s&gt;</span><div class="meta">1.04s</div></td>
+<td><span class="w1-text">Der kurze Kopf ist oft abgeplattet, teilweise gepanzert und trägt Stacheln.&lt;/s&gt;</span><div class="meta">1.14s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">9</span><div class="meta">14.62s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43612801.mp3"></audio></td>
+<td class="gt-text">Der heutige Bau der neuen Abtei ist ein imposanter neugotischer Wiederaufbau.</td>
+<td><span class="w0-text">Der heutige Bau der neuen Abtei ist ein imposanter neugotischer Wiederaufbau.&lt;/s&gt;</span><div class="meta">0.97s</div></td>
+<td><span class="w1-text">Der heutige Bahnhof Neumarkt bei ist ein imposanter neugotischer Wiederaufbau.&lt;/s&gt;</span><div class="meta">1.12s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">10</span><div class="meta">15.34s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_44194671.mp3"></audio></td>
+<td class="gt-text">In der Felsenhöhle von Covadonga befand sich schon zur Zeit des Westgotenreichs ein Marienheiligtum.</td>
+<td><span class="w0-text">In der Felsenhöhle von Covadonga befand sich schon zur Zeit des Westgotenreichs ein Marienheiligtum.&lt;/s&gt;</span><div class="meta">1.43s</div></td>
+<td><span class="w1-text">In der Fersenhöhle von Covadonga befand sich schon zur Zeit des Westgotenreichs ein Marienheiligtum.&lt;/s&gt;</span><div class="meta">1.65s</div></td>
+</tr>
+</tbody></table>
+</div>
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge continue">continue</span>
+<span class="task-title">Text continuation from speech</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Transcription</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">14.62s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43333147.mp3"></audio></td>
+<td class="gt-text">Die Niederländer erreichten das Halbfinale als Gruppenzweite hinter den Deutschen.</td>
+<td><span class="w0-text"> Die Niederländer erreichten das Halbfinale als Gruppen Zweiter hinter den Deutschen.&lt;/s&gt;</span><div class="meta">3.45s</div></td>
+<td><span class="w1-text">Die Ländereien, die in der Regel von den Bauern besät wurden, wurden von den Landbesitzern, den Herren, aufgekauft.&lt;/s&gt;</span><div class="meta">4.67s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">14.47s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43339826.mp3"></audio></td>
+<td class="gt-text">Benazir Bhutto kämpfte für ein demokratisches Pakistan und einen friedlichen Übergang zu einer Zivilregierung.</td>
+<td><span class="w0-text"> Die Regierung hat sich in den letzten Wochen und Monaten mit der Frage beschäftigt, wie wir die Pandemie in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Wirtschaft in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Gesellschaft in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Demokratie in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Rechtsstaatlichkeit in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Freiheit in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Menschen in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Wirtschaft in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Gesellschaft in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Demokratie in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Rechtsstaatlichkeit in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Freiheit in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Menschen in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Wirtschaft in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Gesellschaft in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Demokratie in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Rechtsstaatlichkeit in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Freiheit in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Menschen in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Wirtschaft in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Gesellschaft in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Demokratie in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Rechtsstaatlichkeit in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Freiheit in den Griff bekommen. Und wir haben uns dabei auch mit der Frage beschäftigt, wie wir die Menschen</span><div class="meta">26.42s</div></td>
+<td><span class="w1-text">Er war ein sehr guter Schüler und hatte viele Freunde.&lt;/s&gt;</span><div class="meta">0.78s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">14.94s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43341579.mp3"></audio></td>
+<td class="gt-text">Dort besuchte sie das College und studierte Theaterwissenschaften an der &quot;University of Winnipeg&quot;.</td>
+<td><span class="w0-text"> Die Universität ist eine der wichtigsten Institutionen unserer Gesellschaft. Sie ist die Wurzel allen Wissens, der Grundlage aller Fortschritte.&lt;/s&gt;</span><div class="meta">1.52s</div></td>
+<td><span class="w1-text"> Die erste Frage ist, wie kann man die Datenbanken von der Universität von Kalifornien, die sogenannten Caltech, in die Schweiz bringen?&lt;/s&gt;</span><div class="meta">1.72s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">14.83s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43342596.mp3"></audio></td>
+<td class="gt-text">Seine vielfältige Nahrung lässt auf einen Opportunisten schließen, der jedes verfügbare Futter nimmt.</td>
+<td><span class="w0-text">Die meisten der hier gezeigten Aufnahmen stammen von der Tour von 2018.&lt;/s&gt;</span><div class="meta">1.02s</div></td>
+<td><span class="w1-text">Die erste Frage ist, ob es eine Alternative zur Abtreibung gibt.&lt;/s&gt;</span><div class="meta">0.98s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">15.34s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43342998.mp3"></audio></td>
+<td class="gt-text">Daher bemüht sich China nach Kräften darum, eine ständige Präsenz in Afrika aufzubauen.</td>
+<td><span class="w0-text"> Die chinesische Regierung hat sich in den letzten Jahren immer wieder dafür ausgesprochen, dass es keine einheitliche Weltordnung geben soll.&lt;/s&gt;</span><div class="meta">1.38s</div></td>
+<td><span class="w1-text"> Ich bin der erste, der sich in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Menschheit, äh, in der Geschichte der Mensch</span><div class="meta">31.99s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">6</span><div class="meta">14.8s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43343789.mp3"></audio></td>
+<td class="gt-text">Wir haben das in unserer Stellungnahme auch dem Bericht hinzugefügt.</td>
+<td><span class="w0-text"> Wir haben das in unserer Stellungnahme auch dem Berichterstatter mitgeteilt. Wir haben das in unserer Stellungnahme auch dem Berichterstatter mitgeteilt.&lt;/s&gt;</span><div class="meta">1.69s</div></td>
+<td><span class="w1-text"> Wir haben uns in der Vergangenheit mit dem Thema der sogenannten Selbstverpflichtung beschäftigt.&lt;/s&gt;</span><div class="meta">1.14s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">7</span><div class="meta">15.44s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43363349.mp3"></audio></td>
+<td class="gt-text">Seitdem widmete er sich ganz dem ihm anvertrauten Lehramt und literarischen Arbeiten.</td>
+<td><span class="w0-text">Die beiden hatten sich in der Schule kennengelernt und waren seitdem unzertrennlich. Seitdem widmete er sich ganz dem Studium und der Forschung.&lt;/s&gt;</span><div class="meta">1.79s</div></td>
+<td><span class="w1-text">Die beiden Männer waren in der Nähe der Stadt, als sie den ersten Schuss hörten. Sie sahen sich um und sahen, dass die Stadt in Flammen stand.&lt;/s&gt;</span><div class="meta">2.16s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">8</span><div class="meta">14.8s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43371808.mp3"></audio></td>
+<td class="gt-text">Der große Kopf ist oft abgeplattet, teilweise gepanzert und trägt Stacheln.</td>
+<td><span class="w0-text"> Der große Kopf ist oft abgebildet, teilweise gepanzert.&lt;/s&gt;</span><div class="meta">0.72s</div></td>
+<td><span class="w1-text"> Die meisten Menschen haben Angst vor dem Tod.&lt;/s&gt;</span><div class="meta">0.69s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">9</span><div class="meta">14.62s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_43612801.mp3"></audio></td>
+<td class="gt-text">Der heutige Bau der neuen Abtei ist ein imposanter neugotischer Wiederaufbau.</td>
+<td><span class="w0-text">Der heutige Bau der neuen Abtei ist ein imposanter Neubau.&lt;/s&gt;</span><div class="meta">0.69s</div></td>
+<td><span class="w1-text">Er ist ein großer, hohes Gebäude, das in der Mitte der Stadt steht.&lt;/s&gt;</span><div class="meta">1.22s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">10</span><div class="meta">15.34s</div></td>
+<td><audio controls src="samples/commonvoice_de/common_voice_de_44194671.mp3"></audio></td>
+<td class="gt-text">In der Felsenhöhle von Covadonga befand sich schon zur Zeit des Westgotenreichs ein Marienheiligtum.</td>
+<td><span class="w0-text"> In der Kirche von Corandona befand sich schon zur Zeit des Westgotenreichs ein Bischofssitz.&lt;/s&gt;</span><div class="meta">1.18s</div></td>
+<td><span class="w1-text">Die Stadt ist von der Natur umgeben und bietet eine Vielzahl an Aktivitäten.&lt;/s&gt;</span><div class="meta">0.93s</div></td>
+</tr>
+</tbody></table>
+</div>
+</div>
+<div class="tab-content" id="tab-commonvoice_fr">
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge transcribe">transcribe</span>
+<span class="task-title">Speech-to-text transcription</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Ground Truth</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">14.83s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_37460936.mp3"></audio></td>
+<td class="gt-text">Les six autres épéistes de Kiri seront eux aussi invoqués, ainsi que Haku.</td>
+<td><span class="w0-text">Le sixième est le stade qui sera le plus avancé.&lt;/s&gt;</span><div class="meta">3.39s</div></td>
+<td><span class="w1-text">La série est basée sur la série télévisée.&lt;/s&gt;</span><div class="meta">3.25s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">15.34s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_42919023.mp3"></audio></td>
+<td class="gt-text">Il rompit le premier ce silence. — Vous me disiez donc de revenir ?</td>
+<td><span class="w0-text">S&#x27;il rompit le premier ce silence, je m&#x27;inquisis donc de revenir.&lt;/s&gt;</span><div class="meta">1.04s</div></td>
+<td><span class="w1-text"> Il a voté le premier socialiste en&lt;/s&gt;</span><div class="meta">0.5s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">13.86s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_42994922.mp3"></audio></td>
+<td class="gt-text">La violence féminine serait, au contraire, interprétée comme réactionnelle aux efforts de domination masculine.</td>
+<td><span class="w0-text">La violence féminine souligne la confusion entre réactionnel ou effondré de l’émotion masculine.&lt;/s&gt;</span><div class="meta">1.06s</div></td>
+<td><span class="w1-text">La vilaĝfloreno sufiĉe multe kontribuis al la ekspozicion de la moderna muziko.&lt;/s&gt;</span><div class="meta">1.4s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">13.72s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43195837.mp3"></audio></td>
+<td class="gt-text">Cette espèce se rencontre en Indonésie, en Malaisie et en Inde.</td>
+<td><span class="w0-text">Cette espèce se rencontre en Indonésie, en Malaisie et en Inde.&lt;/s&gt;</span><div class="meta">0.9s</div></td>
+<td><span class="w1-text">Ce que spécifie ce rencontre en Asie, en Malaisie et en Inde.&lt;/s&gt;</span><div class="meta">0.92s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">13.57s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43337575.mp3"></audio></td>
+<td class="gt-text">Il grommelait: fille d’or, épouseur de cuivre.</td>
+<td><span class="w0-text">Les grands mulets, filles d’or, épousèrent, à deux cuivres&lt;/s&gt;</span><div class="meta">0.94s</div></td>
+<td><span class="w1-text">Il grand bleu vert et plus haut un de cuivre.&lt;/s&gt;</span><div class="meta">0.64s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">6</span><div class="meta">14.58s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43346067.mp3"></audio></td>
+<td class="gt-text">La composition est une illustration musicale de la transition entre obscurité et lumière.</td>
+<td><span class="w0-text">La composition est une illustration musicale de la transition entre obscurité et lumière.&lt;/s&gt;</span><div class="meta">1.05s</div></td>
+<td><span class="w1-text">La composition est une illustration musicale de la transition entre obscurité et lumière.&lt;/s&gt;</span><div class="meta">0.85s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">7</span><div class="meta">14.22s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43346068.mp3"></audio></td>
+<td class="gt-text">Il dispose de ces derniers au sprint.</td>
+<td><span class="w0-text">Il dispose de ses derniers sprints.&lt;/s&gt;</span><div class="meta">0.48s</div></td>
+<td><span class="w1-text">Il dispose de ses derniers ou sprint.&lt;/s&gt;</span><div class="meta">0.49s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">8</span><div class="meta">14.87s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43360735.mp3"></audio></td>
+<td class="gt-text">Paris a accueilli l&#x27;épreuve de danse sur glace.</td>
+<td><span class="w0-text">Talia accueille l&#x27;épreuve de danse sur glace.&lt;/s&gt;</span><div class="meta">0.58s</div></td>
+<td><span class="w1-text">Parmi la catégorie les preuves de non-singularité.&lt;/s&gt;</span><div class="meta">0.91s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">9</span><div class="meta">14.29s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43607325.mp3"></audio></td>
+<td class="gt-text">Sa grande souplesse lors des spirales constitue sa principale signature.</td>
+<td><span class="w0-text">Sa grande souplesse lors des spirales constitue sa principale signature.&lt;/s&gt;</span><div class="meta">0.79s</div></td>
+<td><span class="w1-text">Sa grande securité consiste à considérer ces inacteurs.&lt;/s&gt;</span><div class="meta">0.69s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">10</span><div class="meta">14.94s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43607481.mp3"></audio></td>
+<td class="gt-text">Remportant une majorité absolue des sièges, les Travaillistes enregistrent une victoire historique.</td>
+<td><span class="w0-text">Remporter une majorité absolue des sièges, les travaillistes enregistrent une victoire historique. Voilà.&lt;/s&gt;</span><div class="meta">1.14s</div></td>
+<td><span class="w1-text">Remplant en marque la majorité absolue des sièges, les travaillistes en restent une victoire historique.&lt;/s&gt;</span><div class="meta">1.11s</div></td>
+</tr>
+</tbody></table>
+</div>
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge continue">continue</span>
+<span class="task-title">Text continuation from speech</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Transcription</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">14.83s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_37460936.mp3"></audio></td>
+<td class="gt-text">Les six autres épéistes de Kiri seront eux aussi invoqués, ainsi que Haku.</td>
+<td><span class="w0-text">La série est créée par le réalisateur et scénariste britannique Mark Webb.&lt;/s&gt;</span><div class="meta">3.44s</div></td>
+<td><span class="w1-text">La première chose que je vais faire, c&#x27;est que je vais faire un petit tour de la salle.&lt;/s&gt;</span><div class="meta">4.0s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">15.34s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_42919023.mp3"></audio></td>
+<td class="gt-text">Il rompit le premier ce silence. — Vous me disiez donc de revenir ?</td>
+<td><span class="w0-text"> Et il reprit le premier le silence.&lt;/s&gt;</span><div class="meta">0.48s</div></td>
+<td><span class="w1-text"> Et je vous prie de vous abonner à cette chaîne.&lt;/s&gt;</span><div class="meta">0.74s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">13.86s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_42994922.mp3"></audio></td>
+<td class="gt-text">La violence féminine serait, au contraire, interprétée comme réactionnelle aux efforts de domination masculine.</td>
+<td><span class="w0-text"> Die Reaktionen sind unterschiedlich.&lt;/s&gt;</span><div class="meta">0.36s</div></td>
+<td><span class="w1-text">La ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville de la capitale, la ville</span><div class="meta">38.28s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">13.72s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43195837.mp3"></audio></td>
+<td class="gt-text">Cette espèce se rencontre en Indonésie, en Malaisie et en Inde.</td>
+<td><span class="w0-text">Cette espèce se rencontre en Indonésie, en Malaisie et en Inde.&lt;/s&gt;</span><div class="meta">0.85s</div></td>
+<td><span class="w1-text">La première chose à faire est de se rendre compte que nous sommes tous des êtres humains.&lt;/s&gt;</span><div class="meta">1.37s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">13.57s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43337575.mp3"></audio></td>
+<td class="gt-text">Il grommelait: fille d’or, épouseur de cuivre.</td>
+<td><span class="w0-text"> Et, euh, je vais vous montrer, euh, comment, euh, on peut, euh, utiliser, euh, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce, ce</span><div class="meta">25.45s</div></td>
+<td><span class="w1-text"> Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort. Il est mort.</span><div class="meta">35.04s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">6</span><div class="meta">14.58s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43346067.mp3"></audio></td>
+<td class="gt-text">La composition est une illustration musicale de la transition entre obscurité et lumière.</td>
+<td><span class="w0-text"> La composition est une illustration musicale de la transition entre deux états.&lt;/s&gt;</span><div class="meta">0.7s</div></td>
+<td><span class="w1-text">La proposition est la suivante.&lt;/s&gt;</span><div class="meta">0.43s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">7</span><div class="meta">14.22s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43346068.mp3"></audio></td>
+<td class="gt-text">Il dispose de ces derniers au sprint.</td>
+<td><span class="w0-text">Les deux premiers sont des suites géométriques de raison 1,2.&lt;/s&gt;</span><div class="meta">0.9s</div></td>
+<td><span class="w1-text">Il dispose de ses derniers.&lt;/s&gt;</span><div class="meta">0.43s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">8</span><div class="meta">14.87s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43360735.mp3"></audio></td>
+<td class="gt-text">Paris a accueilli l&#x27;épreuve de danse sur glace.</td>
+<td><span class="w0-text">La ville a accueilli l&#x27;épreuve de danse sur glace.&lt;/s&gt;</span><div class="meta">0.65s</div></td>
+<td><span class="w1-text">La première, c&#x27;est que, euh, il y a un problème de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de, de</span><div class="meta">37.95s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">9</span><div class="meta">14.29s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43607325.mp3"></audio></td>
+<td class="gt-text">Sa grande souplesse lors des spirales constitue sa principale signature.</td>
+<td><span class="w0-text">Sa grande souplesse lors des spirales constitue sa principale signature.&lt;/s&gt;</span><div class="meta">0.73s</div></td>
+<td><span class="w1-text">La grande société, c&#x27;est la société de consommation.&lt;/s&gt;</span><div class="meta">0.87s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">10</span><div class="meta">14.94s</div></td>
+<td><audio controls src="samples/commonvoice_fr/common_voice_fr_43607481.mp3"></audio></td>
+<td class="gt-text">Remportant une majorité absolue des sièges, les Travaillistes enregistrent une victoire historique.</td>
+<td><span class="w0-text"> Et, euh, je vais vous montrer, euh, ce que j&#x27;ai fait. Alors, je vais vous montrer, euh, ce que j&#x27;ai fait. Alors, je vais vous montrer, euh, ce que j&#x27;ai fait. Alors, je vais vous montrer, euh, ce que j&#x27;ai fait. Alors, je vais vous montrer, euh, ce que j&#x27;ai fait. Alors, je vais vous montrer, euh, ce que j&#x27;ai fait.&lt;/s&gt;</span><div class="meta">4.85s</div></td>
+<td><span class="w1-text"> Et, euh, je vais vous parler de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la, de la</span><div class="meta">34.23s</div></td>
+</tr>
+</tbody></table>
+</div>
+</div>
+<div class="tab-content" id="tab-eurospeech_uk">
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge transcribe">transcribe</span>
+<span class="task-title">Speech-to-text transcription</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Ground Truth</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">12.77s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_0.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">with what we&#x27;ve seen about the nine years of cuts benefit cuts stagnating wages and increasing numbers of parents unable to meet the basic costs of living and the knock on effects of this reality is a rise in child poverty&lt;/s&gt;</span><div class="meta">4.9s</div></td>
+<td><span class="w1-text">We hope we see you this afternoon years of cuts, benefit cuts devastating wages, increasing numbers of parents unable to meet the basic costs of living. And then that kind of effect of this reality is a way of insuring child poverty.&lt;/s&gt;</span><div class="meta">5.19s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">17.28s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_1.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">it is something that should concern us all deeply recently letters brought to light many of the negative effects that growing up in poverty has upon children and some must start from boot off in the most deprived areas of our country girls can expect to live twenty fewer years of their lives in good health&lt;/s&gt;</span><div class="meta">3.6s</div></td>
+<td><span class="w1-text">She simply should have considered as all detailed. Recently, she&#x27;s brought to light many of the negative health, growing or poverty, housing and school, and some must start, improve on. In the most deprived areas, our country girls can expect to live 20 fewer years of their lives in good health.&lt;/s&gt;</span><div class="meta">4.25s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">11.3s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_2.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">every september we see children on their way to start their new school year looking very smart in their uniforms and our thoughts may turn to our own first day or perhaps to our children&#x27;s first day&lt;/s&gt;</span><div class="meta">3.77s</div></td>
+<td><span class="w1-text">Every September we see children on their way to start their new school year looking very smart in their uniforms and our thoughts may turn to our own first day or perhaps to our children&#x27;s first day.&lt;/s&gt;</span><div class="meta">3.81s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">10.9s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_3.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">However, no one has yet proven in uniform, so I do see it for a difference that survives, but I was deeply affected by the testimony of a group of mothers at an evidence session of the Education Select Committee.&lt;/s&gt;</span><div class="meta">2.39s</div></td>
+<td><span class="w1-text">However, they are not yet suitable for uniform, so I do see it through a different set of eyes. Those deeply affected by the testimony of the group of mothers at an evident session of the Education Select Committee.&lt;/s&gt;</span><div class="meta">2.28s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">10.48s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_4.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">a parent&#x27;s description of skipping meals to try and meet the ever-increasing costs devastated me. But tragically these accounts don&#x27;t represent rare and isolated circumstances.&lt;/s&gt;</span><div class="meta">1.79s</div></td>
+<td><span class="w1-text">The current description of skippy meals to try and meet the ever-creeping costs devastatingly. But tragically, the new accounts don&#x27;t represent where I am in isolated circumstances.&lt;/s&gt;</span><div class="meta">2.55s</div></td>
+</tr>
+</tbody></table>
+</div>
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge continue">continue</span>
+<span class="task-title">Text continuation from speech</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Transcription</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">12.77s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_0.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">所以，我們見到一個非常明顯的差異，在過去九年，在這個領域。我們也見到一個差異，在過去九年，在這個領域。&lt;/s&gt;</span><div class="meta">5.28s</div></td>
+<td><span class="w1-text">The government has been very clear that it is not going to be able to meet the 2020 target. It is not going to be able to meet the 2020 target. It is not going to be able to meet the 2020 target.&lt;/s&gt;</span><div class="meta">5.91s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">17.28s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_1.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">And the most deprived areas of our country are often the most deprived areas of our cities. And this is a problem that we need to address. And I think that the government has been doing a lot to address this.&lt;/s&gt;</span><div class="meta">3.1s</div></td>
+<td><span class="w1-text">and the government has been very clear that it is not going to be able to provide that support. So we are looking at the situation and we are looking at the situation very carefully. We are looking at the situation very carefully.&lt;/s&gt;</span><div class="meta">3.34s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">11.3s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_2.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">We are all aware that the government has been working hard to ensure that all children are able to start their new school year with the necessary equipment.&lt;/s&gt;</span><div class="meta">3.18s</div></td>
+<td><span class="w1-text">We also saw a lot of children who were not in school, who were not in school because they were not in the system. They were not in the system because they were not registered. They were not in the system because they were not in the system.&lt;/s&gt;</span><div class="meta">4.57s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">10.9s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_3.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">The group of mothers were deeply moved by the testimony of the mothers of the children who died in the fire. They were deeply moved by the testimony of the mothers of the children who died in the fire.&lt;/s&gt;</span><div class="meta">2.17s</div></td>
+<td><span class="w1-text">我們會繼續與各持份者溝通，並會在適當時候向立法會提交修訂法例的建議。多謝主席。好，唔該晒。誒，下一位係誒。&lt;/s&gt;</span><div class="meta">3.4s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">10.48s</div></td>
+<td><audio controls src="samples/eurospeech_uk/sample_4.wav"></audio></td>
+<td class="gt-text"></td>
+<td><span class="w0-text">The parents&#x27; description of skipping meals to try and meet the ever-increasing costs of living is a sad reality for many Hong Kong families. The government needs to do more to help.&lt;/s&gt;</span><div class="meta">1.97s</div></td>
+<td><span class="w1-text">The government has also been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its handling of the pandemic. The government has been criticised for its</span><div class="meta">30.7s</div></td>
+</tr>
+</tbody></table>
+</div>
+</div>
+<div class="tab-content" id="tab-aishell1_test">
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge transcribe">transcribe</span>
+<span class="task-title">Speech-to-text transcription</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Ground Truth</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">14.7s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0768W0452.wav"></audio></td>
+<td class="gt-text">    白云  区  钟  落  潭  竹  一村  民  白云  区  钟  落  潭  竹  一村  的  村民  跟  记者  报  料</td>
+<td><span class="w0-text">白银七中落坛主一村民白银七中落坛主以村的村民本记者报料&lt;/s&gt;</span><div class="meta">4.61s</div></td>
+<td><span class="w1-text">白银期周末谈主为村民白银期周末谈主以村的村民感谢者告亮&lt;/s&gt;</span><div class="meta">4.22s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">12.0s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0770W0210.wav"></audio></td>
+<td class="gt-text">    城市  化  快速  发展  期  的  重要  特征  就  是  基础  设施  投资  需求  量  大</td>
+<td><span class="w0-text">城市化快速发展期的重要特征就是基础建设投资需求量大&lt;/s&gt;</span><div class="meta">2.95s</div></td>
+<td><span class="w1-text">城市化快速发展期的重要特征就是基础建设投资需求较大&lt;/s&gt;</span><div class="meta">2.95s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">13.93s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0906W0219.wav"></audio></td>
+<td class="gt-text">    健全  农作  物种  质  资源  和  畜禽  遗传  资源  保存  体系</td>
+<td><span class="w0-text">借权农购物种质资源和去钱遗传资源保存体系&lt;/s&gt;</span><div class="meta">1.23s</div></td>
+<td><span class="w1-text">建群能够入主智能和趣情移传智能保存体系&lt;/s&gt;</span><div class="meta">1.03s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">12.0s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0913W0140.wav"></audio></td>
+<td class="gt-text">    新  产业  发展  快  地  用地  集约  求  且  需求  大  的  地区</td>
+<td><span class="w0-text">新产业发展快利用地及约七亩铁需求大的地区&lt;/s&gt;</span><div class="meta">1.12s</div></td>
+<td><span class="w1-text">新产业发展快利用地级医院提供切入大的地区&lt;/s&gt;</span><div class="meta">0.92s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">12.64s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0199.wav"></audio></td>
+<td class="gt-text">    也是  国家  淘汰  落后  产能  加快  产业  升级  宏观  政策  的  体现</td>
+<td><span class="w0-text">也是国家淘汰落后产能加快产业升级宏观政策的体现&lt;/s&gt;</span><div class="meta">1.25s</div></td>
+<td><span class="w1-text">也是国家淘汰落后产能加快产业升级红更正色的体现&lt;/s&gt;</span><div class="meta">1.2s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">6</span><div class="meta">11.62s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0202.wav"></audio></td>
+<td class="gt-text">    转化  成  由  资产  产生  的  现金  流  作  担保  可  自由  流通  的  证券</td>
+<td><span class="w0-text">转化成由资产台升到现金流作担保可自流如通的证券&lt;/s&gt;</span><div class="meta">1.35s</div></td>
+<td><span class="w1-text">转化成由资产转身的现金流作为投资有如同的账票&lt;/s&gt;</span><div class="meta">1.21s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">7</span><div class="meta">11.87s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0204.wav"></audio></td>
+<td class="gt-text">    目前  我  国正  在  稳步  开展  中小  企业  信贷  资产  证券  化  试点</td>
+<td><span class="w0-text">目前我国正在稳步开展中小企业信贷资产证券化试点&lt;/s&gt;</span><div class="meta">1.39s</div></td>
+<td><span class="w1-text">目前我国正在稳步开展中小企业信贷自查正确化试点&lt;/s&gt;</span><div class="meta">1.3s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">8</span><div class="meta">12.43s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0223.wav"></audio></td>
+<td class="gt-text">    资源  环境  面临  较大  压力  有  的  企业  管理  水平  不  高</td>
+<td><span class="w0-text">资源环境面临较大压力有的企业关联谁评估高&lt;/s&gt;</span><div class="meta">1.13s</div></td>
+<td><span class="w1-text">自愿还进面粉交大压力水果品类水苹果高&lt;/s&gt;</span><div class="meta">1.0s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">9</span><div class="meta">11.95s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0421.wav"></audio></td>
+<td class="gt-text">    贵州  都市  报  十月  二十九  日报  道  据  台湾  媒体  报道  艺人  陈  妍  希  认  爱小  四  岁  的大  陆  小生  陈  晓</td>
+<td><span class="w0-text">贵州都市报十月二十九日报道据台湾媒体报道艺人陈妍希润爱小四岁的大陆小生陈晓&lt;/s&gt;</span><div class="meta">2.1s</div></td>
+<td><span class="w1-text">贵州都市报十月二十九日报道据台湾媒体报道一人受伤四岁的大陆小生添小&lt;/s&gt;</span><div class="meta">1.47s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">10</span><div class="meta">13.19s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0460.wav"></audio></td>
+<td class="gt-text">    游戏  主播  花样  作死  声称  天津  是  他  炸  的  直播  被  抓  游戏  室  老板  因  冲突  开枪  将  人  射  伤  致死</td>
+<td><span class="w0-text">优系主播花雅作死声称天津市她炸的直播被抓优系是老板因冲突开枪将人射伤致死&lt;/s&gt;</span><div class="meta">2.32s</div></td>
+<td><span class="w1-text">游戏主播花样作死声称天津市滩涨支播被抓游戏是老板因冲突开枪将人射伤致死&lt;/s&gt;</span><div class="meta">2.27s</div></td>
+</tr>
+</tbody></table>
+</div>
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge continue">continue</span>
+<span class="task-title">Text continuation from speech</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Transcription</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">14.7s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0768W0452.wav"></audio></td>
+<td class="gt-text">    白云  区  钟  落  潭  竹  一村  民  白云  区  钟  落  潭  竹  一村  的  村民  跟  记者  报  料</td>
+<td><span class="w0-text">白银期中洛炭竹以村的村民们的努力&lt;/s&gt;</span><div class="meta">3.77s</div></td>
+<td><span class="w1-text">而李春亮则是被判处有期徒刑十五年&lt;/s&gt;</span><div class="meta">3.75s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">12.0s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0770W0210.wav"></audio></td>
+<td class="gt-text">    城市  化  快速  发展  期  的  重要  特征  就  是  基础  设施  投资  需求  量  大</td>
+<td><span class="w0-text">在一系列的政策利好之下&lt;/s&gt;</span><div class="meta">2.07s</div></td>
+<td><span class="w1-text">而这也意味着&lt;/s&gt;</span><div class="meta">1.88s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">13.93s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0906W0219.wav"></audio></td>
+<td class="gt-text">    健全  农作  物种  质  资源  和  畜禽  遗传  资源  保存  体系</td>
+<td><span class="w0-text">据了解&lt;/s&gt;</span><div class="meta">0.17s</div></td>
+<td><span class="w1-text">而家呢，我哋就係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，即係誒，</span><div class="meta">30.59s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">12.0s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0913W0140.wav"></audio></td>
+<td class="gt-text">    新  产业  发展  快  地  用地  集约  求  且  需求  大  的  地区</td>
+<td><span class="w0-text">新产业发展快利用地极其优良企业需求大的地区&lt;/s&gt;</span><div class="meta">1.07s</div></td>
+<td><span class="w1-text">而这也让我们看到了&lt;/s&gt;</span><div class="meta">0.45s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">12.64s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0199.wav"></audio></td>
+<td class="gt-text">    也是  国家  淘汰  落后  产能  加快  产业  升级  宏观  政策  的  体现</td>
+<td><span class="w0-text">国家财政收入的来源&lt;/s&gt;</span><div class="meta">0.36s</div></td>
+<td><span class="w1-text">在二零一九年十一月十五日&lt;/s&gt;</span><div class="meta">0.71s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">6</span><div class="meta">11.62s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0202.wav"></audio></td>
+<td class="gt-text">    转化  成  由  资产  产生  的  现金  流  作  担保  可  自由  流通  的  证券</td>
+<td><span class="w0-text">在一片质疑声中&lt;/s&gt;</span><div class="meta">0.41s</div></td>
+<td><span class="w1-text">据了解&lt;/s&gt;</span><div class="meta">0.23s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">7</span><div class="meta">11.87s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0204.wav"></audio></td>
+<td class="gt-text">    目前  我  国正  在  稳步  开展  中小  企业  信贷  资产  证券  化  试点</td>
+<td><span class="w0-text">证券化是指将证券公司的资产证券化&lt;/s&gt;</span><div class="meta">0.98s</div></td>
+<td><span class="w1-text">在二零一五年十月十五日&lt;/s&gt;</span><div class="meta">0.82s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">8</span><div class="meta">12.43s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0223.wav"></audio></td>
+<td class="gt-text">    资源  环境  面临  较大  压力  有  的  企业  管理  水平  不  高</td>
+<td><span class="w0-text">有的企业关联水平偏低&lt;/s&gt;</span><div class="meta">0.6s</div></td>
+<td><span class="w1-text">一名男子在一家餐厅内被一名女子殴打&lt;/s&gt;</span><div class="meta">1.25s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">9</span><div class="meta">11.95s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0421.wav"></audio></td>
+<td class="gt-text">    贵州  都市  报  十月  二十九  日报  道  据  台湾  媒体  报道  艺人  陈  妍  希  认  爱小  四  岁  的大  陆  小生  陈  晓</td>
+<td><span class="w0-text">据报道&lt;/s&gt;</span><div class="meta">0.15s</div></td>
+<td><span class="w1-text">据了解&lt;/s&gt;</span><div class="meta">0.2s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">10</span><div class="meta">13.19s</div></td>
+<td><audio controls src="samples/aishell1_test/BAC009S0915W0460.wav"></audio></td>
+<td class="gt-text">    游戏  主播  花样  作死  声称  天津  是  他  炸  的  直播  被  抓  游戏  室  老板  因  冲突  开枪  将  人  射  伤  致死</td>
+<td><span class="w0-text">刘喜主播花样作死声称天津市滨海新区人民法院判决&lt;/s&gt;</span><div class="meta">1.26s</div></td>
+<td><span class="w1-text">而这些人也都有着不同的背景和经历&lt;/s&gt;</span><div class="meta">0.97s</div></td>
+</tr>
+</tbody></table>
+</div>
+</div>
+<div class="tab-content" id="tab-spc_r_test">
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge transcribe">transcribe</span>
+<span class="task-title">Speech-to-text transcription</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Ground Truth</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">19.48s</div></td>
+<td><audio controls src="samples/spc_r_test/row00000_seg000.wav"></audio></td>
+<td class="gt-text">Die SVP-Fraktion wird die Motion als Ganzes ablehnen, und zwar in allen Punkten, weil die Abschreibung bestritten wird, in allen Punkten, wo eben die Annahme beantragt wird. Es wird einzelne geben, die werden die Punkte die Einzelnen annehmen, aber dann wird auch die Abschreibung befürwortet.</td>
+<td><span class="w0-text">Die SVP-Fraktion wird die Motion als Ganzes ablehnen und zwar in allen Punkten, weil die Abschreibung bestritten wird, in allen Punkten, weil die Annahme beantragt wird. Es wird einzelne geben, die werden die Punkte einzelnen annehmen und aber auch die Abschreibung befürworten.&lt;/s&gt;</span><div class="meta">6.7s</div></td>
+<td><span class="w1-text">Die SVP-Fraktion wird Motion als ganzes ablehnen und zwar in allen Punkten, weil die Abschreibung bestritten wird. In allen Punkten werden wir Annahme ablehnen. Es wird eigentlich nur noch, weil die Punkte 1 und 2 einzeln angenommen und abschreiben wird, bestritten.&lt;/s&gt;</span><div class="meta">8.27s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">3.26s</div></td>
+<td><audio controls src="samples/spc_r_test/row00000_seg001.wav"></audio></td>
+<td class="gt-text">Und da erlauben wir jetzt gleich noch heute ein paar Bemerkungen.</td>
+<td><span class="w0-text">Und der Herr Maurer-Brienz gleich noch, wo die Spare mehr geht.&lt;/s&gt;</span><div class="meta">1.53s</div></td>
+<td><span class="w1-text">Und darum haben wir uns entschieden, das Parlament hier gegen die Regierung zu stellen.&lt;/s&gt;</span><div class="meta">1.73s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">16.8s</div></td>
+<td><audio controls src="samples/spc_r_test/row00001_seg000.wav"></audio></td>
+<td class="gt-text">Und ich habe gesehen, wie selbstständige Erwerbende, die auf dem Papier das tatsächlich sind, auf Berner Baustellen arbeiten und vor allem zu welchen Lohnbedingungen sie arbeiten. Da kann man hinten und vorne nicht von gleich langen Spiessen sprechen.</td>
+<td><span class="w0-text">Und ich habe selber hier selbständige Werbung gemacht, wie ich das tatsächlich auf Berner Baustellen machen und Frauen zu einem Lohn bringen. Das ist auch ein hinderer Vorermittlungsgrund gewesen.&lt;/s&gt;</span><div class="meta">2.49s</div></td>
+<td><span class="w1-text">Und ich sehe, dass wir selbstständige werden, die auf dem Papier das darstellen, das sie auf der Baustelle machen. Und vor allem zu den Bauen zu den Logen, die man hier machen kann. Ich komme hier vorne her und sage, ich habe eine Spielsitzung.&lt;/s&gt;</span><div class="meta">4.66s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">16.71s</div></td>
+<td><audio controls src="samples/spc_r_test/row00002_seg000.wav"></audio></td>
+<td class="gt-text">Sehr geehrter Herr Grossratspräsident, geschätzte Kolleginnen und Kollegen, im Namen der Finanzkommissionsmehrheit, zugegebenermassen geringe Mehrheit, streichen wir als Regierungsrat drei Anträge auf der Synopsen.</td>
+<td><span class="w0-text">Sehr geehrter Grossratspräsident, geschätzte Kolleginnen und Kollegen, im Namen der Finanzkommissionsmehrheit, zugegebenermassen eine geringe Mehrheit, ich würde sagen, die Mehrheit, die die Streichung als Regierungsrat 3 beantragt, auf das Votum&lt;/s&gt;</span><div class="meta">4.57s</div></td>
+<td><span class="w1-text">Herr Präsident, Herr Grossratspräsident, geschätzte Kolleginnen und Kollegen, im Namen der Finanzkommission freue ich mich, Ihnen mitzuteilen, dass wir eine grüne Mehrheit haben, die wir in der Mehrheit der Regierungsrat drin hat, und es ist schwierig, aus der Regierungsrat drin hat, auf das Resultat zu schauen.&lt;/s&gt;</span><div class="meta">5.55s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">12.61s</div></td>
+<td><audio controls src="samples/spc_r_test/row00002_seg001.wav"></audio></td>
+<td class="gt-text">Zuerst bestreiten wir, das war der Kernpunkt in der ersten Lesung, ob wir einen einstufigen oder einen zweistufigen Instanzenzug in den Beschwerdeverfahren wollen.</td>
+<td><span class="w0-text">Ausserdem bestreiten wir den Kernpunkt in der ersten Lesung, dass die Schulinspektion in die Schulinspektion im Schaltjahr in den Beschwerdeverfahren will.&lt;/s&gt;</span><div class="meta">4.29s</div></td>
+<td><span class="w1-text">Auch für sie wird es wichtig, dass der Fahnenturm sichtbar ist, dass man ein Zeichen aussenden kann, dass man zur Ausschau nach den Beschwerden gefahren ist.&lt;/s&gt;</span><div class="meta">3.89s</div></td>
+</tr>
+</tbody></table>
+</div>
+<div class="task-section">
+<div class="task-header">
+<span class="task-badge continue">continue</span>
+<span class="task-title">Text continuation from speech</span>
+</div>
+<table>
+<thead><tr>
+<th style="width:60px">#</th><th style="width:220px">Audio</th>
+<th>Transcription</th>
+<th class="w0-col">weight-0</th>
+<th class="w1-col">weight-1</th>
+</tr></thead>
+<tbody>
+<tr>
+<td><span class="sample-info">1</span><div class="meta">19.48s</div></td>
+<td><audio controls src="samples/spc_r_test/row00000_seg000.wav"></audio></td>
+<td class="gt-text">Die SVP-Fraktion wird die Motion als Ganzes ablehnen, und zwar in allen Punkten, weil die Abschreibung bestritten wird, in allen Punkten, wo eben die Annahme beantragt wird. Es wird einzelne geben, die werden die Punkte die Einzelnen annehmen, aber dann wird auch die Abschreibung befürwortet.</td>
+<td><span class="w0-text">Die SVP-Fraktion wird die Motion einstimmig ablehnen. Danke.&lt;/s&gt;</span><div class="meta">4.22s</div></td>
+<td><span class="w1-text">Die Motion verlangt, dass die Gemeinden die Möglichkeit haben, die Ausgaben für die Abfallentsorgung zu übernehmen. Das ist eine sehr gute Idee. Es ist aber nicht so, dass die Gemeinden das nicht schon machen. Die Gemeinden haben bereits heute die Möglichkeit, die Abfallentsorgung zu übernehmen.&lt;/s&gt;</span><div class="meta">6.42s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">2</span><div class="meta">3.26s</div></td>
+<td><audio controls src="samples/spc_r_test/row00000_seg001.wav"></audio></td>
+<td class="gt-text">Und da erlauben wir jetzt gleich noch heute ein paar Bemerkungen.</td>
+<td><span class="w0-text">Die Motionärin hat es vorhin gesagt, es geht um die Frage, ob man die 100&#x27;000 Franken, die man für die Spitäler vorgesehen hat, ob man die in die Spitäler oder in die Hausärzte verschiebt. Das ist eine Frage, die man beantworten kann. Man kann sagen, man verschiebt sie in die Spitäler.&lt;/s&gt;</span><div class="meta">4.85s</div></td>
+<td><span class="w1-text">Und das ist ein bisschen schade, weil es ist ein bisschen kompliziert, aber es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert, weil es ist ein bisschen kompliziert,</span><div class="meta">27.96s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">3</span><div class="meta">16.8s</div></td>
+<td><audio controls src="samples/spc_r_test/row00001_seg000.wav"></audio></td>
+<td class="gt-text">Und ich habe gesehen, wie selbstständige Erwerbende, die auf dem Papier das tatsächlich sind, auf Berner Baustellen arbeiten und vor allem zu welchen Lohnbedingungen sie arbeiten. Da kann man hinten und vorne nicht von gleich langen Spiessen sprechen.</td>
+<td><span class="w0-text">Ich habe es vorhin gesagt, es ist ein sehr komplexes Thema, das wir hier diskutieren. Und ich bin überzeugt, dass wir hier im Rat, wenn wir uns mit diesem Thema auseinandersetzen, auch immer wieder auf die Fakten schauen müssen. Und ich bin überzeugt, dass wir hier im Rat auch immer wieder auf die Fakten schauen müssen.&lt;/s&gt;</span><div class="meta">3.89s</div></td>
+<td><span class="w1-text">Ich habe es vorhin gesagt, wir haben es auch schon in der ersten Lesung gesagt, wir haben es auch in der zweiten Lesung gesagt, wir haben es auch in der dritten Lesung gesagt, wir haben es auch in der vierten Lesung gesagt, wir haben es auch in der fünften Lesung gesagt, wir haben es auch in der sechsten Lesung gesagt, wir haben es auch in der siebten Lesung gesagt, wir haben es auch in der achten Lesung gesagt, wir haben es auch in der neunten Lesung gesagt, wir haben es auch in der zehnten Lesung gesagt, wir haben es auch in der elften Lesung gesagt, wir haben es auch in der zwölften Lesung gesagt, wir haben es auch in der dreizehnten Lesung gesagt, wir haben es auch in der vierzehnten Lesung gesagt, wir haben es auch in der fünfzehnten Lesung gesagt, wir haben es auch in der sechzehnten Lesung gesagt, wir haben es auch in der siebzehnten Lesung gesagt, wir haben es auch in der achtzehnten Lesung gesagt, wir haben es auch in der neunzehnten Lesung gesagt, wir haben es auch in der zwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten Lesung gesagt, wir haben es auch in der einundzwanzigsten lesung gesagt, wir haben es auch in der einundzwanzigsten lesung gesagt, wir haben es auch in der einundzwanzigsten lesung gesagt, wir haben es auch in</span><div class="meta">25.79s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">4</span><div class="meta">16.71s</div></td>
+<td><audio controls src="samples/spc_r_test/row00002_seg000.wav"></audio></td>
+<td class="gt-text">Sehr geehrter Herr Grossratspräsident, geschätzte Kolleginnen und Kollegen, im Namen der Finanzkommissionsmehrheit, zugegebenermassen geringe Mehrheit, streichen wir als Regierungsrat drei Anträge auf der Synopsen.</td>
+<td><span class="w0-text">Ich habe es vorhin gesagt, es ist ein Antrag, der von der Finanzkommission mit 10 zu 0 Stimmen bei 1 Enthaltung überwiesen wurde.&lt;/s&gt;</span><div class="meta">1.83s</div></td>
+<td><span class="w1-text">Wir haben es gehört, es ist ein sehr komplexes Thema, das wir hier beraten. Es ist ein Thema, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir hier beraten, das wir</span><div class="meta">26.62s</div></td>
+</tr>
+<tr>
+<td><span class="sample-info">5</span><div class="meta">12.61s</div></td>
+<td><audio controls src="samples/spc_r_test/row00002_seg001.wav"></audio></td>
+<td class="gt-text">Zuerst bestreiten wir, das war der Kernpunkt in der ersten Lesung, ob wir einen einstufigen oder einen zweistufigen Instanzenzug in den Beschwerdeverfahren wollen.</td>
+<td><span class="w0-text">Es ist nicht so, dass die Schulinspektorate, die die Aufsicht über die Schulen haben, dass die die Schulen nicht besuchen dürfen. Sie dürfen sie beliebig oft besuchen. Sie haben auch die Möglichkeit, die Schulbücher zu kontrollieren. Sie haben die Möglichkeit, die Unterrichtsunterlagen zu kontrollieren.&lt;/s&gt;</span><div class="meta">4.3s</div></td>
+<td><span class="w1-text">Wir haben in der Zwischenzeit auch die Möglichkeit, dass wir die Ausgaben der öffentlichen Hand, die wir in der Vergangenheit hatten, in der Zukunft noch einmal überprüfen können.&lt;/s&gt;</span><div class="meta">2.07s</div></td>
+</tr>
+</tbody></table>
+</div>
+</div>
+
+<script>
+function switchTab(ds) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + ds).classList.add('active');
+  document.querySelectorAll('.tab').forEach(el => {
+    if (el.getAttribute('onclick').includes("'" + ds + "'")) el.classList.add('active');
+  });
+  window.scrollTo({top: document.querySelector('.tabs').offsetTop - 10, behavior: 'smooth'});
+}
+</script>
+<div class="footer">Apertus &mdash; Swiss AI</div>
+</body></html>

@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio Tokenization Pipeline</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --text-dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --orange: #d29922; --red: #f85149;
+    --purple: #bc8cff; --pink: #f778ba; --cyan: #39d2c0;
+    --yellow: #e3b341;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.6; padding: 2rem; max-width: 1200px; margin: 0 auto;
+  }
+  h1 { font-size: 2.2rem; color: #fff; margin-bottom: 0.2rem; }
+  h2 {
+    font-size: 1.4rem; color: #fff; margin: 3rem 0 1.2rem;
+    border-bottom: 1px solid var(--border); padding-bottom: 0.4rem;
+  }
+  h3 { font-size: 1.05rem; color: var(--accent); margin: 1.5rem 0 0.5rem; }
+  p { margin-bottom: 0.5rem; font-size: 0.92rem; }
+  code {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    background: var(--surface); padding: 0.12em 0.35em; border-radius: 3px;
+    font-size: 0.85em; color: var(--cyan);
+  }
+  pre {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.8rem 1rem; overflow-x: auto;
+    font-size: 0.82rem; line-height: 1.45; margin: 0.6rem 0 1rem;
+  }
+  pre code { background: none; padding: 0; color: var(--text); }
+  .sub { color: var(--text-dim); font-size: 0.95rem; margin-bottom: 2.5rem; }
+  table { width: 100%; border-collapse: collapse; margin: 0.8rem 0; font-size: 0.85rem; }
+  th, td { padding: 0.4rem 0.7rem; border: 1px solid var(--border); text-align: left; }
+  th { background: var(--surface); color: var(--accent); font-weight: 600; }
+
+  /* ---- Flow diagrams ---- */
+  .flow {
+    display: flex; flex-wrap: wrap; gap: 0; align-items: stretch;
+    justify-content: center; margin: 1.2rem 0;
+  }
+  .flow-box {
+    background: var(--surface); border: 1.5px solid var(--border);
+    border-radius: 10px; padding: 0.7rem 1.1rem; text-align: center;
+    font-size: 0.82rem; min-width: 130px; position: relative;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .flow-box b { color: #fff; display: block; margin-bottom: 2px; font-size: 0.88rem; }
+  .flow-box small { color: var(--text-dim); font-size: 0.75rem; }
+  .flow-box.blue  { border-color: var(--accent); background: #111827; }
+  .flow-box.green { border-color: var(--green); background: #0d1f12; }
+  .flow-box.purple { border-color: var(--purple); background: #160d22; }
+  .flow-box.orange { border-color: var(--orange); background: #1a1505; }
+  .flow-box.pink { border-color: var(--pink); background: #1f0d18; }
+  .fa { color: var(--text-dim); font-size: 1.6rem; display: flex; align-items: center; padding: 0 0.3rem; }
+
+  /* ---- Vertical flow ---- */
+  .vflow { display: flex; flex-direction: column; align-items: center; gap: 0; margin: 1rem 0; }
+  .vflow .fa { font-size: 1.2rem; padding: 0.15rem 0; }
+  .vflow .flow-box { min-width: 320px; }
+
+  /* ---- Split layout ---- */
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin: 1rem 0; }
+  @media (max-width: 750px) { .split { grid-template-columns: 1fr; } }
+
+  /* ---- Cards ---- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.8rem; margin: 1rem 0; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.8rem 1rem; text-align: center;
+  }
+  .card .v { font-size: 1.5rem; font-weight: 700; color: #fff; }
+  .card .l { color: var(--text-dim); font-size: 0.78rem; margin-top: 2px; }
+
+  /* ---- Token sequence ---- */
+  .tok-seq {
+    display: flex; flex-wrap: wrap; gap: 3px; margin: 0.6rem 0 1rem;
+    align-items: center; justify-content: center;
+  }
+  .tok {
+    display: inline-block; padding: 5px 9px; border-radius: 5px;
+    font-family: monospace; font-size: 0.75rem; font-weight: 600; white-space: nowrap;
+  }
+  .tok.bos    { background: #122a1a; color: var(--green); border: 1px solid var(--green); }
+  .tok.eos    { background: #122a1a; color: var(--green); border: 1px solid var(--green); }
+  .tok.astart { background: #0f1e33; color: var(--accent); border: 1px solid var(--accent); }
+  .tok.aend   { background: #0f1e33; color: var(--accent); border: 1px solid var(--accent); }
+  .tok.audio  { background: #15102a; color: var(--purple); border: 1px solid #6e40aa; }
+  .tok.task   { background: #221a08; color: var(--orange); border: 1px solid var(--orange); }
+  .tok.text   { background: #220818; color: var(--pink); border: 1px solid var(--pink); }
+  .tok.dots   { background: none; color: var(--text-dim); border: none; font-size: 1rem; padding: 0 4px; }
+
+  /* ---- Architecture diagram ---- */
+  .arch {
+    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.6rem;
+    margin: 1rem 0; font-size: 0.78rem;
+  }
+  .arch-col {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.7rem; min-height: 120px;
+  }
+  .arch-col h4 { color: var(--accent); font-size: 0.85rem; margin-bottom: 0.4rem; border-bottom: 1px solid var(--border); padding-bottom: 3px; }
+  .arch-col .f { color: var(--cyan); font-family: monospace; font-size: 0.76rem; display: block; margin: 2px 0; }
+  .arch-col .f span { color: var(--text-dim); font-family: inherit; }
+  @media (max-width: 750px) { .arch { grid-template-columns: 1fr; } }
+
+  .note {
+    background: #111a28; border-left: 3px solid var(--accent);
+    padding: 0.6rem 0.9rem; border-radius: 0 6px 6px 0;
+    margin: 0.8rem 0; font-size: 0.85rem;
+  }
+
+  /* ---- Multi-node diagram ---- */
+  .nodes {
+    display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; margin: 1rem 0;
+  }
+  .node-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.6rem 0.8rem; text-align: center;
+    min-width: 100px; font-size: 0.78rem;
+  }
+  .node-box b { color: #fff; display: block; font-size: 0.82rem; }
+  .gpu { display: inline-block; background: #1a1a30; border: 1px solid var(--purple);
+    border-radius: 4px; padding: 2px 6px; margin: 2px; font-size: 0.7rem; color: var(--purple); }
+</style>
+</head>
+<body>
+
+<h1>Audio Tokenization Pipeline</h1>
+<p class="sub">Raw audio + text &rarr; discrete tokens for multimodal training</p>
+
+<!-- ================================================================ -->
+<h2>1. End-to-End Flow</h2>
+
+<div class="flow">
+  <div class="flow-box orange">
+    <b>Raw Data</b>
+    <small>WDS tars / HF / audio dirs</small>
+    <small>audio + text sidecars</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box blue">
+    <b>prepare_*_to_shar</b>
+    <small>Resample &bull; VAD chunk</small>
+    <small>Text tokenize &bull; Write Shar</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box green">
+    <b>Lhotse Shar</b>
+    <small>audio (FLAC tar)</small>
+    <small>cuts (JSONL.gz + text_tokens)</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box purple">
+    <b>tokenize.py</b>
+    <small>GPU: WavTokenizer encode</small>
+    <small>Assemble sequences</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box pink">
+    <b>Training Data</b>
+    <small>bin/idx (direct)</small>
+    <small>Parquet (interleaved)</small>
+  </div>
+</div>
+
+<!-- ================================================================ -->
+<h2>2. Stage 1: Data Preparation (Shar)</h2>
+
+<div class="split">
+  <div>
+    <div class="vflow">
+      <div class="flow-box orange" style="min-width:280px">
+        <b>WDS Tar Shard</b>
+        <small>sample_001.wav + sample_001.json</small>
+      </div>
+      <div class="fa">&darr;</div>
+      <div class="flow-box blue" style="min-width:280px">
+        <b>iter_tar_cuts()</b>
+        <small>Parse sidecars &bull; Recording.from_bytes()</small>
+        <small>&rarr; Lhotse Cut with supervision.text</small>
+      </div>
+      <div class="fa">&darr;</div>
+      <div class="flow-box blue" style="min-width:280px">
+        <b>Process</b>
+        <small>Resample to 24kHz &bull; Mono downmix</small>
+        <small>VAD split (optional) &bull; min_sr filter</small>
+      </div>
+      <div class="fa">&darr;</div>
+      <div class="flow-box blue" style="min-width:280px">
+        <b>Text Tokenize</b>
+        <small>omni_tokenizer.encode(text, add_special_tokens=False)</small>
+        <small>&rarr; cut.custom["text_tokens"]</small>
+      </div>
+      <div class="fa">&darr;</div>
+      <div class="flow-box green" style="min-width:280px">
+        <b>SharWriter</b>
+        <small>cuts.XXXXXX.jsonl.gz + recording.XXXXXX.flac.tar</small>
+      </div>
+    </div>
+  </div>
+  <div>
+    <h3>Shar Directory Layout</h3>
+    <pre><code>output_shar/
+ worker_00/
+   cuts.000000.jsonl.gz
+   recording.000000.flac.tar
+   cuts.000001.jsonl.gz
+   recording.000001.flac.tar
+   worker_stats.json
+   _SUCCESS
+ worker_01/
+   ...
+ shar_index.json
+ _worker_assignment.json</code></pre>
+
+    <h3>Cut Manifest (1 line per clip)</h3>
+    <pre><code>{
+ "id": "EN__youtube__XyZ__chunk_0",
+ "duration": 7.32,
+ "sampling_rate": 24000,
+ "recording": {
+   "sources": [{"type":"shar","source":""}]
+ },
+ "supervisions": [{
+   "text": "Hello world..."
+ }],
+ "custom": {
+   "text_tokens": [1234, 567, 890, ...]
+ }
+}</code></pre>
+  </div>
+</div>
+
+<!-- ================================================================ -->
+<h2>3. Omni Tokenizer Vocabulary</h2>
+
+<p>Unified vocabulary across text, vision, and audio modalities:</p>
+
+<div style="display:flex; gap:0; justify-content:center; flex-wrap:wrap; margin:1rem 0;">
+  <div style="background:#122a1a; border:1px solid var(--green); border-radius:8px 0 0 8px; padding:0.6rem 1rem; text-align:center; min-width:140px;">
+    <div style="color:var(--green); font-weight:700; font-size:0.85rem;">Text Tokens</div>
+    <div style="color:var(--text-dim); font-size:0.75rem;">0 &ndash; 131,071</div>
+  </div>
+  <div style="background:#221a08; border:1px solid var(--orange); padding:0.6rem 1rem; text-align:center; min-width:140px;">
+    <div style="color:var(--orange); font-weight:700; font-size:0.85rem;">Special Tokens</div>
+    <div style="color:var(--text-dim); font-size:0.75rem;">BOS(1) EOS(2)</div>
+    <div style="color:var(--text-dim); font-size:0.75rem;">audio_start/end</div>
+  </div>
+  <div style="background:#0f1528; border:1px solid #4488cc; padding:0.6rem 1rem; text-align:center; min-width:140px;">
+    <div style="color:#4488cc; font-weight:700; font-size:0.85rem;">Vision Tokens</div>
+    <div style="color:var(--text-dim); font-size:0.75rem;">131,084 &ndash; ~262K</div>
+  </div>
+  <div style="background:#15102a; border:1px solid var(--purple); border-radius:0 8px 8px 0; padding:0.6rem 1rem; text-align:center; min-width:140px;">
+    <div style="color:var(--purple); font-weight:700; font-size:0.85rem;">Audio Tokens</div>
+    <div style="color:var(--text-dim); font-size:0.75rem;">~262K &ndash; ~266K</div>
+    <div style="color:var(--text-dim); font-size:0.75rem;">4096 codes + offset</div>
+  </div>
+</div>
+
+<table>
+  <tr><th>Token</th><th>ID</th><th>Role</th></tr>
+  <tr><td><code>BOS</code></td><td>1</td><td>Sequence start</td></tr>
+  <tr><td><code>EOS</code></td><td>2</td><td>Sequence end</td></tr>
+  <tr><td><code>&lt;|audio_start|&gt;</code></td><td>131080</td><td>Audio block start marker</td></tr>
+  <tr><td><code>&lt;|audio_end|&gt;</code></td><td>131081</td><td>Audio block end marker</td></tr>
+  <tr><td><code>&lt;|speech_transcribe|&gt;</code></td><td>131082</td><td>Task: transcription</td></tr>
+  <tr><td><code>&lt;|audio token 0..4095|&gt;</code></td><td>offset..offset+4095</td><td>WavTokenizer codec indices</td></tr>
+</table>
+
+<div class="note">
+  <b>Offset mapping:</b> <code>stored = raw_codec + offset</code> where <code>offset = tokenizer.convert_tokens_to_ids("&lt;|audio token 0|&gt;")</code>
+</div>
+
+<!-- ================================================================ -->
+<h2>4. WavTokenizer-40</h2>
+
+<div class="cards">
+  <div class="card"><div class="v">40</div><div class="l">tokens / second</div></div>
+  <div class="card"><div class="v">4096</div><div class="l">codebook size</div></div>
+  <div class="card"><div class="v">24kHz</div><div class="l">sample rate</div></div>
+  <div class="card"><div class="v">1</div><div class="l">codebook</div></div>
+  <div class="card"><div class="v">600</div><div class="l">downsample rate</div></div>
+</div>
+
+<div class="flow" style="margin:1.5rem 0;">
+  <div class="flow-box orange" style="min-width:100px;">
+    <b>Audio</b>
+    <small>24kHz waveform</small>
+    <small>(padded batch)</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box purple" style="min-width:140px;">
+    <b>WavTokenizer</b>
+    <small>GPU encode</small>
+    <small>&rarr; [0..4095] per frame</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box blue" style="min-width:100px;">
+    <b>+ Offset</b>
+    <small>Map into</small>
+    <small>omni vocab</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box green" style="min-width:160px;">
+    <b>Token Sequence</b>
+    <small>[audio_start, tok, ..., audio_end]</small>
+  </div>
+</div>
+
+<p><code>trim_last_tokens=5</code> removes trailing tokens from padded samples to avoid artifacts.</p>
+
+<!-- ================================================================ -->
+<h2>5. Output Formats &amp; Token Assembly</h2>
+
+<div class="split">
+  <div>
+    <h3>Direct (Megatron bin/idx)</h3>
+    <p style="font-size:0.82rem; color:var(--text-dim);">Complete training sequence per document:</p>
+    <div class="tok-seq" style="justify-content:flex-start;">
+      <span class="tok bos">BOS</span>
+      <span class="tok astart">audio_start</span>
+      <span class="tok audio">aud</span>
+      <span class="tok audio">aud</span>
+      <span class="tok dots">...</span>
+      <span class="tok audio">aud</span>
+      <span class="tok aend">audio_end</span>
+      <span class="tok task">task</span>
+      <span class="tok text">txt</span>
+      <span class="tok text">txt</span>
+      <span class="tok dots">...</span>
+      <span class="tok eos">EOS</span>
+    </div>
+    <pre><code>rank_0000_chunk_0000.bin  # token data
+rank_0000_chunk_0000.idx  # doc index</code></pre>
+  </div>
+  <div>
+    <h3>Interleaved (Parquet)</h3>
+    <p style="font-size:0.82rem; color:var(--text-dim);">Raw tokens per clip (no BOS/EOS/task):</p>
+    <div style="display:flex; gap:6px; margin:0.5rem 0;">
+      <div style="flex:1;">
+        <div style="font-size:0.72rem; color:var(--accent); margin-bottom:2px;">audio_tokens</div>
+        <div class="tok-seq" style="justify-content:flex-start;">
+          <span class="tok astart" style="font-size:0.68rem; padding:3px 5px;">a_s</span>
+          <span class="tok audio" style="font-size:0.68rem; padding:3px 5px;">aud</span>
+          <span class="tok dots" style="font-size:0.8rem;">...</span>
+          <span class="tok aend" style="font-size:0.68rem; padding:3px 5px;">a_e</span>
+        </div>
+      </div>
+      <div style="flex:1;">
+        <div style="font-size:0.72rem; color:var(--accent); margin-bottom:2px;">text_tokens</div>
+        <div class="tok-seq" style="justify-content:flex-start;">
+          <span class="tok text" style="font-size:0.68rem; padding:3px 5px;">txt</span>
+          <span class="tok text" style="font-size:0.68rem; padding:3px 5px;">txt</span>
+          <span class="tok dots" style="font-size:0.8rem;">...</span>
+        </div>
+      </div>
+    </div>
+    <pre><code>rank_0000_chunk_0000.parquet
+  clip_id | text | text_tokens
+  audio_tokens | duration | dataset</code></pre>
+  </div>
+</div>
+
+<!-- ================================================================ -->
+<h2>6. Stage 2: GPU Tokenization Loop</h2>
+
+<div class="vflow">
+  <div class="flow-box green" style="min-width:380px;">
+    <b>build_cutset()</b>
+    <small>Load shar_index.json &rarr; CutSet.from_shar() &rarr; round-robin split across ranks &rarr; filter (sr, duration)</small>
+  </div>
+  <div class="fa">&darr;</div>
+  <div class="flow-box blue" style="min-width:380px;">
+    <b>DynamicBucketingSampler</b>
+    <small>Group clips by duration into 20 buckets &rarr; fill batches up to max_batch_duration (2000s)</small>
+  </div>
+  <div class="fa">&darr;</div>
+  <div class="flow-box blue" style="min-width:380px;">
+    <b>DataLoader</b>
+    <small>32 workers decode audio from Shar &bull; prefetch_factor=4 &bull; pin_memory</small>
+  </div>
+  <div class="fa">&darr;</div>
+  <div class="flow-box purple" style="min-width:380px;">
+    <b>handler.process_batch()</b>
+    <small>Audio &rarr; GPU &rarr; WavTokenizer &rarr; audio tokens &bull; Read text_tokens from cut.custom &bull; Assemble &amp; write</small>
+  </div>
+  <div class="fa">&darr;</div>
+  <div class="flow-box orange" style="min-width:380px;">
+    <b>Checkpoint (every 500 batches)</b>
+    <small>Finalize chunk &rarr; atomic rename .tmp &rarr; save sampler state + stats &rarr; open next chunk</small>
+  </div>
+</div>
+
+<!-- ================================================================ -->
+<h2>7. Multi-Node Architecture</h2>
+
+<p>Fault-isolated: no NCCL, no collectives. Each rank is fully independent.</p>
+
+<div class="nodes">
+  <div class="node-box">
+    <b>Node 0</b>
+    <div><span class="gpu">Rank 0</span><span class="gpu">Rank 1</span></div>
+    <div><span class="gpu">Rank 2</span><span class="gpu">Rank 3</span></div>
+    <div style="font-size:0.7rem; color:var(--text-dim); margin-top:4px;">shards [0,4,8,...]</div>
+  </div>
+  <div class="node-box">
+    <b>Node 1</b>
+    <div><span class="gpu">Rank 4</span><span class="gpu">Rank 5</span></div>
+    <div><span class="gpu">Rank 6</span><span class="gpu">Rank 7</span></div>
+    <div style="font-size:0.7rem; color:var(--text-dim); margin-top:4px;">shards [1,5,9,...]</div>
+  </div>
+  <div class="node-box">
+    <b>Node 2</b>
+    <div><span class="gpu">Rank 8</span><span class="gpu">Rank 9</span></div>
+    <div><span class="gpu">Rank 10</span><span class="gpu">Rank 11</span></div>
+    <div style="font-size:0.7rem; color:var(--text-dim); margin-top:4px;">shards [2,6,10,...]</div>
+  </div>
+  <div class="node-box">
+    <b>Node 3</b>
+    <div><span class="gpu">Rank 12</span><span class="gpu">Rank 13</span></div>
+    <div><span class="gpu">Rank 14</span><span class="gpu">Rank 15</span></div>
+    <div style="font-size:0.7rem; color:var(--text-dim); margin-top:4px;">shards [3,7,11,...]</div>
+  </div>
+</div>
+
+<div style="text-align:center; font-size:0.8rem; color:var(--text-dim); margin:0.5rem 0;">
+  Shard assignment: <code>shards[rank::world_size]</code> &mdash; each rank reads/writes independently
+</div>
+
+<div class="cards" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
+  <div class="card" style="text-align:left; padding:0.7rem 1rem;">
+    <div style="color:var(--green); font-weight:600; font-size:0.85rem;">No NCCL</div>
+    <div style="font-size:0.78rem; color:var(--text-dim);">No collectives, no deadlocks. One rank crash doesn't affect others.</div>
+  </div>
+  <div class="card" style="text-align:left; padding:0.7rem 1rem;">
+    <div style="color:var(--green); font-weight:600; font-size:0.85rem;">Per-Rank Checkpoint</div>
+    <div style="font-size:0.78rem; color:var(--text-dim);">Each rank saves rank_XXXX_checkpoint.pt independently. Resume restores sampler state.</div>
+  </div>
+  <div class="card" style="text-align:left; padding:0.7rem 1rem;">
+    <div style="color:var(--green); font-weight:600; font-size:0.85rem;">Atomic Writes</div>
+    <div style="font-size:0.78rem; color:var(--text-dim);">Write to .tmp, then os.replace(). No partial files on crash.</div>
+  </div>
+</div>
+
+<!-- ================================================================ -->
+<h2>8. Detokenization (Decode)</h2>
+
+<div class="flow">
+  <div class="flow-box pink" style="min-width:160px;">
+    <b>Token Sequence</b>
+    <small>[BOS, a_s, aud..., a_e, task, txt..., EOS]</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box blue" style="min-width:120px;">
+    <b>Extract</b>
+    <small>Find audio_start/end</small>
+    <small>Slice tokens between</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box blue" style="min-width:100px;">
+    <b>&minus; Offset</b>
+    <small>Recover raw</small>
+    <small>[0..4095]</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box purple" style="min-width:120px;">
+    <b>WavTokenizer</b>
+    <small>GPU decode</small>
+  </div>
+  <div class="fa">&rarr;</div>
+  <div class="flow-box green" style="min-width:100px;">
+    <b>Audio</b>
+    <small>24kHz WAV</small>
+  </div>
+</div>
+
+<pre><code>raw_codes, audio, info = tokenizer.detokenize(token_tensor)
+# Works for both audio_only and audio_text sequences</code></pre>
+
+<!-- ================================================================ -->
+<h2>9. Code Architecture</h2>
+
+<div class="arch">
+  <div class="arch-col">
+    <h4>Entry &amp; Config</h4>
+    <span class="f">tokenize.py <span>Hydra entry</span></span>
+    <span class="f">configs/config.yaml <span>defaults</span></span>
+    <span class="f">configs/dataset/**/*.yaml <span>per-dataset</span></span>
+  </div>
+  <div class="arch-col">
+    <h4>Pipeline (pipelines/lhotse/)</h4>
+    <span class="f">core.py <span>tokenize_loop + entry</span></span>
+    <span class="f">data.py <span>Shar loading + filters</span></span>
+    <span class="f">audio_text.py <span>AudioTextHandler</span></span>
+    <span class="f">audio_only.py <span>AudioOnlyHandler</span></span>
+    <span class="f">checkpoint.py <span>stats, I/O, W&amp;B</span></span>
+  </div>
+  <div class="arch-col">
+    <h4>Tokenizer &amp; Data Prep</h4>
+    <span class="f">vokenizers/wavtokenizer/ <span>encode/decode</span></span>
+    <span class="f">prepare_wds_to_shar.py <span>WDS &rarr; Shar</span></span>
+    <span class="f">prepare_hf_to_shar.py <span>HF &rarr; Shar</span></span>
+    <span class="f">chunking.py <span>VAD chunking</span></span>
+    <span class="f">indexed_dataset.py <span>bin/idx I/O</span></span>
+  </div>
+</div>
+
+<!-- ================================================================ -->
+<h2>10. Production: Emilia-YODAS Isolated</h2>
+
+<div class="cards">
+  <div class="card"><div class="v">2,044,651</div><div class="l">samples</div></div>
+  <div class="card"><div class="v">684.6M</div><div class="l">audio tokens</div></div>
+  <div class="card"><div class="v">60.8M</div><div class="l">text tokens</div></div>
+  <div class="card"><div class="v">0</div><div class="l">errors</div></div>
+  <div class="card"><div class="v">~13 min</div><div class="l">4 GPUs</div></div>
+  <div class="card"><div class="v">2.9 GB</div><div class="l">60 files</div></div>
+</div>
+
+<!-- ================================================================ -->
+<h2>11. Quick Reference</h2>
+
+<pre><code># Step 1: Prepare Shar (includes text tokenization)
+python -m audio_tokenization.utils.prepare_data.prepare_wds_to_shar \
+    --wds-shards '/data/shards/*.tar' \
+    --shar-dir /output/shar \
+    --text-tokenizer /path/to/tokenizer.json \
+    --target-sr 24000 --num-workers 32
+
+# Step 2: GPU Tokenize (direct)
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+    -m audio_tokenization.tokenize \
+    dataset=audio_text/emilia_yodas_isolated \
+    mode=audio_text audio_text_format=direct audio_text_task=transcribe
+
+# Step 2: GPU Tokenize (interleaved)
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
+    -m audio_tokenization.tokenize \
+    dataset=audio_text/emilia_yodas_interleaved \
+    mode=audio_text audio_text_format=interleaved
+
+# Verify: decode a sample back to audio
+python -c "
+import torch, torchaudio
+from audio_tokenization.vokenizers.wavtokenizer.audio_only import WavTokenizerAudioOnly
+from audio_tokenization.utils.indexed_dataset import MMapIndexedDataset
+tok = WavTokenizerAudioOnly('/path/to/omni_tokenizer', device='cuda')
+ds = MMapIndexedDataset('/path/to/rank_0000_chunk_0000')
+_, audio, info = tok.detokenize(torch.tensor(ds[0]).long().cuda())
+torchaudio.save('decoded.wav', audio.unsqueeze(0).cpu(), info['output_sample_rate'])
+"</code></pre>
+
+<hr style="border-color: var(--border); margin: 2.5rem 0 1rem;">
+<p style="color: var(--text-dim); font-size: 0.8rem; text-align: center;">
+  Audio Tokenization Pipeline &mdash; Apertus &mdash; Feb 2026
+</p>
+
+</body>
+</html>
