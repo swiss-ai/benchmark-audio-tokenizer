@@ -57,8 +57,9 @@ def load_special_token_ids(tokenizer) -> dict[str, int]:
     names = {
         "audio_start": "<|audio_start|>",
         "audio_end": "<|audio_end|>",
-        "speech_transcribe": "<|speech_transcribe|>",
-        "speech_switch": "<|speech_switch|>",
+        "stt_transcribe": "<|stt_transcribe|>",
+        "stt_continue": "<|stt_continue|>",
+        "tts_continue": "<|tts_continue|>",
     }
     ids = {}
     for key, tok_str in names.items():
@@ -84,9 +85,9 @@ def build_prompt(
     prompt.append(special_ids["audio_end"])
 
     if task == "transcribe":
-        prompt.append(special_ids["speech_transcribe"])
-    elif task == "switch":
-        prompt.append(special_ids["speech_switch"])
+        prompt.append(special_ids["stt_transcribe"])
+    elif task == "continue":
+        prompt.append(special_ids["stt_continue"])
 
     return prompt
 
@@ -259,7 +260,7 @@ def main() -> None:
              "Optionally include metadata.tsv (filename<TAB>text) for ground truth.",
     )
     parser.add_argument(
-        "--task", type=str, choices=["transcribe", "switch", "continue"],
+        "--task", type=str, choices=["transcribe", "continue"],
         default="transcribe",
     )
     parser.add_argument("--num-samples", type=int, default=5)
@@ -288,7 +289,7 @@ def main() -> None:
     special_ids = load_special_token_ids(tokenizer)
     print(f"  bos={bos_id}  eos={eos_id}")
     print(f"  audio_start={special_ids['audio_start']}  audio_end={special_ids['audio_end']}")
-    print(f"  speech_transcribe={special_ids['speech_transcribe']}  speech_switch={special_ids['speech_switch']}")
+    print(f"  stt_transcribe={special_ids['stt_transcribe']}  stt_continue={special_ids['stt_continue']}  tts_continue={special_ids['tts_continue']}")
 
     # ------------------------------------------------------------------
     # 2. Load model
@@ -423,8 +424,8 @@ def main() -> None:
         )
         n_text_out = n_new - n_audio_out
 
-        # For transcribe, the text is ground truth; for switch, it's the audio prompt
-        ref_label = "audio_prompt" if args.task == "switch" else "ground_truth"
+        # For transcribe, the text is ground truth; for continue, it's the audio prompt
+        ref_label = "audio_prompt" if args.task == "continue" else "ground_truth"
 
         result = {
             "sample_idx": i,
