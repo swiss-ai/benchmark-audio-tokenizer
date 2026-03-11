@@ -268,6 +268,10 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature. 0 = greedy.")
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--backend", type=str, choices=["transformers", "vllm"], default="transformers",
+        help="Inference backend to use.",
+    )
     parser.add_argument("--audio-column", type=str, default="audio",
                         help="Column name containing audio data.")
     parser.add_argument("--dataset-name", type=str, default=None,
@@ -294,15 +298,31 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Load model
     # ------------------------------------------------------------------
-    print(f"\nLoading model from {args.model_path} ...")
+    print(f"\nLoading model from {args.model_path} with backend={args.backend} ...")
     t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
+    if args.backend == "transformers":
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model.eval()
+    else:
+        try:
+            from vllm import LLM, SamplingParams
+        except ImportError as e:
+            raise ImportError(
+                "vLLM backend requested but vllm is not installed. "
+                "Install it or run with --backend transformers."
+            ) from e
+        model = LLM(
+            model=args.model_path,
+            tokenizer=tokenizer_path,
+            trust_remote_code=True,
+            dtype="bfloat16",
+        )
+
     print(f"  Model loaded in {time.time() - t0:.1f}s")
 
     # ------------------------------------------------------------------
@@ -342,6 +362,16 @@ def main() -> None:
     #    useless audio tokens after a switch/continue response)
     # ------------------------------------------------------------------
     stop_token_ids = [eos_id, special_ids["audio_start"]]
+    vllm_sampling_params = None
+    if args.backend == "vllm":
+        vllm_top_p = args.top_p if args.temperature > 0 else 1.0
+        vllm_sampling_params = SamplingParams(
+            max_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=vllm_top_p,
+            stop_token_ids=stop_token_ids,
+            skip_special_tokens=False,
+        )
 
     # ------------------------------------------------------------------
     # 7. Inference loop
@@ -391,26 +421,38 @@ def main() -> None:
 
         # Build prompt
         prompt_ids = build_prompt(codes, args.task, bos_id, special_ids)
-        prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=model.device)
 
         # Generate
-        gen_kwargs = dict(
-            max_new_tokens=args.max_new_tokens,
-            eos_token_id=stop_token_ids,
-        )
-        if args.temperature == 0.0:
-            gen_kwargs["do_sample"] = False
-        else:
-            gen_kwargs["do_sample"] = True
-            gen_kwargs["temperature"] = args.temperature
-            gen_kwargs["top_p"] = args.top_p
-
         t_gen = time.time()
-        with torch.no_grad():
-            output = model.generate(prompt_tensor, **gen_kwargs)
+        if args.backend == "transformers":
+            prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=model.device)
+            gen_kwargs = dict(
+                max_new_tokens=args.max_new_tokens,
+                eos_token_id=stop_token_ids,
+            )
+            if args.temperature == 0.0:
+                gen_kwargs["do_sample"] = False
+            else:
+                gen_kwargs["do_sample"] = True
+                gen_kwargs["temperature"] = args.temperature
+                gen_kwargs["top_p"] = args.top_p
+
+            with torch.no_grad():
+                output = model.generate(prompt_tensor, **gen_kwargs)
+            generated_ids = output[0].tolist()
+        else:
+            request_outputs = model.generate(
+                [{"prompt_token_ids": prompt_ids}],
+                sampling_params=vllm_sampling_params,
+                use_tqdm=False,
+            )
+            if not request_outputs or not request_outputs[0].outputs:
+                generated_ids = prompt_ids
+            else:
+                completion_ids = list(request_outputs[0].outputs[0].token_ids)
+                generated_ids = prompt_ids + completion_ids
         gen_time = time.time() - t_gen
 
-        generated_ids = output[0].tolist()
         n_new = len(generated_ids) - len(prompt_ids)
 
         # Decode text portion of output
@@ -458,6 +500,7 @@ def main() -> None:
         "data_source": data_source,
         "dataset_name": dataset_name,
         "task": args.task,
+        "backend": args.backend,
         "num_samples": len(samples),
         "max_new_tokens": args.max_new_tokens,
         "temperature": args.temperature,
