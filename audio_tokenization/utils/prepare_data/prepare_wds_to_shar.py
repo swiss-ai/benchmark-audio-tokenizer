@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Convert standard WebDataset shards (.wav/.flac/.mp3) to Lhotse Shar format.
+"""Convert tar-based audio archives to Lhotse Shar format.
 
-Reads standard WDS tars via the webdataset library, creates Lhotse Cuts from
-raw audio bytes (Recording.from_bytes), resamples to target SR, and writes to
-Shar. Each worker processes a subset of tar shards and writes to its own
-``worker_XX/`` sub-directory. After all workers finish, a merged
-``shar_index.json`` is written so that the tokenization pipeline can load the
-output directly with ``source_type: shar, stage: tokenize`` — no prepare
-stage needed.
+Supports two metadata modes:
 
-Note: Lhotse's ``CutSet.from_webdataset()`` expects Lhotse's own pickle
-format, NOT standard WDS tars. This script bridges the gap.
+1. **Standard WDS** (default): Each tar shard contains paired audio +
+   sidecar files (e.g. ``sample.wav`` + ``sample.txt``).
 
-Usage:
+2. **External metadata** (``--external-metadata``): Audio-only tar/tar.gz
+   archives with transcripts in a separate TSV or JSONL file. Useful for
+   datasets like GigaSpeech2, Common Voice, Suno, NB-Tale, etc.
+
+Creates Lhotse Cuts from raw audio bytes (Recording.from_bytes), resamples
+to target SR, and writes to Shar. Each worker processes a subset of tar
+shards and writes to its own ``worker_XX/`` sub-directory. After all workers
+finish, a merged ``shar_index.json`` is written.
+
+Usage (WDS mode):
     python -m audio_tokenization.utils.prepare_data.prepare_wds_to_shar \
         --wds-shards '/path/to/shards/*.tar' \
         --shar-dir /output/path/shar \
@@ -21,17 +24,26 @@ Usage:
         --shard-size 2000 \
         --shar-format flac \
         --min-sr 16000
+
+Usage (external metadata mode — e.g. GigaSpeech2):
+    python -m audio_tokenization.utils.prepare_data.prepare_wds_to_shar \
+        --wds-shards '/data/th/train/*.tar.gz' \
+        --external-metadata /data/th/train_refined.tsv \
+        --shar-dir /output/gigaspeech2_th/shar \
+        --target-sr 24000 \
+        --num-workers 64 \
+        --shard-size 5000 \
+        --shar-format flac
 """
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 import glob
 import logging
 import time
 from pathlib import Path
-from typing import Optional, Tuple
-
-import orjson
+from typing import Any, Optional, Tuple
 
 from audio_tokenization.utils.prepare_data.common import (
     PREPARE_STATE_FILE,
@@ -72,12 +84,157 @@ logger = logging.getLogger(__name__)
 AUDIO_SUFFIXES = (".wav", ".flac", ".mp3", ".opus", ".ogg")
 SIDECAR_SUFFIXES = (".txt", ".json")
 
+MetadataEntry = tuple[Optional[str], dict[str, Any]]
+
+
+def load_external_metadata(
+    path: str,
+    custom_fields: Optional[Tuple[str, ...]] = None,
+) -> dict[str, MetadataEntry]:
+    """Load transcript metadata from an external TSV or JSONL file.
+
+    Supported formats:
+      - ``.tsv``: headerless, tab-separated ``segment_id<TAB>text``
+      - ``.jsonl``: one JSON object per line with ``"id"`` and ``"text"`` keys
+
+    Returns a ``{segment_id: (text, custom)}`` dict.
+    """
+    from pathlib import Path as _Path
+    p = _Path(path)
+    result: dict[str, MetadataEntry] = {}
+    if p.suffix == ".tsv":
+        with open(p) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    result[parts[0]] = (parts[1], {})
+    elif p.suffix == ".jsonl":
+        import orjson
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = orjson.loads(line)
+                custom = {k: obj[k] for k in (custom_fields or ()) if k in obj}
+                result[obj["id"]] = (obj.get("text"), custom)
+    else:
+        raise ValueError(f"Unsupported external metadata format: {p.suffix} (expected .tsv or .jsonl)")
+    logger.info(f"Loaded {len(result):,} entries from external metadata: {p}")
+    return result
+
+
+@dataclass
+class TarScanResult:
+    """Per-tar scan state used by metadata providers."""
+
+    audio_members: list
+    metadata_state: Any = None
+
+
+class MetadataProvider:
+    """Abstract metadata source for tar members."""
+
+    def scan_tar(self, tf, stats: Optional[Counter] = None) -> TarScanResult:
+        raise NotImplementedError
+
+    def lookup(
+        self,
+        stem: str,
+        scan: TarScanResult,
+        stats: Optional[Counter] = None,
+    ) -> MetadataEntry:
+        raise NotImplementedError
+
+
+@dataclass
+class SidecarMetadataProvider(MetadataProvider):
+    """Read transcripts and custom fields from sidecars stored inside each tar."""
+
+    text_field: str = "text"
+    custom_fields: Optional[Tuple[str, ...]] = None
+
+    def scan_tar(self, tf, stats: Optional[Counter] = None) -> TarScanResult:
+        metas: dict[str, MetadataEntry] = {}
+        audio_members = []
+        for member in tf:
+            if not member.isfile():
+                continue
+            dot = member.name.rfind(".")
+            ext = member.name[dot:] if dot >= 0 else ""
+            if ext in SIDECAR_SUFFIXES:
+                stem = member.name[:dot]
+                try:
+                    text, custom = _parse_sidecar(
+                        tf.extractfile(member).read(), ext,
+                        self.text_field, self.custom_fields,
+                    )
+                    prev = metas.get(stem)
+                    if prev:
+                        text = text or prev[0]
+                        custom = {**prev[1], **custom}
+                    metas[stem] = (text, custom)
+                except Exception:
+                    if stats is not None:
+                        stats["text_decode_failed"] += 1
+            elif ext in AUDIO_SUFFIXES:
+                audio_members.append(member)
+        return TarScanResult(audio_members=audio_members, metadata_state=metas)
+
+    def lookup(
+        self,
+        stem: str,
+        scan: TarScanResult,
+        stats: Optional[Counter] = None,
+    ) -> MetadataEntry:
+        metas = scan.metadata_state or {}
+        return metas.get(stem, (None, {}))
+
+
+@dataclass
+class ExternalMetadataProvider(MetadataProvider):
+    """Read transcripts and custom fields from an external TSV or JSONL mapping."""
+
+    metadata: dict[str, MetadataEntry]
+
+    def scan_tar(self, tf, stats: Optional[Counter] = None) -> TarScanResult:
+        audio_members = [
+            m for m in tf
+            if m.isfile() and m.name[m.name.rfind("."):] in AUDIO_SUFFIXES
+        ]
+        return TarScanResult(audio_members=audio_members)
+
+    def lookup(
+        self,
+        stem: str,
+        scan: TarScanResult,
+        stats: Optional[Counter] = None,
+    ) -> MetadataEntry:
+        basename = stem.rsplit("/", 1)[-1] if "/" in stem else stem
+        if basename in self.metadata:
+            return self.metadata[basename]
+        if stem in self.metadata:
+            return self.metadata[stem]
+        if stats is not None:
+            stats["external_meta_miss"] += 1
+        return None, {}
+
+
+# Module-level global for COW sharing of a large external metadata map across
+# forked workers. Sidecar mode constructs its provider inside each worker.
+_METADATA_PROVIDER: MetadataProvider | None = None
+
+
 def _parse_sidecar(
     raw: bytes, ext: str, text_field: str = "text",
     custom_fields: Optional[Tuple[str, ...]] = None,
 ) -> Tuple[Optional[str], dict]:
     """Parse a sidecar into ``(text, custom_dict)``."""
     if ext == ".json":
+        import orjson
         obj = orjson.loads(raw)
         text = obj.get(text_field)
         custom = {k: obj[k] for k in (custom_fields or ()) if k in obj}
@@ -87,44 +244,23 @@ def _parse_sidecar(
 
 def iter_tar_cuts(
     tar_paths,
-    text_field: str = "text",
-    custom_fields: Optional[Tuple[str, ...]] = None,
+    provider: MetadataProvider,
     stats: Optional[Counter] = None,
 ):
-    """Iterate over WDS tar shards and yield Lhotse cuts with supervisions."""
+    """Iterate over tar shards and yield Lhotse cuts with supervisions.
+
+    The provider controls how metadata is gathered and looked up, while this
+    function keeps a single cut-building path.
+    """
     import tarfile
     from lhotse import Recording, SupervisionSegment
 
     for tar_path in tar_paths:
         with tarfile.open(tar_path) as tf:
-            # Phase 1: collect sidecar metadata and audio member pointers.
-            metas = {}  # stem -> (text, custom)
-            audio_members = []
-            for member in tf:
-                if not member.isfile():
-                    continue
-                dot = member.name.rfind(".")
-                ext = member.name[dot:] if dot >= 0 else ""
-                if ext in SIDECAR_SUFFIXES:
-                    stem = member.name[:dot]
-                    try:
-                        text, custom = _parse_sidecar(
-                            tf.extractfile(member).read(), ext,
-                            text_field, custom_fields,
-                        )
-                        prev = metas.get(stem)
-                        if prev:
-                            text = text or prev[0]
-                            custom = {**prev[1], **custom}
-                        metas[stem] = (text, custom)
-                    except Exception:
-                        if stats is not None:
-                            stats["text_decode_failed"] += 1
-                elif ext in AUDIO_SUFFIXES:
-                    audio_members.append(member)
+            scan = provider.scan_tar(tf, stats=stats)
 
-            # Phase 2: decode audio and attach supervision from sidecar.
-            for member in audio_members:
+            # Phase 2: decode audio and attach supervision.
+            for member in scan.audio_members:
                 stem = member.name[:member.name.rfind(".")]
                 try:
                     extracted = tf.extractfile(member)
@@ -142,7 +278,8 @@ def iter_tar_cuts(
                     logger.warning(f"Skipping {stem}: failed to build cut ({e})")
                     continue
 
-                text, custom = metas.get(stem, (None, {}))
+                text, custom = provider.lookup(stem, scan, stats=stats)
+
                 if text:
                     cut.supervisions = [SupervisionSegment(
                         id=cut.id,
@@ -224,13 +361,17 @@ def _convert_worker(args_tuple):
     total_duration_sec = 0.0
     runtime_counts = Counter()
     _tokenize_text = make_text_tokenize_fn(text_tokenizer) if text_tokenizer is not None else None
+    provider = _METADATA_PROVIDER or SidecarMetadataProvider(
+        text_field=text_field,
+        custom_fields=custom_fields,
+    )
 
     with SharWriter(
         output_dir=str(worker_dir),
         fields={"recording": shar_format},
         shard_size=shard_size,
     ) as writer:
-        for cut in iter_tar_cuts(tar_paths, text_field=text_field, custom_fields=custom_fields, stats=runtime_counts):
+        for cut in iter_tar_cuts(tar_paths, provider=provider, stats=runtime_counts):
             try:
                 if min_sr and cut.sampling_rate < min_sr:
                     skipped += 1
@@ -315,14 +456,15 @@ def _validate_or_write_prepare_state(args) -> None:
         "text_tokenizer": normalize_optional_path(args.text_tokenizer),
         "text_field": args.text_field,
         "custom_fields": sorted(args.custom_fields) if args.custom_fields else None,
+        "external_metadata": normalize_optional_path(args.external_metadata),
     }
     wrote = validate_or_write_prepare_state(
         state_path,
         expected=expected,
-        invariant_keys=("text_tokenizer", "text_field", "custom_fields"),
+        invariant_keys=("text_tokenizer", "text_field", "custom_fields", "external_metadata"),
         guidance=(
-            "Use the same --text-tokenizer, --text-field, and --custom-fields "
-            f"to resume this output directory, or remove {args.shar_dir} and restart from scratch."
+            "Use the same --text-tokenizer, --text-field, --custom-fields, "
+            f"and --external-metadata to resume, or remove {args.shar_dir} and restart from scratch."
         ),
     )
     if wrote:
@@ -359,9 +501,13 @@ def main(argv=None):
     parser.add_argument("--no-mono-downmix", action="store_true",
                         help="Select channel 0 instead of averaging stereo channels")
 
-    # Text / metadata sidecars (.txt and .json auto-detected)
+    # Text / metadata
+    parser.add_argument("--external-metadata", type=str, default=None,
+                        help="Path to external metadata file (.tsv or .jsonl). "
+                             "When set, transcripts are loaded from this file instead "
+                             "of sidecar files inside the tar archives.")
     parser.add_argument("--text-field", type=str, default="text",
-                        help="JSON key for transcript (default: 'text')")
+                        help="JSON key for transcript in WDS sidecars (default: 'text')")
     parser.add_argument("--custom-fields", type=str, nargs="*", default=None,
                         help="JSON keys to store in cut.custom (e.g. --custom-fields language speaker)")
     parser.add_argument("--text-tokenizer", type=str, required=True,
@@ -454,6 +600,21 @@ def main(argv=None):
     else:
         logger.info("VAD segmenting disabled; writing full recordings")
 
+    # Load external metadata before forking (COW-shared via fork).
+    global _METADATA_PROVIDER
+    if args.external_metadata:
+        _METADATA_PROVIDER = ExternalMetadataProvider(
+            metadata=load_external_metadata(
+                args.external_metadata,
+                tuple(args.custom_fields) if args.custom_fields else None,
+            )
+        )
+        mp_start_method = "fork"
+        logger.info("Using fork start method for COW sharing of external metadata")
+    else:
+        _METADATA_PROVIDER = None
+        mp_start_method = "forkserver"
+
     # Load text tokenizer before forking (shared via COW across workers)
     text_tokenizer = load_text_tokenizer(args.text_tokenizer)
 
@@ -482,7 +643,8 @@ def main(argv=None):
         if shards
     ]
 
-    run_pool_and_finalize(_convert_worker, worker_args, args.shar_dir, num_workers)
+    run_pool_and_finalize(_convert_worker, worker_args, args.shar_dir, num_workers,
+                          mp_start_method=mp_start_method)
 
 
 if __name__ == "__main__":

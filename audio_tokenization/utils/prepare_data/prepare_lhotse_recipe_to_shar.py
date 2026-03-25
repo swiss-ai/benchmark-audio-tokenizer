@@ -311,6 +311,11 @@ def main():
     parser.add_argument("--min_sample_rate", type=int, default=None,
                         help="Drop cuts with sample rate below this threshold")
 
+    # Cut segmentation
+    parser.add_argument("--trim_to_supervisions", action="store_true", default=False,
+                        help="Segment cuts to supervision boundaries (one cut per supervision). "
+                             "Use for datasets with long recordings and many supervisions (e.g. meetings).")
+
     # Text tokenization
     parser.add_argument("--text_tokenizer", type=str, default=None,
                         help="Path to tokenizer.json for pre-tokenizing supervision text")
@@ -356,6 +361,16 @@ def main():
         recordings=split_manifests["recordings"],
         supervisions=split_manifests.get("supervisions"),
     )
+
+    if args.trim_to_supervisions:
+        cuts = cuts.trim_to_supervisions(keep_overlapping=False)
+        logger.info("Trimming cuts to supervision boundaries (one per supervision)")
+
+    # Drop cuts whose supervisions have no text
+    cuts = cuts.filter(
+        lambda c: any(s.text and s.text.strip() for s in (c.supervisions or []))
+    )
+
     cuts_list = list(cuts)
     logger.info(f"Built CutSet with {len(cuts_list)} cuts from {args.recipe}/{args.split}")
     logger.info(f"Converting to Shar → {args.shar_dir}")
