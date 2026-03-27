@@ -1,0 +1,81 @@
+# ------------------------------------------------------------------
+# Input
+# ------------------------------------------------------------------
+shar_dir: 
+  - "/iopsstor/scratch/cscs/arsaikia/ca_train"
+  - "/iopsstor/scratch/cscs/arsaikia/en_train"
+  - "/iopsstor/scratch/cscs/arsaikia/fr_train"
+  - "/iopsstor/scratch/cscs/arsaikia/de_train"
+  - "/iopsstor/scratch/cscs/arsaikia/it_train"
+  - "/iopsstor/scratch/cscs/arsaikia/ru_train"          
+shar_index_filename: shar_index.json                
+
+# ------------------------------------------------------------------
+# Output
+# ------------------------------------------------------------------
+output_dir: "/iopsstor/scratch/cscs/arsaikia/newpreprocess/checkpoints"
+output_dir_data: "/iopsstor/scratch/cscs/arsaikia/newpreprocess"
+output_format: "cuts_only"
+output_shard_size: 1000
+
+# ------------------------------------------------------------------
+# Audio filtering & resampling
+# ------------------------------------------------------------------
+target_sample_rate: 16000
+min_sample_rate: 8000
+min_duration:                            
+max_duration:                            
+
+# ------------------------------------------------------------------
+# ASR
+# ------------------------------------------------------------------
+nvidia_model: "nvidia/parakeet-tdt-0.6b-v3"
+NVIDIA_LANGUAGES: [bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk]
+whisper_model_id: "openai/whisper-large-v3"
+transcribe: true                 
+cache_dir: /iopsstor/scratch/cscs/arsaikia/.cache                            
+# language_detection_samples: 5            # Number of samples to decide the language of a shard
+
+# ------------------------------------------------------------------
+# Text tokenization
+# ------------------------------------------------------------------
+calculate_cer: true
+
+# ------------------------------------------------------------------
+# Text tokenization
+# ------------------------------------------------------------------
+include_text_tokens: false
+use_transcription: false
+text_tokenizer_path: "/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json"
+
+# ------------------------------------------------------------------
+# DataLoader & Sampler
+# ------------------------------------------------------------------
+num_workers: 4
+prefetch_factor: 4
+dataloader_timeout: 300
+max_batch_duration: 1500.0
+max_batch_cuts: 32                         
+num_buckets: 20
+bucket_buffer_size: 20000
+sampler_shuffle: false
+sampler_seed: 42
+# quadratic_duration:                    
+
+# ------------------------------------------------------------------
+# Checkpointing & Error handling
+# ------------------------------------------------------------------
+resume: true
+checkpoint_interval_batches: 500
+max_consecutive_errors: 50
+
+# ------------------------------------------------------------------
+# W&B Logging
+# ------------------------------------------------------------------
+wandb:
+  enabled: true
+  project: "audio-preprocessing"
+  entity:                                
+  name: "commonvoice"                               
+  tags: []
+  log_interval_seconds: 10.0
