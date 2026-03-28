@@ -165,12 +165,6 @@ class SimpleWandbLogger:
             "text_tokens_generated": stats.text_tokens_generated
         }
 
-        if torch.cuda.is_available():
-            data["gpu/memory_allocated_mb"] = torch.cuda.memory_allocated() / 1e6
-            data["gpu/memory_reserved_mb"] = torch.cuda.memory_reserved() / 1e6
-            data["gpu/max_memory_allocated_mb"] = torch.cuda.max_memory_allocated() / 1e6
-            data["gpu/utilization_pct"] = torch.cuda.utilization(torch.cuda.current_device())
-
         wandb.log(data, step=self._step)
         self._step += 1
         self._last_flush = now

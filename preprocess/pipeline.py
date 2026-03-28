@@ -120,6 +120,22 @@ def _assign_shards_to_rank(fields: dict[str, list[str]],
     # Round robin assignment
     return [all_shards[i] for i in range(rank, len(all_shards), world_size)]
 
+def _extract_batch(batch):
+    """Extract audios, cuts_list, audio_lens from either dataset format."""
+    
+    if "inputs" in batch:
+        # K2SpeechRecognitionDataset format
+        audios = batch["inputs"]
+        cuts_list = batch["supervisions"]["cut"]
+    else:
+        # UnsupervisedDataset format
+        audios = batch["audio"]
+        cuts_list = list(batch["cuts"])
+    audio_lens = torch.tensor(
+        [c.num_samples for c in cuts_list], dtype=torch.int64
+    )
+    return audios, cuts_list, audio_lens
+
 def _detect_shard_language(batch, cfg, target_sr):
     """Detect shard language via majority vote over the first batch."""
     from collections import Counter
@@ -128,11 +144,7 @@ def _detect_shard_language(batch, cfg, target_sr):
     if whisper is None:
         return
 
-    audios = batch["inputs"]                          # (B, T)
-    cuts_list = batch["supervisions"]["cut"]
-    audio_lens = torch.tensor(
-        [c.num_samples for c in cuts_list], dtype=torch.int64
-    )
+    audios, cuts_list, audio_lens = _extract_batch(batch)
 
     n = min(audios.shape[0], cfg.get("language_detection_samples", audios.shape[0]))
 
@@ -246,14 +258,18 @@ def preprocess_loop(rank: int,
 
     target_sr = int(cfg.get("target_sample_rate", 16000))
 
-    # Dataset configuration
-    from lhotse.dataset import K2SpeechRecognitionDataset
-    from lhotse.dataset.input_strategies import AudioSamples
-    dataset = K2SpeechRecognitionDataset(
-        return_cuts=True,
-        input_strategy=AudioSamples()
-    )
-    
+    # Dataset configuration    
+    if cfg.get("type","audio_only") == "audio_only":
+        from lhotse.dataset.unsupervised import UnsupervisedWaveformDataset
+        dataset = UnsupervisedWaveformDataset()
+    else:
+        from lhotse.dataset import K2SpeechRecognitionDataset
+        from lhotse.dataset.input_strategies import AudioSamples
+        dataset = K2SpeechRecognitionDataset(
+            return_cuts=True,
+            input_strategy=AudioSamples()
+        )
+
     # Checkpoint configuration
     checkpoint_interval = cfg.get("checkpoint_interval_batches", 500)
     max_consecutive_errors = cfg.get("max_consecutive_errors", 50)
@@ -431,11 +447,8 @@ def _process_batch(batch: Dict[str, Any],
                    device: str,
                    cfg: Dict[str, Any]):
     
-    audios = batch["inputs"]
-    cuts_list = batch["supervisions"]["cut"]
-    audio_lens = torch.tensor(
-        [c.num_samples for c in cuts_list], dtype=torch.int64
-    ).to(device)
+    audios, cuts_list, audio_lens = _extract_batch(batch)
+    audio_lens = audio_lens.to(device)
 
     B = audios.shape[0]
 
@@ -449,10 +462,12 @@ def _process_batch(batch: Dict[str, Any],
             audios, audio_lens, sr=target_sr, language=shard_language
         )  
 
-        if cfg.get("calculate_cer", True):
-            refs = [cut.supervisions[0].text for cut in cuts_list]
-            cer_metrics = whisper.calculate_cer(transcriptions=transcription, 
-                                                references=refs)
+        if cfg.get("calculate_cer", False):
+            has_refs = all(len(cut.supervisions) > 0 and cut.supervisions[0].text for cut in cuts_list)
+            if has_refs:
+                refs = [cut.supervisions[0].text for cut in cuts_list]
+                cer_metrics = whisper.calculate_cer(transcriptions=transcription,
+                                                    references=refs)
     
     for i in range(B):
         cut = cuts_list[i]
@@ -513,7 +528,7 @@ def run_pipeline(cfg: Dict[str, Any]) -> Dict[str, Any]:
     
     # Only rank 0 logs at INFO
     if rank != 0:
-        # logging.getLogger("preprocess").setLevel(logging.WARNING)
+        logging.getLogger("preprocess").setLevel(logging.WARNING)
         logging.getLogger("audio_tokenization").setLevel(logging.WARNING)
         logging.getLogger("lhotse").setLevel(logging.WARNING)
 

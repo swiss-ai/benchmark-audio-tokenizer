@@ -1,22 +1,20 @@
 # ------------------------------------------------------------------
 # Input
 # ------------------------------------------------------------------
-shar_dir: 
-  - "/iopsstor/scratch/cscs/arsaikia/ca_train"
-  - "/iopsstor/scratch/cscs/arsaikia/en_train"
-  - "/iopsstor/scratch/cscs/arsaikia/fr_train"
-  - "/iopsstor/scratch/cscs/arsaikia/de_train"
-  - "/iopsstor/scratch/cscs/arsaikia/it_train"
-  - "/iopsstor/scratch/cscs/arsaikia/ru_train"          
-shar_index_filename: shar_index.json                
+shar_dir:
+  - /iopsstor/scratch/cscs/arsaikia/librilight/shar_output/node_0
+  - /iopsstor/scratch/cscs/arsaikia/librilight/shar_output/node_1
+  - /iopsstor/scratch/cscs/arsaikia/librilight/shar_output/node_2
+  - /iopsstor/scratch/cscs/arsaikia/librilight/shar_output/node_3        
+shar_index_filename: shar_index.json  
+type: audio_only              
 
 # ------------------------------------------------------------------
 # Output
 # ------------------------------------------------------------------
-output_dir: "/iopsstor/scratch/cscs/arsaikia/newpreprocess/checkpoints"
-output_dir_data: "/iopsstor/scratch/cscs/arsaikia/newpreprocess"
+output_dir: "/iopsstor/scratch/cscs/arsaikia/librilight/cutsets/checkpoints"
+output_dir_data: "/iopsstor/scratch/cscs/arsaikia/librilight/cutsets"
 output_format: "cuts_only"
-output_shard_size: 1000
 
 # ------------------------------------------------------------------
 # Audio filtering & resampling
@@ -30,7 +28,7 @@ max_duration:
 # ASR
 # ------------------------------------------------------------------
 nvidia_model: "nvidia/parakeet-tdt-0.6b-v3"
-NVIDIA_LANGUAGES: [bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk]
+NVIDIA_LANGUAGES: [] #[bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk]
 whisper_model_id: "openai/whisper-large-v3"
 transcribe: true                 
 cache_dir: /iopsstor/scratch/cscs/arsaikia/.cache                            
@@ -39,13 +37,13 @@ cache_dir: /iopsstor/scratch/cscs/arsaikia/.cache
 # ------------------------------------------------------------------
 # Text tokenization
 # ------------------------------------------------------------------
-calculate_cer: true
+calculate_cer: false
 
 # ------------------------------------------------------------------
 # Text tokenization
 # ------------------------------------------------------------------
-include_text_tokens: false
-use_transcription: false
+include_text_tokens: true
+use_transcription: true
 text_tokenizer_path: "/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json"
 
 # ------------------------------------------------------------------
@@ -54,8 +52,8 @@ text_tokenizer_path: "/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus
 num_workers: 4
 prefetch_factor: 4
 dataloader_timeout: 300
-max_batch_duration: 1500.0
-max_batch_cuts: 32                         
+max_batch_duration: 500.0
+max_batch_cuts: 32                        
 num_buckets: 20
 bucket_buffer_size: 20000
 sampler_shuffle: false
@@ -76,6 +74,6 @@ wandb:
   enabled: true
   project: "audio-preprocessing"
   entity:                                
-  name: "commonvoice"                               
+  name: "librilight"                               
   tags: []
   log_interval_seconds: 10.0

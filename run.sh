@@ -1,24 +1,24 @@
 #!/bin/bash
 #SBATCH --account=infra01
-#SBATCH --job-name=preprocess_cv
+#SBATCH --job-name=preprocess_libri
 #SBATCH --environment=nemo
-#SBATCH --output=/users/arsaikia/benchmark-audio-tokenizer-updated/logs/preprocess_%j.out
-#SBATCH --error=/users/arsaikia/benchmark-audio-tokenizer-updated/logs/preprocess_%j.err
+#SBATCH --output=/users/arsaikia/benchmark-audio-tokenizer-updated/librilogs/preprocess_%j.out
+#SBATCH --error=/users/arsaikia/benchmark-audio-tokenizer-updated/librilogs/preprocess_%j.err
 #SBATCH --time=12:00:00
-#SBATCH --nodes=6
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=72
+#SBATCH --cpus-per-task=288
 #SBATCH --partition=normal
 #SBATCH --reservation=PA-2338-RL
 
 set -e
 
-# --- API Key --
-WANDB_API_KEY=""
+# --- API Key an OUTPUT --
+WANDB_API_KEY="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"
+OUTPUT_DIR="${OUTPUT_DIR:-${SCRATCH}/librilight/cutsets}"
 
-# --- Configuration ---
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRATCH}/commonvoice_en_fr_de_ca_it_ru}"
+
 REPO_DIR="${REPO_DIR:-/users/arsaikia/benchmark-audio-tokenizer-updated}"
 GPUS_PER_NODE=4
 

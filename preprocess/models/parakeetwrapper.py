@@ -1,5 +1,5 @@
 import logging
-from typing import List
+from typing import List, Dict, Any
 
 import torch
 import torchaudio
@@ -75,7 +75,8 @@ class ParakeetWrapper:
                                     audio_signal=features, 
                                     length=features_len 
                                 )
+        
+        output = self.model.decoding.rnnt_decoder_predictions_tensor(encoded, encoded_len)
+        transcriptions = [hyp.text for hyp in output]
 
-        output = self.model.decoding.decode_predictions_tensor(encoded, encoded_len)
-        transcriptions = [op[0].text if isinstance(op, list) else op.text for op in output]
         return transcriptions
