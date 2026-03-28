@@ -1,0 +1,15 @@
+image = "/capstor/store/cscs/swissai/infra01/MLLM/containers/nvcr.io#nvidia+nemo+25.11.aarch64.sqsh"
+
+mounts = ["/capstor", 
+        "/iopsstor", 
+        "/users"]
+writable = true
+workdir = "${HOME}"
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"
+
+[env]
+CUDA_CACHE_DISABLE = "1"
+LD_LIBRARY_PATH = "/opt/ctranslate2/lib64:/opt/ctranslate2/lib:$LD_LIBRARY_PATH"
