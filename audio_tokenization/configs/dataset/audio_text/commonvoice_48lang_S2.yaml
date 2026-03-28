@@ -1,4 +1,8 @@
 # CommonVoice 48-language stage_2 (train) — audio-text direct tokenization.
+defaults:
+  - ../_base_
+  - _self_
+
 dataset_name: commonvoice
 output_name: commonvoice_48lang_S2
 clip_id_parser: generic
@@ -53,23 +57,6 @@ shar_dir:
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/commonvoice/zh-CN_train
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/commonvoice/zh-HK_train
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/commonvoice/zh-TW_train
-shar_index_filename: shar_index.json
 
-# Filtering
 min_duration: 3.0
-max_duration: 200.0
-min_sample_rate: 16000
-
-# Dynamic bucketing sampler
 max_batch_duration: 1500.0
-num_buckets: 40
-bucket_buffer_size: 20000
-sampler_shuffle: true
-sampler_seed: 42
-
-# DataLoader
-num_workers: 32
-prefetch_factor: 4
-
-# Checkpointing
-checkpoint_interval_batches: 5000

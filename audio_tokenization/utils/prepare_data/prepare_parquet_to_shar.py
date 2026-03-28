@@ -157,6 +157,7 @@ def _convert_worker(args_tuple):
         audio_column,
         text_column,
         duration_column,
+        language_column,
         text_tokenizer,
         resampling_backend,
         ffmpeg_bin,
@@ -234,12 +235,14 @@ def _convert_worker(args_tuple):
                     # Attach supervision with text
                     text = row.get(text_column)
                     if text:
+                        language = row.get(language_column) if language_column else None
                         cut.supervisions = [SupervisionSegment(
                             id=cut.id,
                             recording_id=cut.recording_id,
                             start=0.0,
                             duration=cut.duration,
                             text=text,
+                            language=language,
                         )]
 
                     # Resample if needed
@@ -347,6 +350,8 @@ def main(argv=None):
                         help="Column name for transcription text (default: 'text')")
     parser.add_argument("--duration-column", type=str, default="duration",
                         help="Column name for duration (default: 'duration')")
+    parser.add_argument("--language-column", type=str, default=None,
+                        help="Column name for language code (default: None, not set)")
 
     # Text tokenizer
     parser.add_argument("--text-tokenizer", type=str, default=None,
@@ -406,6 +411,7 @@ def main(argv=None):
             args.audio_column,
             args.text_column,
             args.duration_column,
+            args.language_column,
             text_tokenizer,
             args.resampling_backend,
             args.ffmpeg_bin,

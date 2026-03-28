@@ -48,7 +48,7 @@ def _resolve_index_paths(shar_root: Path, fields: Dict[str, list]) -> Dict[str, 
 # ---------------------------------------------------------------------------
 
 
-def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int):
+def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int, stats=None):
     """Load prepared Shar into a CutSet and apply post-load filters."""
     _set_resampling_backend(rank)
 
@@ -84,8 +84,17 @@ def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int):
     # Drop quiet audio (e.g. coral conversation at -30 dB reconstructs to silence).
     min_rms_db = cfg.get("min_rms_db")
     if min_rms_db is not None:
-        from audio_tokenization.utils.prepare_data.common import make_rms_filter
-        cuts = cuts.filter(make_rms_filter(float(min_rms_db)))
+        from audio_tokenization.utils.prepare_data.common import rms_db
+        _min_rms = float(min_rms_db)
+
+        def _rms_filter(cut):
+            if rms_db(cut) < _min_rms:
+                if stats is not None:
+                    stats.rms_skipped += 1
+                return False
+            return True
+
+        cuts = cuts.filter(_rms_filter)
 
     return cuts
 

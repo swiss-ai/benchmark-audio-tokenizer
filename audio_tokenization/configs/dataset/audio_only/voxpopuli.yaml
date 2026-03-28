@@ -1,32 +1,14 @@
-# Lhotse pipeline config for VoxPopuli tokenization.
-# Requires pre-built Shar data (run prepare_audio_dir_to_shar first).
-dataset_type: lhotse
+# VoxPopuli — audio-only tokenization.
+defaults:
+  - ../_base_
+  - _self_
+
 output_name: voxpopuli_vad
 
 # Pre-built Shar directory
 shar_dir: /iopsstor/scratch/cscs/xyixuan/audio-datasets/voxpopuli_shar
-shar_index_filename: shar_index.json
-
-# Dynamic bucketing sampler
-max_batch_duration: 1000.0
-max_batch_cuts: null
-num_buckets: 40
-bucket_buffer_size: 20000
-sampler_shuffle: true
-sampler_seed: 42
-
-# DataLoader
-num_workers: 32
-prefetch_factor: 4
-
-# Checkpointing
-checkpoint_interval_batches: 2000
 
 # Duration filters (must match VAD chunking: min_chunk=5s, max_chunk=200s)
 min_duration: 5.0
-max_duration: 200.0
-
-# Hard-drop audio below 16kHz before resampling to target SR.
-min_sample_rate: 16000
-
-max_samples: null
+max_batch_duration: 1000.0
+checkpoint_interval_batches: 2000

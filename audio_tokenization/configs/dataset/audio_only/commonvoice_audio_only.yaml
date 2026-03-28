@@ -1,6 +1,8 @@
-# Lhotse pipeline config for all CommonVoice "other" splits tokenization.
-# Languages: ca, de, en, es, fr, it, zh-CN
-dataset_type: lhotse
+# CommonVoice "other" splits — ca/de/en/es/fr/it/zh-CN audio-only tokenization.
+defaults:
+  - ../_base_
+  - _self_
+
 output_name: commonvoice_ca_de_en_es_fr_it_zh-CN_S1
 
 # Pre-built Shar directories (one per language)
@@ -12,28 +14,8 @@ shar_dir:
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_only_shar/commonvoice_fr_other_shar
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_only_shar/commonvoice_it_other_shar
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_only_shar/commonvoice_zh-CN_other_shar
-shar_index_filename: shar_index.json
 
-# Duration filters
 min_duration: 3.0
 max_duration: 500.0
-
-# Hard-drop audio below 16kHz before resampling to target SR.
-min_sample_rate: 16000
-
-# Dynamic bucketing sampler
 max_batch_duration: 1000.0
-max_batch_cuts: null
-num_buckets: 40
-bucket_buffer_size: 20000
-sampler_shuffle: true
-sampler_seed: 42
-
-# DataLoader
-num_workers: 32
-prefetch_factor: 4
-
-# Checkpointing
 checkpoint_interval_batches: 2000
-
-max_samples: null

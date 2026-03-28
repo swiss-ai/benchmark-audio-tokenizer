@@ -88,7 +88,7 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     # ------------------------------------------------------------------
     # 1. Build CutSet (prepared Shar load + filters/resample safety-net)
     # ------------------------------------------------------------------
-    cuts = build_cutset(cfg, rank, world_size)
+    cuts = build_cutset(cfg, rank, world_size, stats=cumulative_stats)
 
     # ------------------------------------------------------------------
     # 2. Dynamic bucketing sampler -- each rank's CutSet is already split
@@ -149,6 +149,7 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
             cumulative_stats.text_tokens_generated = prev.get("text_tokens_generated", 0)
             cumulative_stats.errors = prev.get("errors", 0)
             cumulative_stats.samples_skipped = prev.get("samples_skipped", 0)
+            cumulative_stats.rms_skipped = prev.get("rms_skipped", 0)
             logger.info(
                 f"[rank {rank}] Resumed from chunk {start_chunk_id}, "
                 f"samples={cumulative_stats.samples_processed}"
@@ -340,10 +341,13 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     text_tok_msg = ""
     if result.get("text_tokens_generated", 0) > 0:
         text_tok_msg = f", {result['text_tokens_generated']} text tokens"
+    rms_msg = ""
+    if result.get("rms_skipped", 0) > 0:
+        rms_msg = f", {result['rms_skipped']} rms_skipped"
     logger.info(
         f"[rank {rank}] Done: {result['samples_processed']} samples, "
         f"{result['tokens_generated']} audio tokens{text_tok_msg}, "
-        f"{result['errors']} errors, {result['elapsed_time']:.1f}s"
+        f"{result['errors']} errors{rms_msg}, {result['elapsed_time']:.1f}s"
     )
 
     result["output_dir"] = output_dir

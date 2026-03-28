@@ -73,6 +73,7 @@ class WorkerStats:
     text_tokens_generated: int = 0
     errors: int = 0
     samples_skipped: int = 0
+    rms_skipped: int = 0
     duration_skipped: int = 0
     frequency_skipped: int = 0
     start_time: float = field(default_factory=time.time)
@@ -85,6 +86,7 @@ class WorkerStats:
             "tokens_generated": self.tokens_generated,
             "errors": self.errors,
             "samples_skipped": self.samples_skipped,
+            "rms_skipped": self.rms_skipped,
             "duration_skipped": self.duration_skipped,
             "frequency_skipped": self.frequency_skipped,
             "elapsed_time": self.elapsed_time,

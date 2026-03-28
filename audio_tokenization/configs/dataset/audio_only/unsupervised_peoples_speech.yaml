@@ -1,10 +1,11 @@
-# Lhotse pipeline config for People's Speech tokenization.
-# Requires pre-built Shar data (run prepare_wds_to_shar first).
-dataset_type: lhotse
+# People's Speech (unsupervised) — audio-only tokenization.
+defaults:
+  - ../_base_
+  - _self_
+
 output_name: ups_all_lang_vad_v2
 
 # Pre-built Shar directories (from prepare_wds_to_shar with VAD segmentation)
-# Supports a single path or a list of paths.
 # Each node_XX dir was produced by a separate SLURM rank and has its own shar_index.json.
 shar_dir:
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/shar/ups_all_lang_shar_v2/node_00
@@ -34,37 +35,8 @@ shar_dir:
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/shar/ups_all_lang_shar_v2/node_24
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/shar/ups_all_lang_shar_v2/node_25
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/shar/ups_all_lang_shar_v2/node_26
-shar_index_filename: shar_index.json
-
-# Dynamic bucketing sampler
-# max_batch_duration = total audio seconds per batch. Profiling shows:
-#   600s → ~300 audio_s/s, ~4 GB     (conservative)
-#  1500s → ~700 audio_s/s, ~22 GB    (2.3x throughput, safe on GH200 80GB)
-#  3000s → ~1100 audio_s/s, ~44 GB   (3.7x, aggressive)
-max_batch_duration: 1000.0
-max_batch_cuts: null
-num_buckets: 40
-bucket_buffer_size: 20000
-sampler_shuffle: true
-sampler_seed: 42
-
-# DataLoader prefetching (CPU decode overlaps GPU tokenization)
-num_workers: 32
-prefetch_factor: 4
-
-# Micro-shard checkpointing interval (in batches)
-checkpoint_interval_batches: 2000
 
 # Duration filters (must match VAD chunking: min_chunk=5s, max_chunk=200s)
 min_duration: 5.0
-max_duration: 200.0
-
-# Hard-drop audio below 16kHz before resampling to target SR.
-# 16kHz→24kHz upsampling is fine (Nyquist 8kHz covers speech).
-# 8kHz→24kHz produces garbage — drop it.
-min_sample_rate: 16000
-
-# Optional post-tokenization silence filter
-# silence_unique_threshold: 5
-
-max_samples: null
+max_batch_duration: 1000.0
+checkpoint_interval_batches: 2000

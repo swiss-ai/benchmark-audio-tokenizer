@@ -1,0 +1,33 @@
+# Base dataset config — inherited by all dataset configs via:
+#   defaults:
+#     - _base_
+#     - _self_
+
+# Filtering
+min_duration: 0
+max_duration: 200.0
+min_sample_rate: 16000
+
+# Audio quality
+min_rms_db: -40                  # drop clips quieter than -40 dB (near-silence)
+normalize_rms_db: -3             # peak normalize to -3 dBFS (matches WavTokenizer training)
+
+# Shar
+shar_index_filename: shar_index.json
+
+# Dynamic bucketing sampler
+max_batch_duration: 2000.0
+max_batch_cuts: null
+num_buckets: 40
+bucket_buffer_size: 20000
+sampler_shuffle: true
+sampler_seed: 42
+
+# DataLoader
+num_workers: 32
+prefetch_factor: 4
+
+# Checkpointing
+checkpoint_interval_batches: 5000
+
+max_samples: null

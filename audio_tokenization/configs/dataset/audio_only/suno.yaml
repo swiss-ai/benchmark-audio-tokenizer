@@ -1,32 +1,16 @@
-# Lhotse pipeline config for Suno AI music dataset tokenization.
+# Suno AI music dataset — audio-only tokenization.
 # Source: Suno train split (AI-generated music, ~12.5K hrs).
-dataset_type: lhotse
+defaults:
+  - ../_base_
+  - _self_
+
 output_name: suno_train_S1
 
 # Pre-built Shar directory
 shar_dir: /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_only_shar/suno_s1_shar
-shar_index_filename: shar_index.json
 
-# Duration filters (5–200s)
+# Duration filters (5-200s)
 min_duration: 5.0
-max_duration: 200.0
-
-# Hard-drop audio below 16kHz before resampling to target SR.
-min_sample_rate: 16000
-
-# Dynamic bucketing sampler
 max_batch_duration: 1000.0
-max_batch_cuts: null
-num_buckets: 40
-bucket_buffer_size: 20000
-sampler_shuffle: true
-sampler_seed: 42
-
-# DataLoader
 num_workers: 8
-prefetch_factor: 4
-
-# Checkpointing
 checkpoint_interval_batches: 2000
-
-max_samples: null

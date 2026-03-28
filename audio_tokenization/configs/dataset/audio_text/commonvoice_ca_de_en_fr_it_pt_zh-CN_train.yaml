@@ -1,4 +1,8 @@
 # CommonVoice ca/de/en/fr/it/pt/zh-CN train — audio-text tokenization.
+defaults:
+  - ../_base_
+  - _self_
+
 dataset_name: commonvoice
 output_name: commonvoice_ca_de_en_fr_it_pt_zh-CN_train
 clip_id_parser: generic
@@ -12,23 +16,8 @@ shar_dir:
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_text_as_repetition_shar/commonvoice_it_train_shar
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_text_as_repetition_shar/commonvoice_pt_train_shar
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_text_as_repetition_shar/commonvoice_zh-CN_train_shar
-shar_index_filename: shar_index.json
 
-# Filtering
 min_duration: 2.0
-max_duration: 200.0
-min_sample_rate: 16000
-
-# Dynamic bucketing sampler
 max_batch_duration: 1500.0
-num_buckets: 40
-bucket_buffer_size: 20000
-sampler_shuffle: true
-sampler_seed: 42
-
-# DataLoader
 num_workers: 4
-prefetch_factor: 4
-
-# Checkpointing
 checkpoint_interval_batches: 500

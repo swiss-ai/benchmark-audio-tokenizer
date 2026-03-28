@@ -1,32 +1,14 @@
-# Lhotse pipeline config for MTG-Jamendo music dataset tokenization.
-# Source: MTG-Jamendo train split (music tracks).
-dataset_type: lhotse
+# MTG-Jamendo music dataset — audio-only tokenization.
+defaults:
+  - ../_base_
+  - _self_
+
 output_name: mtg_jamendo_train_S1
 
 # Pre-built Shar directory
 shar_dir: /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_only_shar/mtg_jamendo_train
-shar_index_filename: shar_index.json
 
-# Duration filters (5–200s; most tracks > 200s are full songs)
+# Duration filters (5-200s; most tracks > 200s are full songs)
 min_duration: 5.0
-max_duration: 200.0
-
-# Hard-drop audio below 16kHz before resampling to target SR.
-min_sample_rate: 16000
-
-# Dynamic bucketing sampler
 max_batch_duration: 1000.0
-max_batch_cuts: null
-num_buckets: 40
-bucket_buffer_size: 20000
-sampler_shuffle: true
-sampler_seed: 42
-
-# DataLoader
-num_workers: 32
-prefetch_factor: 4
-
-# Checkpointing
 checkpoint_interval_batches: 2000
-
-max_samples: null

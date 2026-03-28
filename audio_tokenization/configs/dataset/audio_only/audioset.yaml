@@ -1,30 +1,15 @@
-# Lhotse pipeline config for AudioSet tokenization.
-# Requires pre-built Shar data (run prepare_hf_to_shar first).
-dataset_type: lhotse
+# AudioSet unbal_train — audio-only tokenization.
+defaults:
+  - ../_base_
+  - _self_
+
 output_name: audioset_unbal_train
 
-# Pre-built Shar directory (from prepare_hf_to_shar)
+# Pre-built Shar directory
 shar_dir: /iopsstor/scratch/cscs/xyixuan/audio-datasets/audioset_unbal_train_shar
-shar_index_filename: shar_index.json
 
-# Filtering
 min_duration: 2.0
-max_duration: 200.0
-min_sample_rate: 16000
-
-# Dynamic bucketing sampler
 max_batch_duration: 2500.0
-max_batch_cuts: null
-num_buckets: 40
-bucket_buffer_size: 20000
-sampler_shuffle: true
-sampler_seed: 42
-
 # DataLoader (72 CPUs per rank on GH200)
 num_workers: 64
-prefetch_factor: 4
-
-# Checkpointing
 checkpoint_interval_batches: 1000
-
-max_samples: null
