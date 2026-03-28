@@ -1,7 +1,4 @@
 # People's Speech train (clean + dirty) — audio-text interleaved tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: peoples_speech
 output_name: peoples_speech_train_interleaved

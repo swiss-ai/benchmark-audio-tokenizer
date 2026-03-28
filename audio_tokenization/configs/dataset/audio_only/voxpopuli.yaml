@@ -1,7 +1,4 @@
 # VoxPopuli — audio-only tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 output_name: voxpopuli_vad
 

@@ -1,8 +1,5 @@
 # Suno AI music dataset — audio-only tokenization.
 # Source: Suno train split (AI-generated music, ~12.5K hrs).
-defaults:
-  - ../_base_
-  - _self_
 
 output_name: suno_train_S1
 

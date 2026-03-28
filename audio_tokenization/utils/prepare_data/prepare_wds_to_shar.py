@@ -54,6 +54,7 @@ from audio_tokenization.utils.prepare_data.common import (
     load_text_tokenizer,
     make_text_tokenize_fn,
     normalize_optional_path,
+    rms_db,
     run_aggregate,
     run_pool_and_finalize,
     to_mono,
@@ -410,6 +411,9 @@ def _convert_worker(args_tuple):
                     if sample_lang is not None:
                         out_cut.custom = out_cut.custom or {}
                         out_cut.custom["lang"] = sample_lang
+                    # Precompute RMS (audio already decoded; avoids double load at tokenize time)
+                    out_cut.custom = out_cut.custom or {}
+                    out_cut.custom["rms_db"] = rms_db(out_cut)
                     writer.write(out_cut)
                     written += 1
                     total_duration_sec += out_cut.duration

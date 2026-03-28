@@ -92,21 +92,6 @@ def rms_db(cut) -> float:
     return 20.0 * np.log10(rms + 1e-10)
 
 
-def make_rms_filter(min_rms_db: float, stats=None):
-    """Return a filter function that rejects cuts quieter than *min_rms_db*.
-
-    Works both in eager loops (``if not filt(cut): continue``) and with
-    lazy CutSet chains (``cuts.filter(filt)``).
-    """
-    def _filt(cut) -> bool:
-        db = rms_db(cut)
-        if db < min_rms_db:
-            if stats is not None:
-                stats["skipped_quiet"] += 1
-            return False
-        return True
-    return _filt
-
 
 def to_mono(cut, mono_downmix=True, stats=None):
     """Convert a multi-channel cut to mono.

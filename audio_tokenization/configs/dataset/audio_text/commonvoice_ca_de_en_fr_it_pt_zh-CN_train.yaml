@@ -1,8 +1,4 @@
 # CommonVoice ca/de/en/fr/it/pt/zh-CN train — audio-text tokenization.
-defaults:
-  - ../_base_
-  - _self_
-
 dataset_name: commonvoice
 output_name: commonvoice_ca_de_en_fr_it_pt_zh-CN_train
 clip_id_parser: generic

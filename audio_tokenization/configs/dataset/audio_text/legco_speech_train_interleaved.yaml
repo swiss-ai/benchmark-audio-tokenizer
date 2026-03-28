@@ -1,7 +1,4 @@
 # LegCo speech train split — audio-text interleaved tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: legco_speech
 output_name: legco_speech_train_interleaved

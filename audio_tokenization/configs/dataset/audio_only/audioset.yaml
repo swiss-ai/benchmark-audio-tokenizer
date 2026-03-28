@@ -1,7 +1,4 @@
 # AudioSet unbal_train — audio-only tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 output_name: audioset_unbal_train
 

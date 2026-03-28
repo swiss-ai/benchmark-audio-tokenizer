@@ -1,8 +1,4 @@
 # AISHELL-1 + AISHELL-3 train — audio-text direct tokenization.
-defaults:
-  - ../_base_
-  - _self_
-
 dataset_name: aishell
 output_name: aishell_1_3_direct
 

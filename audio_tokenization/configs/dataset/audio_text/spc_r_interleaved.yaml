@@ -1,7 +1,4 @@
 # SPC-R (Speech Parliament Corpus) interleaved — audio-text tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: spc_r
 output_name: spc_r_interleaved

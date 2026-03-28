@@ -30,6 +30,7 @@ import torch
 
 from .checkpoint import (
     WorkerStats,
+    _get_rss_gb,
     is_cuda_oom,
     load_checkpoint,
     save_checkpoint,
@@ -85,6 +86,8 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
         logger.warning(f"[rank {rank}] Removing stale temp file: {tmp.name}")
         tmp.unlink()
 
+    cumulative_stats = WorkerStats()
+
     # ------------------------------------------------------------------
     # 1. Build CutSet (prepared Shar load + filters/resample safety-net)
     # ------------------------------------------------------------------
@@ -127,7 +130,6 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     # ------------------------------------------------------------------
     resume = cfg.get("resume", False)
     start_chunk_id = 0
-    cumulative_stats = WorkerStats()
 
     if resume:
         ckpt = load_checkpoint(output_dir, rank)
@@ -285,12 +287,20 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
 
             # W&B log (rate-limited by interval inside logger)
             if wandb_logger is not None:
+                mem_metrics = None
+                if wandb_logger.should_log_now():
+                    mem_metrics = {
+                        "memory/rss_gb": _get_rss_gb(),
+                        "memory/cuda_alloc_gb": torch.cuda.memory_allocated() / (1024 ** 3),
+                        "memory/cuda_reserved_gb": torch.cuda.memory_reserved() / (1024 ** 3),
+                    }
                 wandb_logger.log(
                     samples=stats.samples_processed,
                     tokens=stats.tokens_generated,
                     errors=stats.errors,
                     skipped=stats.samples_skipped,
                     batch_audio_seconds=total_audio_seconds,
+                    metrics=mem_metrics,
                 )
 
             # Periodic checkpoint: finalize current chunk, save state, open next

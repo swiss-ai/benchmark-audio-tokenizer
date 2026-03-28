@@ -1,7 +1,4 @@
 # WenetSpeech L-split interleaved — audio-text tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: wenetspeech
 output_name: wenetspeech_interleaved

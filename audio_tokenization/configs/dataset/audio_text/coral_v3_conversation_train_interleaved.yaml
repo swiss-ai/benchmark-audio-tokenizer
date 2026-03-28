@@ -1,7 +1,4 @@
 # CoRal v3 conversation train split — audio-text interleaved tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: coral_v3_conversation
 output_name: coral_v3_conversation_train_interleaved_normalized

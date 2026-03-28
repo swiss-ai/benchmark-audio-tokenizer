@@ -35,6 +35,7 @@ from audio_tokenization.utils.prepare_data.common import (
     init_worker_process,
     load_text_tokenizer,
     make_text_tokenize_fn,
+    rms_db,
     run_pool_and_finalize,
     to_mono,
     write_worker_result,
@@ -141,6 +142,10 @@ def _convert_worker(args_tuple):
                     # Pre-tokenize text
                     if _tokenize_text is not None:
                         cut = _tokenize_text(cut)
+
+                    # Precompute RMS (audio already decoded; avoids double load at tokenize time)
+                    cut.custom = cut.custom or {}
+                    cut.custom["rms_db"] = rms_db(cut)
 
                     writer.write(cut)
                     written += 1

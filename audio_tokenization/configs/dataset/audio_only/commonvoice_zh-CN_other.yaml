@@ -1,7 +1,4 @@
 # CommonVoice zh-CN (other split) — audio-only tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 output_name: commonvoice_zh-CN_other
 

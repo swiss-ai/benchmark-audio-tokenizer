@@ -36,7 +36,20 @@ __all__ = [
     "SimpleWandbLogger",
     "finalize_shard_writer",
     "is_cuda_oom",
+    "_get_rss_gb",
 ]
+
+
+def _get_rss_gb() -> float:
+    """Return current process RSS in GiB by reading /proc/self/status."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / (1024 * 1024)  # kB -> GiB
+    except Exception:
+        pass
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +225,10 @@ class SimpleWandbLogger:
         self._start_time = time.time()
         self._step = 0
 
+    def should_log_now(self) -> bool:
+        """Return True if the flush interval has elapsed since the last log."""
+        return (time.time() - self._last_flush) >= self._interval
+
     def log(
         self,
         samples: int,
@@ -220,6 +237,7 @@ class SimpleWandbLogger:
         skipped: int,
         batch_audio_seconds: float = 0.0,
         force: bool = False,
+        metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Log absolute totals if the flush interval has elapsed."""
         now = time.time()
@@ -228,19 +246,19 @@ class SimpleWandbLogger:
         import wandb
 
         elapsed = now - self._start_time
-        wandb.log(
-            {
-                "samples_processed": samples,
-                "tokens_generated": tokens,
-                "errors": errors,
-                "samples_skipped": skipped,
-                "samples_per_second": samples / elapsed if elapsed > 0 else 0,
-                "tokens_per_second": tokens / elapsed if elapsed > 0 else 0,
-                "elapsed_seconds": elapsed,
-                "batch_audio_seconds": batch_audio_seconds,
-            },
-            step=self._step,
-        )
+        payload = {
+            "samples_processed": samples,
+            "tokens_generated": tokens,
+            "errors": errors,
+            "samples_skipped": skipped,
+            "samples_per_second": samples / elapsed if elapsed > 0 else 0,
+            "tokens_per_second": tokens / elapsed if elapsed > 0 else 0,
+            "elapsed_seconds": elapsed,
+            "batch_audio_seconds": batch_audio_seconds,
+        }
+        if metrics:
+            payload.update(metrics)
+        wandb.log(payload, step=self._step)
         self._step += 1
         self._last_flush = now
 

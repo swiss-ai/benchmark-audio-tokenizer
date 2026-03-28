@@ -17,8 +17,13 @@ tokenizer:
   torch_compile: false
   trim_last_tokens: 5              # Trim trailing tokens from padded audio (0 to disable)
 
-# Filtering
-min_sample_rate: 16000
+# Filtering & audio quality
+filter:
+  min_duration: 0.1
+  max_duration: 200.0
+  min_sample_rate: 16000
+  min_rms_db: -40                # drop clips quieter than -40 dB (near-silence)
+  normalize_rms_db: -3           # peak normalize to -3 dBFS (matches WavTokenizer training)
 
 # Resume
 resume: false

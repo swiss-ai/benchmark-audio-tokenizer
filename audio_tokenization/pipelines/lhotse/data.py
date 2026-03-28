@@ -81,14 +81,15 @@ def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int, stats=None):
 
         cuts = cuts.filter(_dur_filter)
 
-    # Drop quiet audio (e.g. coral conversation at -30 dB reconstructs to silence).
+    # Drop quiet audio using precomputed rms_db stored in cut.custom during
+    # Shar preparation.  Old Shar without the field passes through unfiltered.
     min_rms_db = cfg.get("min_rms_db")
     if min_rms_db is not None:
-        from audio_tokenization.utils.prepare_data.common import rms_db
         _min_rms = float(min_rms_db)
 
         def _rms_filter(cut):
-            if rms_db(cut) < _min_rms:
+            val = (cut.custom or {}).get("rms_db")
+            if val is not None and val < _min_rms:
                 if stats is not None:
                     stats.rms_skipped += 1
                 return False

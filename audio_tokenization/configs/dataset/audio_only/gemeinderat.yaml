@@ -1,7 +1,4 @@
 # Gemeinderat (Swiss German) — audio-only tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 output_name: gemeinderat_zurich
 

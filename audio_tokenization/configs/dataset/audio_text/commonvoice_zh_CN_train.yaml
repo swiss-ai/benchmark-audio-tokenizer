@@ -1,7 +1,4 @@
 # CommonVoice zh-CN train — audio-text tokenization test.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: commonvoice_zh_CN
 output_name: commonvoice_zh_CN_train

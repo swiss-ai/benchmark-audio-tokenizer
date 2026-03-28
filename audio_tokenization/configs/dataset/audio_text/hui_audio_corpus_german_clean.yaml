@@ -1,7 +1,4 @@
 # HUI Audio Corpus German (clean) — audio-text direct tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: hui_audio_corpus_german_clean
 output_name: hui_audio_corpus_german_clean

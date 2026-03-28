@@ -1,8 +1,5 @@
 # EuroSpeech permissive languages — audio-text direct tokenization.
 # Italy (CC BY 4.0), UK (OGL v3.0), Bulgaria (CC BY 2.5), France (Licence Ouverte), Norway (NLOD 2.0)
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: eurospeech_permissive
 output_name: eurospeech_permissive_direct

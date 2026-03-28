@@ -1,7 +1,4 @@
 # AudioSet balanced train — small test set for regression testing.
-defaults:
-  - ../_base_
-  - _self_
 
 output_name: audioset_bal_train
 

@@ -1,9 +1,5 @@
 # AudioSet with UTS captions — audio-text direct annotate tokenization.
 # Only 65K of 1.7M cuts have UTS text; cuts without text are skipped by the pipeline.
-defaults:
-  - ../_base_
-  - _self_
-
 dataset_name: audioset_uts
 output_name: audioset_uts_annotate_direct
 

@@ -1,7 +1,4 @@
 # Emilia-YODAS isolated — audio-text tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: emilia_yodas
 output_name: emilia_yodas_isolated

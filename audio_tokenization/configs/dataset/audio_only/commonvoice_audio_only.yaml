@@ -1,7 +1,4 @@
 # CommonVoice "other" splits — ca/de/en/es/fr/it/zh-CN audio-only tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 output_name: commonvoice_ca_de_en_es_fr_it_zh-CN_S1
 

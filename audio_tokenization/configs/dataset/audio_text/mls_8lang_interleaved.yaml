@@ -1,7 +1,4 @@
 # MLS (Multilingual LibriSpeech) 8 languages — audio-text interleaved tokenization.
-defaults:
-  - ../_base_
-  - _self_
 
 dataset_name: mls
 output_name: mls_8lang_interleaved

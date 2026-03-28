@@ -13,6 +13,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import logging
 
@@ -83,11 +84,11 @@ def main(cfg: DictConfig):
         "output_dir": cfg.output_dir,
         "mode": cfg.get("mode", "audio_only"),
         "resume": cfg.get("resume", False),
-        "min_duration": cfg.dataset.get("min_duration"),
-        "max_duration": cfg.dataset.get("max_duration"),
-        "min_sample_rate": cfg.dataset.get("min_sample_rate", min_sample_rate),
-        "min_rms_db": cfg.dataset.get("min_rms_db"),
-        "normalize_rms_db": cfg.dataset.get("normalize_rms_db"),
+        "min_duration": cfg.dataset.get("min_duration", cfg.filter.min_duration),
+        "max_duration": cfg.dataset.get("max_duration", cfg.filter.max_duration),
+        "min_sample_rate": cfg.dataset.get("min_sample_rate", cfg.filter.min_sample_rate),
+        "min_rms_db": cfg.dataset.get("min_rms_db", cfg.filter.min_rms_db),
+        "normalize_rms_db": cfg.dataset.get("normalize_rms_db", cfg.filter.normalize_rms_db),
         # Shar data (pre-built by prepare_hf_to_shar / prepare_wds_to_shar)
         "shar_dir": list(cfg.dataset.shar_dir) if isinstance(cfg.dataset.shar_dir, (list, ListConfig)) else cfg.dataset.shar_dir,
         "shar_index_filename": cfg.dataset.get("shar_index_filename", "shar_index.json"),
