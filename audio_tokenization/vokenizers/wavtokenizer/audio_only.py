@@ -74,30 +74,23 @@ class WavTokenizerAudioOnly:
 
     def _cache_special_tokens(self):
         """Cache special token IDs from omni_tokenizer (same pattern as vision)."""
+        from audio_tokenization.utils.token_mapping import load_audio_token_mapping
+
         # BOS and EOS tokens
         assert self.omni_tokenizer.bos_token is not None, "BOS token must be defined"
         assert self.omni_tokenizer.eos_token is not None, "EOS token must be defined"
         self._bos_id = self.omni_tokenizer.bos_token_id
         self._eos_id = self.omni_tokenizer.eos_token_id
 
-        # Audio structure tokens
-        self._audio_start_id = self.omni_tokenizer.convert_tokens_to_ids("<|audio_start|>")
-        self._audio_end_id = self.omni_tokenizer.convert_tokens_to_ids("<|audio_end|>")
+        mapping = load_audio_token_mapping(self.omni_tokenizer_path)
+        st = mapping["structure_tokens"]
 
-        # Audio token offset - query the first audio token just like vision does:
-        # vision: first_vision_token = self.text_tokenizer.convert_tokens_to_ids("<|visual token 000000|>")
-        # audio: first_audio_token = self.omni_tokenizer.convert_tokens_to_ids("<|audio token 0|>")
-        first_audio_token = self.omni_tokenizer.convert_tokens_to_ids("<|audio token 0|>")
+        self._audio_start_id = st["audio_start"]
+        self._audio_end_id = st["audio_end"]
+        self._audio_token_offset = mapping["audio_token_offset"]
 
-        # Check if audio tokens exist in the omni_tokenizer
-        if first_audio_token == self.omni_tokenizer.unk_token_id:
-            raise ValueError(
-                f"Audio tokens not found in omni_tokenizer at {self.omni_tokenizer_path}. "
-                "Make sure the omni_tokenizer has audio tokens added "
-                "(e.g., <|audio token 0|> through <|audio token N|>)."
-            )
-
-        self._audio_token_offset = first_audio_token
+        # Store for subclass reuse (avoids re-reading the file)
+        self._mapping = mapping
 
     @property
     def bos_id(self) -> int:

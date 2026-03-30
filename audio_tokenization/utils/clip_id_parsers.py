@@ -113,6 +113,36 @@ def parse_coral_clip_id(clip_id: str) -> Tuple[str, int]:
     return source_id, clip_num
 
 
+def parse_libriheavy_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse LibriHeavy clip IDs.
+
+    Format: ``large/{speaker_id}/{book_chapter_mp3}/{chapter}_{segment_index}``
+    e.g. ``large/10018/conquestofcanaan_1710_librivox_64kb_mp3/conquestofcanaan_01_tarkington_64kb_5``
+      -> ``("large/10018/conquestofcanaan_1710_librivox_64kb_mp3/conquestofcanaan_01_tarkington_64kb", 5)``
+    """
+    match = re.match(r"^(.+)_(\d+)$", clip_id)
+    if match is None:
+        raise ValueError(f"Cannot parse LibriHeavy clip ID: {clip_id!r}")
+    source_id = match.group(1)
+    clip_num = int(match.group(2))
+    return source_id, clip_num
+
+
+def parse_parlaspeech_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse ParlaSpeech clip IDs.
+
+    Format: ``{session}.{utterance_id}_{start}-{end}``
+    e.g. ``ParlaMint-RS_2013-07-09-0.u20685_112-143``
+      -> ``("ParlaMint-RS_2013-07-09-0.u20685", 112)``
+    """
+    match = re.match(r"^(.+)_(\d+)-\d+$", clip_id)
+    if match is None:
+        raise ValueError(f"Cannot parse ParlaSpeech clip ID: {clip_id!r}")
+    source_id = match.group(1)
+    clip_num = int(match.group(2))
+    return source_id, clip_num
+
+
 def parse_generic_clip_id(clip_id: str) -> Tuple[str, int]:
     """Fallback parser: treats entire clip ID as source, clip_num=0."""
     return clip_id, 0
@@ -130,6 +160,8 @@ _PARSERS = {
     "aishell": parse_aishell_clip_id,
     "legco": parse_legco_clip_id,
     "coral": parse_coral_clip_id,
+    "libriheavy": parse_libriheavy_clip_id,
+    "parlaspeech": parse_parlaspeech_clip_id,
     "generic": parse_generic_clip_id,
 }
 

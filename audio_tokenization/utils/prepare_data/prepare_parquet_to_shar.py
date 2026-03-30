@@ -25,6 +25,7 @@ Usage (SPC-R):
 import argparse
 from collections import Counter
 import logging
+import math
 import subprocess
 import time
 from pathlib import Path
@@ -159,6 +160,7 @@ def _convert_worker(args_tuple):
         text_column,
         duration_column,
         language_column,
+        custom_columns,
         text_tokenizer,
         resampling_backend,
         ffmpeg_bin,
@@ -190,8 +192,10 @@ def _convert_worker(args_tuple):
             logger.info(f"Worker {worker_id}: reading {pq_name}")
             df = pl.read_parquet(pq_path)
 
-            for row in df.iter_rows(named=True):
-                if isinstance(id_column, list):
+            for row_idx, row in enumerate(df.iter_rows(named=True)):
+                if not id_column:
+                    row_id = f"{Path(pq_path).stem}_{row_idx}"
+                elif isinstance(id_column, list):
                     row_id = "_".join(str(row[c]) for c in id_column)
                 else:
                     row_id = row[id_column]
@@ -246,6 +250,15 @@ def _convert_worker(args_tuple):
                             language=language,
                         )]
 
+                    # Store additional columns in cut.custom
+                    if custom_columns:
+                        if cut.custom is None:
+                            cut.custom = {}
+                        for col in custom_columns:
+                            val = row.get(col)
+                            if val is not None:
+                                cut.custom[col] = val
+
                     # Resample if needed
                     if target_sr and cut.sampling_rate != target_sr:
                         cut = cut.resample(target_sr)
@@ -260,7 +273,12 @@ def _convert_worker(args_tuple):
 
                     # Precompute RMS (audio already decoded; avoids double load at tokenize time)
                     cut.custom = cut.custom or {}
-                    cut.custom["rms_db"] = rms_db(cut)
+                    rms_val = rms_db(cut)
+                    if math.isnan(rms_val):
+                        skipped += 1
+                        runtime_counts["skipped_empty_audio"] += 1
+                        continue
+                    cut.custom["rms_db"] = rms_val
 
                     writer.write(cut)
                     written += 1
@@ -346,9 +364,9 @@ def main(argv=None):
     )
 
     # Column names
-    parser.add_argument("--id-column", type=str, nargs="+", default=["id"],
+    parser.add_argument("--id-column", type=str, nargs="*", default=None,
                         help="Column name(s) for row ID. Multiple columns are joined with '_'. "
-                             "(default: 'id')")
+                             "Omit to auto-generate IDs from filename + row index.")
     parser.add_argument("--audio-column", type=str, default="audio",
                         help="Column name for audio struct (default: 'audio')")
     parser.add_argument("--text-column", type=str, default="text",
@@ -357,6 +375,8 @@ def main(argv=None):
                         help="Column name for duration (default: 'duration')")
     parser.add_argument("--language-column", type=str, default=None,
                         help="Column name for language code (default: None, not set)")
+    parser.add_argument("--custom-columns", type=str, nargs="*", default=None,
+                        help="Additional parquet columns to store in supervision.custom dict")
 
     # Text tokenizer
     parser.add_argument("--text-tokenizer", type=str, default=None,
@@ -417,6 +437,7 @@ def main(argv=None):
             args.text_column,
             args.duration_column,
             args.language_column,
+            args.custom_columns,
             text_tokenizer,
             args.resampling_backend,
             args.ffmpeg_bin,

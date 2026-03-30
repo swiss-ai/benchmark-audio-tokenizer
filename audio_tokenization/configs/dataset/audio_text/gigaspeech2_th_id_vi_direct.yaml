@@ -1,0 +1,15 @@
+# GigaSpeech2 Thai + Indonesian + Vietnamese — audio-text direct tokenization.
+# 27.5M samples, ~30.8K hours of web-crawled speech with aligned transcripts.
+
+dataset_name: gigaspeech2
+output_name: gigaspeech2_th_id_vi_direct
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/gigaspeech2/th_train
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/gigaspeech2/id_train
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/gigaspeech2/vi_train
+
+min_duration: 2.0
+max_batch_duration: 2000.0
+prefetch_factor: 4
+checkpoint_interval_batches: 2000

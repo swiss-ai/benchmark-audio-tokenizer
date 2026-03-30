@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 TASK_TOKEN_MAP = {
     "transcribe": "speech_transcribe_id",
+    "translate": "stt_translate_id",
     "annotate": "audio_annotate_id",
 }
 

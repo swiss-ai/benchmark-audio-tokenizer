@@ -9,6 +9,8 @@ from audio_tokenization.utils.clip_id_parsers import (
     parse_emilia_clip_id,
     parse_generic_clip_id,
     parse_legco_clip_id,
+    parse_libriheavy_clip_id,
+    parse_parlaspeech_clip_id,
     parse_peoples_speech_clip_id,
     parse_spc_clip_id,
     parse_wenetspeech_clip_id,
@@ -111,6 +113,31 @@ class TestCoral:
             parse_coral_clip_id("")
 
 
+class TestLibriHeavy:
+    def test_basic(self):
+        assert parse_libriheavy_clip_id(
+            "large/10018/conquestofcanaan_1710_librivox_64kb_mp3/conquestofcanaan_01_tarkington_64kb_5"
+        ) == ("large/10018/conquestofcanaan_1710_librivox_64kb_mp3/conquestofcanaan_01_tarkington_64kb", 5)
+
+    def test_zero(self):
+        assert parse_libriheavy_clip_id("some_source_0") == ("some_source", 0)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_libriheavy_clip_id("no_trailing_digits")
+
+
+class TestParlaSpeech:
+    def test_basic(self):
+        assert parse_parlaspeech_clip_id(
+            "ParlaMint-RS_2013-07-09-0.u20685_112-143"
+        ) == ("ParlaMint-RS_2013-07-09-0.u20685", 112)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_parlaspeech_clip_id("no_range_suffix")
+
+
 class TestGeneric:
     def test_returns_id_and_zero(self):
         assert parse_generic_clip_id("anything_at_all") == ("anything_at_all", 0)
@@ -129,6 +156,8 @@ class TestRegistry:
             "aishell",
             "legco",
             "coral",
+            "libriheavy",
+            "parlaspeech",
             "generic",
         ]:
             parser = get_clip_id_parser(name)

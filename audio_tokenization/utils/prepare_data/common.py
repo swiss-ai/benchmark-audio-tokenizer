@@ -54,15 +54,18 @@ def make_text_tokenize_fn(tokenizer):
     return _tokenize_text
 
 
-def normalize_batch_peak(audios, audio_lens, target_db: float = -3.0):
-    """Peak-normalize each sample in a padded batch.
+def normalize_batch_peak(audios, target_db: float = -3.0):
+    """Peak-normalize each sample in a padded batch (vectorized, no Python loop).
 
     Matches WavTokenizer's training preprocessing: SOX ``norm`` to a target
     peak dB below full scale.  Guarantees no clipping (peaks ≤ target_db dBFS).
 
+    Assumes zero-padding (Lhotse's ``UnsupervisedWaveformDataset(collate=True)``
+    and ``AudioSamples()`` both zero-pad by default).  Zero padding does not
+    affect ``abs().max()`` and stays zero after scaling.
+
     Args:
-        audios: (B, T) float tensor on CPU.
-        audio_lens: list of int, original sample counts per item.
+        audios: (B, T) float tensor (CPU or GPU), zero-padded.
         target_db: target peak in dBFS (default -3.0, matching WavTokenizer val).
 
     Returns:
@@ -70,13 +73,9 @@ def normalize_batch_peak(audios, audio_lens, target_db: float = -3.0):
         Near-silence (peak < -100 dB) is left unchanged.
     """
     target_peak = 10 ** (target_db / 20.0)
-    result = audios.clone()
-    for i, length in enumerate(audio_lens):
-        segment = result[i, :length]
-        peak = segment.abs().max().item()
-        if peak > 1e-10:  # skip near-silence
-            result[i, :length] = segment * (target_peak / peak)
-    return result
+    peaks = audios.abs().max(dim=1).values.clamp(min=1e-10)
+    scale = target_peak / peaks
+    return audios * scale.unsqueeze(1)
 
 
 def rms_db(cut) -> float:
@@ -88,6 +87,8 @@ def rms_db(cut) -> float:
     import numpy as np
 
     audio = cut.load_audio()          # (channels, samples)
+    if audio.size == 0:
+        return -200.0
     rms = float(np.sqrt(np.mean(audio ** 2)))
     return 20.0 * np.log10(rms + 1e-10)
 

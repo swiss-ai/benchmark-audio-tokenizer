@@ -87,6 +87,7 @@ class WorkerStats:
     errors: int = 0
     samples_skipped: int = 0
     rms_skipped: int = 0
+    no_text_skipped: int = 0
     duration_skipped: int = 0
     frequency_skipped: int = 0
     start_time: float = field(default_factory=time.time)
@@ -100,6 +101,7 @@ class WorkerStats:
             "errors": self.errors,
             "samples_skipped": self.samples_skipped,
             "rms_skipped": self.rms_skipped,
+            "no_text_skipped": self.no_text_skipped,
             "duration_skipped": self.duration_skipped,
             "frequency_skipped": self.frequency_skipped,
             "elapsed_time": self.elapsed_time,
@@ -236,6 +238,7 @@ class SimpleWandbLogger:
         errors: int,
         skipped: int,
         batch_audio_seconds: float = 0.0,
+        text_tokens: int = 0,
         force: bool = False,
         metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -248,14 +251,18 @@ class SimpleWandbLogger:
         elapsed = now - self._start_time
         payload = {
             "samples_processed": samples,
-            "tokens_generated": tokens,
+            "audio_tokens_generated": tokens,
+            "tokens_per_second": (tokens + text_tokens) / elapsed if elapsed > 0 else 0,
             "errors": errors,
             "samples_skipped": skipped,
             "samples_per_second": samples / elapsed if elapsed > 0 else 0,
-            "tokens_per_second": tokens / elapsed if elapsed > 0 else 0,
+            "audio_tokens_per_second": tokens / elapsed if elapsed > 0 else 0,
             "elapsed_seconds": elapsed,
             "batch_audio_seconds": batch_audio_seconds,
         }
+        if text_tokens > 0:
+            payload["text_tokens_generated"] = text_tokens
+            payload["text_tokens_per_second"] = text_tokens / elapsed if elapsed > 0 else 0
         if metrics:
             payload.update(metrics)
         wandb.log(payload, step=self._step)

@@ -52,22 +52,13 @@ AUDIO_TOKEN_OFFSET = 262344
 AUDIO_VOCAB_SIZE = 4096
 
 
-def load_special_token_ids(tokenizer) -> dict[str, int]:
-    """Look up special audio structure token IDs from the tokenizer."""
-    names = {
-        "audio_start": "<|audio_start|>",
-        "audio_end": "<|audio_end|>",
-        "stt_transcribe": "<|stt_transcribe|>",
-        "stt_continue": "<|stt_continue|>",
-        "tts_continue": "<|tts_continue|>",
-    }
-    ids = {}
-    for key, tok_str in names.items():
-        tid = tokenizer.convert_tokens_to_ids(tok_str)
-        if tid == tokenizer.unk_token_id:
-            raise ValueError(f"Token {tok_str} not found in tokenizer vocabulary")
-        ids[key] = tid
-    return ids
+def load_special_token_ids(tokenizer, tokenizer_path: str) -> dict[str, int]:
+    """Load audio structure token IDs from the mapping file (single source of truth)."""
+    from audio_tokenization.utils.token_mapping import get_structure_tokens
+
+    required = ["audio_start", "audio_end", "stt_transcribe", "stt_continue", "tts_continue"]
+    st = get_structure_tokens(tokenizer_path, required=required)
+    return {key: st[key] for key in required}
 
 
 def build_prompt(
@@ -290,7 +281,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
-    special_ids = load_special_token_ids(tokenizer)
+    special_ids = load_special_token_ids(tokenizer, tokenizer_path)
     print(f"  bos={bos_id}  eos={eos_id}")
     print(f"  audio_start={special_ids['audio_start']}  audio_end={special_ids['audio_end']}")
     print(f"  stt_transcribe={special_ids['stt_transcribe']}  stt_continue={special_ids['stt_continue']}  tts_continue={special_ids['tts_continue']}")

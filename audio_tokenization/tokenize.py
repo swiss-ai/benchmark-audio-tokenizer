@@ -93,7 +93,7 @@ def main(cfg: DictConfig):
         "shar_dir": list(cfg.dataset.shar_dir) if isinstance(cfg.dataset.shar_dir, (list, ListConfig)) else cfg.dataset.shar_dir,
         "shar_index_filename": cfg.dataset.get("shar_index_filename", "shar_index.json"),
         # Dynamic bucketing sampler
-        "max_batch_duration": cfg.dataset.get("max_batch_duration", 1500.0),
+        "max_batch_duration": cfg.dataset.get("max_batch_duration", cfg.dataloader.max_batch_duration),
         "max_batch_cuts": cfg.dataset.get("max_batch_cuts"),
         "num_buckets": cfg.dataset.get("num_buckets", 20),
         "bucket_buffer_size": cfg.dataset.get("bucket_buffer_size", 20000),
@@ -101,10 +101,10 @@ def main(cfg: DictConfig):
         "sampler_seed": cfg.dataset.get("sampler_seed", 42),
         "quadratic_duration": cfg.dataset.get("quadratic_duration"),
         # DataLoader prefetching
-        "num_workers": cfg.dataset.get("num_workers", 4),
-        "prefetch_factor": cfg.dataset.get("prefetch_factor", 4),
+        "num_workers": cfg.dataset.get("num_workers", cfg.dataloader.num_workers),
+        "prefetch_factor": cfg.dataset.get("prefetch_factor", cfg.dataloader.prefetch_factor),
         # Checkpointing
-        "checkpoint_interval_batches": cfg.dataset.get("checkpoint_interval_batches", 500),
+        "checkpoint_interval_batches": cfg.dataset.get("checkpoint_interval_batches", cfg.dataloader.checkpoint_interval_batches),
         # Output subdirectory name (overrides auto-inferred name)
         "output_name": cfg.dataset.get("output_name"),
         # audio_text mode

@@ -102,6 +102,21 @@ def _process_shard(args):
     return computed, len(raw_dicts) - computed
 
 
+def _safe_process_shard(args):
+    """Wrapper that catches transient errors so one bad shard doesn't kill the pool.
+
+    Fatal I/O errors (permission, disk full, OOM) are re-raised to abort.
+    """
+    try:
+        return _process_shard(args)
+    except (PermissionError, OSError, MemoryError) as e:
+        logger.error(f"Fatal error on shard {args[1]}: {e}")
+        raise
+    except Exception as e:
+        logger.warning(f"Shard failed: {args[1]} — {e}")
+        return None
+
+
 def process_shar_dir(shar_dir: str, num_workers: int = 8):
     """Add rms_db to all cuts in a Shar directory."""
     shar_path = Path(shar_dir)
@@ -131,21 +146,29 @@ def process_shar_dir(shar_dir: str, num_workers: int = 8):
     total_computed = 0
     total_skipped = 0
 
+    errors = 0
     if num_workers <= 1:
         for task in tasks:
-            computed, skipped = _process_shard(task)
-            total_computed += computed
-            total_skipped += skipped
-    else:
-        with Pool(num_workers) as pool:
-            for computed, skipped in pool.imap_unordered(_process_shard, tasks):
+            try:
+                computed, skipped = _process_shard(task)
                 total_computed += computed
                 total_skipped += skipped
+            except Exception as e:
+                logger.warning(f"Shard failed: {task[1]} — {e}")
+                errors += 1
+    else:
+        with Pool(num_workers) as pool:
+            for result in pool.imap_unordered(_safe_process_shard, tasks):
+                if result is None:
+                    errors += 1
+                else:
+                    total_computed += result[0]
+                    total_skipped += result[1]
 
     elapsed = time.time() - t0
     logger.info(
         f"Done: {shar_dir} — {total_computed} computed, {total_skipped} already had rms_db, "
-        f"{elapsed:.1f}s ({total_computed / max(elapsed, 1):.0f} cuts/s)"
+        f"{errors} shard errors, {elapsed:.1f}s ({total_computed / max(elapsed, 1):.0f} cuts/s)"
     )
 
 

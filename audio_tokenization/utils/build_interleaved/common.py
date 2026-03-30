@@ -75,28 +75,22 @@ _PERCENTILES = [1, 5, 10, 25, 50, 75, 90, 95, 99]
 
 def load_token_ids(tokenizer_path: str) -> tuple[int, int, int, int, int, int]:
     """Load BOS, EOS, stt_continue, stt_transcribe, tts_continue IDs and vocab_size."""
+    from audio_tokenization.utils.token_mapping import get_structure_tokens
+
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
 
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
-    stt_continue_id = tokenizer.convert_tokens_to_ids("<|stt_continue|>")
-    stt_transcribe_id = tokenizer.convert_tokens_to_ids("<|stt_transcribe|>")
-    tts_continue_id = tokenizer.convert_tokens_to_ids("<|tts_continue|>")
-
     assert bos_id is not None, "BOS token must be defined in tokenizer"
     assert eos_id is not None, "EOS token must be defined in tokenizer"
-    assert stt_continue_id != tokenizer.unk_token_id, (
-        "<|stt_continue|> not found in tokenizer"
-    )
-    assert stt_transcribe_id != tokenizer.unk_token_id, (
-        "<|stt_transcribe|> not found in tokenizer"
-    )
-    assert tts_continue_id != tokenizer.unk_token_id, (
-        "<|tts_continue|> not found in tokenizer"
+
+    st = get_structure_tokens(
+        tokenizer_path,
+        required=["stt_continue", "stt_transcribe", "tts_continue"],
     )
 
     vocab_size = len(tokenizer)
-    return bos_id, eos_id, stt_continue_id, stt_transcribe_id, tts_continue_id, vocab_size
+    return bos_id, eos_id, st["stt_continue"], st["stt_transcribe"], st["tts_continue"], vocab_size
 
 
 def find_consecutive_runs(sorted_clip_nums: list[int]) -> list[list[int]]:

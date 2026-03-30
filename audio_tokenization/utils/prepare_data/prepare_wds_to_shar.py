@@ -41,6 +41,7 @@ from collections import Counter
 from dataclasses import dataclass
 import glob
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -91,12 +92,15 @@ MetadataEntry = tuple[Optional[str], dict[str, Any]]
 def load_external_metadata(
     path: str,
     custom_fields: Optional[Tuple[str, ...]] = None,
+    id_field: str = "id",
+    text_field: str = "text",
 ) -> dict[str, MetadataEntry]:
     """Load transcript metadata from an external TSV or JSONL file.
 
     Supported formats:
       - ``.tsv``: headerless, tab-separated ``segment_id<TAB>text``
-      - ``.jsonl``: one JSON object per line with ``"id"`` and ``"text"`` keys
+      - ``.jsonl``: one JSON object per line keyed by *id_field* with
+        transcript in *text_field*.
 
     Returns a ``{segment_id: (text, custom)}`` dict.
     """
@@ -114,14 +118,21 @@ def load_external_metadata(
                     result[parts[0]] = (parts[1], {})
     elif p.suffix == ".jsonl":
         import orjson
-        with open(p) as f:
+        skipped = 0
+        with open(p, "rb") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                obj = orjson.loads(line)
+                try:
+                    obj = orjson.loads(line)
+                except (orjson.JSONDecodeError, ValueError):
+                    skipped += 1
+                    continue
                 custom = {k: obj[k] for k in (custom_fields or ()) if k in obj}
-                result[obj["id"]] = (obj.get("text"), custom)
+                result[obj[id_field]] = (obj.get(text_field), custom)
+        if skipped:
+            logger.warning(f"Skipped {skipped:,} malformed lines in {p}")
     else:
         raise ValueError(f"Unsupported external metadata format: {p.suffix} (expected .tsv or .jsonl)")
     logger.info(f"Loaded {len(result):,} entries from external metadata: {p}")
@@ -214,11 +225,22 @@ class ExternalMetadataProvider(MetadataProvider):
         scan: TarScanResult,
         stats: Optional[Counter] = None,
     ) -> MetadataEntry:
+        # Build candidate keys once, check in priority order.
         basename = stem.rsplit("/", 1)[-1] if "/" in stem else stem
-        if basename in self.metadata:
-            return self.metadata[basename]
-        if stem in self.metadata:
-            return self.metadata[stem]
+        candidates = [stem, basename] if basename != stem else [stem]
+
+        # Exact match (stem or basename without extension)
+        for key in candidates:
+            if key in self.metadata:
+                return self.metadata[key]
+
+        # Metadata may include file extension (e.g. "clip.wav") while tar
+        # stems are stripped — try appending common audio suffixes.
+        for key in candidates:
+            for ext in AUDIO_SUFFIXES:
+                if key + ext in self.metadata:
+                    return self.metadata[key + ext]
+
         if stats is not None:
             stats["external_meta_miss"] += 1
         return None, {}
@@ -413,7 +435,12 @@ def _convert_worker(args_tuple):
                         out_cut.custom["lang"] = sample_lang
                     # Precompute RMS (audio already decoded; avoids double load at tokenize time)
                     out_cut.custom = out_cut.custom or {}
-                    out_cut.custom["rms_db"] = rms_db(out_cut)
+                    rms_val = rms_db(out_cut)
+                    if math.isnan(rms_val):
+                        skipped += 1
+                        runtime_counts["skipped_empty_audio"] += 1
+                        continue
+                    out_cut.custom["rms_db"] = rms_val
                     writer.write(out_cut)
                     written += 1
                     total_duration_sec += out_cut.duration
@@ -510,11 +537,13 @@ def main(argv=None):
                         help="Path to external metadata file (.tsv or .jsonl). "
                              "When set, transcripts are loaded from this file instead "
                              "of sidecar files inside the tar archives.")
+    parser.add_argument("--id-field", type=str, default="id",
+                        help="JSON key for segment ID in external metadata JSONL (default: 'id')")
     parser.add_argument("--text-field", type=str, default="text",
-                        help="JSON key for transcript in WDS sidecars (default: 'text')")
+                        help="JSON key for transcript text (default: 'text')")
     parser.add_argument("--custom-fields", type=str, nargs="*", default=None,
                         help="JSON keys to store in cut.custom (e.g. --custom-fields language speaker)")
-    parser.add_argument("--text-tokenizer", type=str, required=True,
+    parser.add_argument("--text-tokenizer", type=str, default=None,
                         help="Path to tokenizer.json for pre-tokenizing supervision text")
 
     # Parallelism
@@ -611,6 +640,8 @@ def main(argv=None):
             metadata=load_external_metadata(
                 args.external_metadata,
                 tuple(args.custom_fields) if args.custom_fields else None,
+                id_field=args.id_field,
+                text_field=args.text_field,
             )
         )
         mp_start_method = "fork"

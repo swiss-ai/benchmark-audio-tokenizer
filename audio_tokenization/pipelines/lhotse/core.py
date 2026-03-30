@@ -41,22 +41,18 @@ from .data import build_cutset
 logger = logging.getLogger(__name__)
 
 
-def _normalize_batch(batch: dict, target_db: float) -> dict:
+def _normalize_batch(batch: dict, target_db: float, device: str = "cpu") -> dict:
     """Peak-normalize audio in a batch dict (works for all handler modes).
 
-    Matches WavTokenizer training: SOX ``norm`` to *target_db* dBFS.
+    Moves audio to *device* before normalizing for GPU-accelerated peak
+    computation.  Matches WavTokenizer training: SOX ``norm`` to *target_db* dBFS.
     """
     from audio_tokenization.utils.prepare_data.common import normalize_batch_peak
 
     if "audio" in batch:
-        # audio_only: keys are "audio" (B, T) and "audio_lens" (B,)
-        audio_lens = batch["audio_lens"].tolist()
-        batch["audio"] = normalize_batch_peak(batch["audio"], audio_lens, target_db)
+        batch["audio"] = normalize_batch_peak(batch["audio"].to(device, non_blocking=True), target_db)
     elif "inputs" in batch:
-        # audio_text: keys are "inputs" (B, T) and "supervisions"
-        cuts = batch["supervisions"]["cut"]
-        audio_lens = [c.num_samples for c in cuts]
-        batch["inputs"] = normalize_batch_peak(batch["inputs"], audio_lens, target_db)
+        batch["inputs"] = normalize_batch_peak(batch["inputs"].to(device, non_blocking=True), target_db)
     return batch
 
 
@@ -247,16 +243,47 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
         normalize_rms_db = float(normalize_rms_db)
         logger.info(f"[rank {rank}] Peak normalization enabled: target {normalize_rms_db} dBFS")
 
+    import time as _time
+
+    _t_start = _t_encode_start = _t_encode_end = None
+    if wandb_logger is not None:
+        _t_start = torch.cuda.Event(enable_timing=True)
+        _t_encode_start = torch.cuda.Event(enable_timing=True)
+        _t_encode_end = torch.cuda.Event(enable_timing=True)
+
+    _batch_ready_time = _time.monotonic()
+
+    _pbar = None
+    if rank == 0:
+        from tqdm import tqdm
+        _pbar = tqdm(desc="tokenize", unit=" batches", dynamic_ncols=True)
+
     try:
         for batch in dataloader:
+            _dataloader_wait_ms = (_time.monotonic() - _batch_ready_time) * 1000
+
+            # Decide whether to capture per-batch timing (only when W&B will flush).
+            _time_this = (
+                wandb_logger is not None and wandb_logger.should_log_now()
+            )
+            if _time_this:
+                _t_start.record()
+
             try:
                 # Normalize audio volume before tokenization (all modes).
                 if normalize_rms_db is not None:
-                    batch = _normalize_batch(batch, normalize_rms_db)
+                    batch = _normalize_batch(batch, normalize_rms_db, device)
+
+                if _time_this:
+                    _t_encode_start.record()
 
                 batch_audio_secs = handler.process_batch(
                     batch, tokenizer, stats, target_sr, device,
                 )
+
+                if _time_this:
+                    _t_encode_end.record()
+
                 total_audio_seconds += batch_audio_secs
                 consecutive_errors = 0  # reset on batch success
 
@@ -285,11 +312,25 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
 
             batch_count += 1
 
+            if _pbar is not None:
+                elapsed = _time.time() - stats.start_time
+                tok_s = stats.tokens_generated / elapsed if elapsed > 0 else 0
+                _pbar.set_postfix_str(
+                    f"{stats.samples_processed} samples, {tok_s:.0f} tok/s, {stats.errors} err"
+                )
+                _pbar.update(1)
+
             # W&B log (rate-limited by interval inside logger)
             if wandb_logger is not None:
-                mem_metrics = None
-                if wandb_logger.should_log_now():
-                    mem_metrics = {
+                metrics = None
+                if _time_this:
+                    _t_encode_end.synchronize()
+                    tokenize_wall_ms = _t_start.elapsed_time(_t_encode_end)
+                    tokenize_gpu_ms = _t_encode_start.elapsed_time(_t_encode_end)
+                    metrics = {
+                        "timing/dataloader_wait_ms": _dataloader_wait_ms,
+                        "timing/tokenize_wall_ms": tokenize_wall_ms,
+                        "timing/tokenize_gpu_ms": tokenize_gpu_ms,
                         "memory/rss_gb": _get_rss_gb(),
                         "memory/cuda_alloc_gb": torch.cuda.memory_allocated() / (1024 ** 3),
                         "memory/cuda_reserved_gb": torch.cuda.memory_reserved() / (1024 ** 3),
@@ -300,7 +341,8 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
                     errors=stats.errors,
                     skipped=stats.samples_skipped,
                     batch_audio_seconds=total_audio_seconds,
-                    metrics=mem_metrics,
+                    text_tokens=stats.text_tokens_generated,
+                    metrics=metrics,
                 )
 
             # Periodic checkpoint: finalize current chunk, save state, open next
@@ -322,10 +364,15 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
 
                 chunk_id = done_chunk + 1
 
+            _batch_ready_time = _time.monotonic()
+
     except Exception as e:
         logger.error(f"[rank {rank}] Fatal error in tokenization loop: {e}", exc_info=True)
         stats.errors += 1
         _loop_error = e
+
+    if _pbar is not None:
+        _pbar.close()
 
     # ------------------------------------------------------------------
     # 8. Finalize last chunk (always save progress, even on failure)

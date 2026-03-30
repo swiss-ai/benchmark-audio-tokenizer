@@ -10,3 +10,5 @@ shar_dir:
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/eurospeech/bulgaria_train
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/eurospeech/france_train
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/eurospeech/norway_train
+
+num_buckets: 80

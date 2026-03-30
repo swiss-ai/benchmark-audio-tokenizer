@@ -81,6 +81,18 @@ def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int, stats=None):
 
         cuts = cuts.filter(_dur_filter)
 
+    # In audio_text mode, drop cuts without text supervision.
+    mode = cfg.get("mode", "audio_only")
+    if mode == "audio_text":
+        def _has_text(cut):
+            if not cut.supervisions or not cut.supervisions[0].text:
+                if stats is not None:
+                    stats.no_text_skipped += 1
+                return False
+            return True
+
+        cuts = cuts.filter(_has_text)
+
     # Drop quiet audio using precomputed rms_db stored in cut.custom during
     # Shar preparation.  Old Shar without the field passes through unfiltered.
     min_rms_db = cfg.get("min_rms_db")
