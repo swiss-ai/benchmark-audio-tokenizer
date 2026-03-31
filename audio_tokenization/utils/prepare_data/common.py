@@ -13,6 +13,10 @@ from typing import Iterable, Mapping, Sequence
 
 
 SUCCESS_MARKER_FILE = "_SUCCESS"
+
+# Minimum RMS threshold (dB) for keeping audio during SHAR conversion.
+# Samples below this are considered silent/near-silent and skipped.
+MIN_RMS_DB = -40.0
 PREPARE_STATE_FILE = "_PREPARE_STATE.json"
 
 
@@ -32,12 +36,16 @@ def load_text_tokenizer(tokenizer_path: str | Path):
     return tok
 
 
-def make_text_tokenize_fn(tokenizer):
+def make_text_tokenize_fn(tokenizer, extra_custom_columns=None):
     """Return a lhotse cut map function that tokenizes supervision text.
+
     Stores result as cut.custom["text_tokens"] (list[int]).
+    If *extra_custom_columns* is provided, also tokenizes those
+    cut.custom fields and stores as cut.custom["{col}_tokens"].
     """
     import logging
     _logger = logging.getLogger(__name__)
+    _extra = tuple(extra_custom_columns or ())
 
     def _tokenize_text(cut):
         texts = [s.text for s in (cut.supervisions or []) if s.text]
@@ -50,6 +58,12 @@ def make_text_tokenize_fn(tokenizer):
         ids = tokenizer.encode(" ".join(texts), add_special_tokens=False).ids
         cut.custom = cut.custom or {}
         cut.custom["text_tokens"] = ids
+        for col in _extra:
+            val = cut.custom.get(col)
+            if val and isinstance(val, str):
+                cut.custom[f"{col}_tokens"] = tokenizer.encode(
+                    val, add_special_tokens=False
+                ).ids
         return cut
     return _tokenize_text
 
@@ -91,6 +105,12 @@ def rms_db(cut) -> float:
         return -200.0
     rms = float(np.sqrt(np.mean(audio ** 2)))
     return 20.0 * np.log10(rms + 1e-10)
+
+
+def should_skip_quiet(rms_val: float) -> bool:
+    """Return True if the sample should be skipped (silent/empty audio)."""
+    import math
+    return math.isnan(rms_val) or rms_val < MIN_RMS_DB
 
 
 

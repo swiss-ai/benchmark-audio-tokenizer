@@ -40,6 +40,7 @@ from audio_tokenization.utils.prepare_data.common import (
     make_text_tokenize_fn,
     normalize_optional_path,
     rms_db,
+    should_skip_quiet,
     run_pool_and_finalize,
     to_mono,
     validate_or_write_prepare_state,
@@ -161,6 +162,7 @@ def _convert_worker(args_tuple):
         duration_column,
         language_column,
         custom_columns,
+        text_tokenize_custom_columns,
         text_tokenizer,
         resampling_backend,
         ffmpeg_bin,
@@ -180,7 +182,7 @@ def _convert_worker(args_tuple):
     written = skipped = errors = 0
     total_duration_sec = 0.0
     runtime_counts = Counter()
-    _tokenize_text = make_text_tokenize_fn(text_tokenizer) if text_tokenizer is not None else None
+    _tokenize_text = make_text_tokenize_fn(text_tokenizer, text_tokenize_custom_columns) if text_tokenizer is not None else None
 
     with SharWriter(
         output_dir=str(worker_dir),
@@ -267,16 +269,16 @@ def _convert_worker(args_tuple):
                     # Mono
                     cut = to_mono(cut, mono_downmix=True, stats=runtime_counts)
 
-                    # Pre-tokenize text
+                    # Pre-tokenize text (including extra custom columns)
                     if _tokenize_text is not None:
                         cut = _tokenize_text(cut)
 
                     # Precompute RMS (audio already decoded; avoids double load at tokenize time)
                     cut.custom = cut.custom or {}
                     rms_val = rms_db(cut)
-                    if math.isnan(rms_val):
+                    if should_skip_quiet(rms_val):
                         skipped += 1
-                        runtime_counts["skipped_empty_audio"] += 1
+                        runtime_counts["skipped_quiet_audio"] += 1
                         continue
                     cut.custom["rms_db"] = rms_val
 
@@ -381,6 +383,8 @@ def main(argv=None):
     # Text tokenizer
     parser.add_argument("--text-tokenizer", type=str, default=None,
                         help="Path to tokenizer.json for pre-tokenizing supervision text")
+    parser.add_argument("--text-tokenize-custom-columns", type=str, nargs="*", default=None,
+                        help="Custom columns to also pre-tokenize. Stored as {col}_tokens in cut.custom.")
 
     # Parallelism
     parser.add_argument("--num-workers", type=int, default=20,
@@ -438,6 +442,7 @@ def main(argv=None):
             args.duration_column,
             args.language_column,
             args.custom_columns,
+            args.text_tokenize_custom_columns,
             text_tokenizer,
             args.resampling_backend,
             args.ffmpeg_bin,

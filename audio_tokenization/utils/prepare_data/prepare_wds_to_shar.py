@@ -56,6 +56,7 @@ from audio_tokenization.utils.prepare_data.common import (
     make_text_tokenize_fn,
     normalize_optional_path,
     rms_db,
+    should_skip_quiet,
     run_aggregate,
     run_pool_and_finalize,
     to_mono,
@@ -436,9 +437,9 @@ def _convert_worker(args_tuple):
                     # Precompute RMS (audio already decoded; avoids double load at tokenize time)
                     out_cut.custom = out_cut.custom or {}
                     rms_val = rms_db(out_cut)
-                    if math.isnan(rms_val):
+                    if should_skip_quiet(rms_val):
                         skipped += 1
-                        runtime_counts["skipped_empty_audio"] += 1
+                        runtime_counts["skipped_quiet_audio"] += 1
                         continue
                     out_cut.custom["rms_db"] = rms_val
                     writer.write(out_cut)
