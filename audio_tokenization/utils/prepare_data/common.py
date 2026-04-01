@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -109,9 +110,64 @@ def rms_db(cut) -> float:
 
 def should_skip_quiet(rms_val: float) -> bool:
     """Return True if the sample should be skipped (silent/empty audio)."""
-    import math
     return math.isnan(rms_val) or rms_val < MIN_RMS_DB
 
+
+def make_rms_filter_fn():
+    """Return a (map_fn, filter_fn) pair for computing rms_db and filtering quiet cuts.
+
+    Usage with lhotse CutSet:
+        compute_rms, keep_loud = make_rms_filter_fn()
+        cuts = cuts.map(compute_rms).filter(keep_loud)
+
+    Usage in conversion loops:
+        compute_rms, keep_loud = make_rms_filter_fn()
+        cut = compute_rms(cut)
+        if not keep_loud(cut):
+            skipped += 1; continue
+    """
+    def _compute_rms(cut):
+        cut.custom = cut.custom or {}
+        cut.custom["rms_db"] = rms_db(cut)
+        return cut
+
+    def _keep_loud(cut) -> bool:
+        val = (cut.custom or {}).get("rms_db", 0.0)
+        return not should_skip_quiet(val)
+
+    return _compute_rms, _keep_loud
+
+
+def apply_audio_pipeline(
+    cut,
+    *,
+    target_sr: int | None = None,
+    mono_downmix: bool = True,
+    tokenize_fn=None,
+    runtime_counts: Counter,
+):
+    """Resample → mono → tokenize text → RMS filter in one call.
+
+    Returns ``(cut, True)`` if the cut should be skipped (quiet/empty),
+    or ``(cut, False)`` if it passed all checks and is ready to write.
+    """
+    if target_sr and cut.sampling_rate != target_sr:
+        cut = cut.resample(target_sr)
+        runtime_counts["resampled"] += 1
+
+    cut = to_mono(cut, mono_downmix=mono_downmix, stats=runtime_counts)
+
+    if tokenize_fn is not None:
+        cut = tokenize_fn(cut)
+
+    cut.custom = cut.custom or {}
+    rms_val = rms_db(cut)
+    if should_skip_quiet(rms_val):
+        runtime_counts["skipped_quiet_audio"] += 1
+        return cut, True
+    cut.custom["rms_db"] = rms_val
+
+    return cut, False
 
 
 def to_mono(cut, mono_downmix=True, stats=None):
@@ -668,3 +724,58 @@ def run_aggregate(shar_root: Path) -> None:
     if agg_runtime:
         print(f"  Runtime counters: {dict(agg_runtime)}")
     print()
+
+
+# ---------------------------------------------------------------------------
+# CLI argument group builders
+# ---------------------------------------------------------------------------
+
+
+def add_shar_output_args(parser, *, shard_size_default=2000, shar_dir_required=True):
+    """Add --shar-dir, --shard-size, --shar-format."""
+    parser.add_argument("--shar-dir", type=Path, required=shar_dir_required,
+                        default=None,
+                        help="Output directory for Shar format")
+    parser.add_argument("--shard-size", type=int, default=shard_size_default,
+                        help=f"Samples per Shar shard (default: {shard_size_default})")
+    parser.add_argument("--shar-format", type=str, default="flac",
+                        choices=["flac", "wav", "mp3", "opus"],
+                        help="Audio format in Shar (default: flac)")
+
+
+def add_audio_processing_args(parser, *, target_sr_default=24000,
+                              include_min_sr=False, include_mono_downmix=False):
+    """Add --target-sr, --resampling-backend, and optionally --min-sr, --no-mono-downmix."""
+    parser.add_argument("--target-sr", type=int, default=target_sr_default,
+                        help=f"Target sample rate (default: {target_sr_default})")
+    parser.add_argument("--resampling-backend", type=str, default=None,
+                        choices=["default", "sox"],
+                        help="Lhotse resampling backend override")
+    if include_min_sr:
+        parser.add_argument("--min-sr", type=int, default=16000,
+                            help="Drop audio below this sample rate (default: 16000)")
+    if include_mono_downmix:
+        parser.add_argument("--no-mono-downmix", action="store_true",
+                            help="Select channel 0 instead of averaging stereo channels")
+
+
+def add_text_tokenizer_args(parser, *, include_custom_columns=False):
+    """Add --text-tokenizer and optionally --text-tokenize-custom-columns."""
+    parser.add_argument("--text-tokenizer", type=str, default=None,
+                        help="Path to tokenizer.json for pre-tokenizing supervision text")
+    if include_custom_columns:
+        parser.add_argument("--text-tokenize-custom-columns", type=str, nargs="*",
+                            default=None,
+                            help="Custom columns to also pre-tokenize. "
+                                 "Stored as {col}_tokens in cut.custom.")
+
+
+def add_parallelism_args(parser, *, num_workers_default=20,
+                         include_mp_start_method=False):
+    """Add --num-workers and optionally --mp-start-method."""
+    parser.add_argument("--num-workers", type=int, default=num_workers_default,
+                        help=f"Number of parallel workers (default: {num_workers_default})")
+    if include_mp_start_method:
+        parser.add_argument("--mp-start-method", type=str, default="forkserver",
+                            choices=["fork", "forkserver", "spawn"],
+                            help="Multiprocessing start method (default: forkserver)")

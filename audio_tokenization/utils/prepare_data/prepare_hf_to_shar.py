@@ -29,15 +29,18 @@ import time
 from pathlib import Path
 
 from audio_tokenization.utils.prepare_data.common import (
+    add_audio_processing_args,
+    add_parallelism_args,
+    add_shar_output_args,
+    add_text_tokenizer_args,
+    apply_audio_pipeline,
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
     load_text_tokenizer,
     make_text_tokenize_fn,
-    rms_db,
     run_pool_and_finalize,
-    to_mono,
     write_worker_result,
 )
 
@@ -131,21 +134,15 @@ def _convert_worker(args_tuple):
                             text=text,
                         )]
 
-                    # Resample if needed
-                    if target_sr and cut.sampling_rate != target_sr:
-                        cut = cut.resample(target_sr)
-                        runtime_counts["resampled"] += 1
-
-                    # Mono
-                    cut = to_mono(cut, mono_downmix=True, stats=runtime_counts)
-
-                    # Pre-tokenize text
-                    if _tokenize_text is not None:
-                        cut = _tokenize_text(cut)
-
-                    # Precompute RMS (audio already decoded; avoids double load at tokenize time)
-                    cut.custom = cut.custom or {}
-                    cut.custom["rms_db"] = rms_db(cut)
+                    cut, skip = apply_audio_pipeline(
+                        cut,
+                        target_sr=target_sr,
+                        tokenize_fn=_tokenize_text,
+                        runtime_counts=runtime_counts,
+                    )
+                    if skip:
+                        skipped += 1
+                        continue
 
                     writer.write(cut)
                     written += 1
@@ -190,22 +187,8 @@ def main(argv=None):
     parser.add_argument("--arrow-files", nargs="+", default=None,
                         help="Explicit list of arrow file paths (overrides --arrow-dir)")
 
-    # Shar output
-    parser.add_argument("--shar-dir", type=Path, required=True,
-                        help="Output directory for Shar format")
-    parser.add_argument("--shard-size", type=int, default=2000,
-                        help="Samples per Shar shard (default: 2000)")
-    parser.add_argument("--shar-format", type=str, default="flac",
-                        choices=["flac", "wav", "mp3", "opus"],
-                        help="Audio format in Shar (default: flac)")
-
-    # Audio processing
-    parser.add_argument("--target-sr", type=int, default=None,
-                        help="Target sample rate (default: None, keep original)")
-    parser.add_argument("--resampling-backend", type=str, default=None,
-                        choices=["default", "sox"],
-                        help="Lhotse resampling backend override (default: use "
-                             "$LHOTSE_RESAMPLING_BACKEND or 'default')")
+    add_shar_output_args(parser)
+    add_audio_processing_args(parser, target_sr_default=None)
 
     # Column names
     parser.add_argument("--id-column", type=str, default="id",
@@ -215,13 +198,8 @@ def main(argv=None):
     parser.add_argument("--text-column", type=str, default=None,
                         help="Column name for transcription text (default: None)")
 
-    # Text tokenizer
-    parser.add_argument("--text-tokenizer", type=str, default=None,
-                        help="Path to tokenizer.json for pre-tokenizing supervision text")
-
-    # Parallelism
-    parser.add_argument("--num-workers", type=int, default=20,
-                        help="Number of parallel workers (default: 20)")
+    add_text_tokenizer_args(parser)
+    add_parallelism_args(parser)
     args = parser.parse_args(argv)
 
     # Resolve arrow files

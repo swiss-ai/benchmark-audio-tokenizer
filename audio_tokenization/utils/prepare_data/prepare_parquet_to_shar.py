@@ -25,13 +25,17 @@ Usage (SPC-R):
 import argparse
 from collections import Counter
 import logging
-import math
 import subprocess
 import time
 from pathlib import Path
 
 from audio_tokenization.utils.prepare_data.common import (
     PREPARE_STATE_FILE,
+    add_audio_processing_args,
+    add_parallelism_args,
+    add_shar_output_args,
+    add_text_tokenizer_args,
+    apply_audio_pipeline,
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
@@ -39,10 +43,7 @@ from audio_tokenization.utils.prepare_data.common import (
     load_text_tokenizer,
     make_text_tokenize_fn,
     normalize_optional_path,
-    rms_db,
-    should_skip_quiet,
     run_pool_and_finalize,
-    to_mono,
     validate_or_write_prepare_state,
     write_worker_result,
 )
@@ -261,26 +262,15 @@ def _convert_worker(args_tuple):
                             if val is not None:
                                 cut.custom[col] = val
 
-                    # Resample if needed
-                    if target_sr and cut.sampling_rate != target_sr:
-                        cut = cut.resample(target_sr)
-                        runtime_counts["resampled"] += 1
-
-                    # Mono
-                    cut = to_mono(cut, mono_downmix=True, stats=runtime_counts)
-
-                    # Pre-tokenize text (including extra custom columns)
-                    if _tokenize_text is not None:
-                        cut = _tokenize_text(cut)
-
-                    # Precompute RMS (audio already decoded; avoids double load at tokenize time)
-                    cut.custom = cut.custom or {}
-                    rms_val = rms_db(cut)
-                    if should_skip_quiet(rms_val):
+                    cut, skip = apply_audio_pipeline(
+                        cut,
+                        target_sr=target_sr,
+                        tokenize_fn=_tokenize_text,
+                        runtime_counts=runtime_counts,
+                    )
+                    if skip:
                         skipped += 1
-                        runtime_counts["skipped_quiet_audio"] += 1
                         continue
-                    cut.custom["rms_db"] = rms_val
 
                     writer.write(cut)
                     written += 1
@@ -342,22 +332,8 @@ def main(argv=None):
     parser.add_argument("--parquet-glob", type=str, default="*.parquet",
                         help="Glob pattern for parquet files (default: '*.parquet')")
 
-    # Shar output
-    parser.add_argument("--shar-dir", type=Path, required=True,
-                        help="Output directory for Shar format")
-    parser.add_argument("--shard-size", type=int, default=2000,
-                        help="Samples per Shar shard (default: 2000)")
-    parser.add_argument("--shar-format", type=str, default="flac",
-                        choices=["flac", "wav", "mp3", "opus"],
-                        help="Audio format in Shar (default: flac)")
-
-    # Audio processing
-    parser.add_argument("--target-sr", type=int, default=24000,
-                        help="Target sample rate (default: 24000)")
-    parser.add_argument("--resampling-backend", type=str, default=None,
-                        choices=["default", "sox"],
-                        help="Lhotse resampling backend override (default: use "
-                             "$LHOTSE_RESAMPLING_BACKEND or 'default')")
+    add_shar_output_args(parser)
+    add_audio_processing_args(parser)
     parser.add_argument(
         "--ffmpeg-bin",
         type=str,
@@ -380,25 +356,8 @@ def main(argv=None):
     parser.add_argument("--custom-columns", type=str, nargs="*", default=None,
                         help="Additional parquet columns to store in supervision.custom dict")
 
-    # Text tokenizer
-    parser.add_argument("--text-tokenizer", type=str, default=None,
-                        help="Path to tokenizer.json for pre-tokenizing supervision text")
-    parser.add_argument("--text-tokenize-custom-columns", type=str, nargs="*", default=None,
-                        help="Custom columns to also pre-tokenize. Stored as {col}_tokens in cut.custom.")
-
-    # Parallelism
-    parser.add_argument("--num-workers", type=int, default=20,
-                        help="Number of parallel workers (default: 20)")
-    parser.add_argument(
-        "--mp-start-method",
-        type=str,
-        default="forkserver",
-        choices=["fork", "forkserver", "spawn"],
-        help=(
-            "Multiprocessing start method (default: forkserver). "
-            "Use 'fork' for faster high-worker startup on Linux."
-        ),
-    )
+    add_text_tokenizer_args(parser, include_custom_columns=True)
+    add_parallelism_args(parser, include_mp_start_method=True)
 
     args = parser.parse_args(argv)
 

@@ -121,6 +121,7 @@ from audio_tokenization.utils.prepare_data.common import (
     SUCCESS_MARKER_FILE,
     build_shar_index_from_parts,
     load_text_tokenizer,
+    make_rms_filter_fn,
     make_text_tokenize_fn,
     mark_partition_success,
     normalize_optional_path,
@@ -203,6 +204,9 @@ def convert_worker(rank: int, my_cuts: list, args,
 
     if args.target_sample_rate:
         cuts = cuts.resample(args.target_sample_rate)
+
+    compute_rms, keep_loud = make_rms_filter_fn()
+    cuts = cuts.map(compute_rms).filter(keep_loud)
 
     # Collect stats lazily as cuts flow through to_shar
     stats = {"num_cuts": 0, "total_duration": 0.0, "num_text_tokens": 0}

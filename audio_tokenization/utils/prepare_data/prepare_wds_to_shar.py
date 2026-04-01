@@ -41,13 +41,17 @@ from collections import Counter
 from dataclasses import dataclass
 import glob
 import logging
-import math
 import time
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from audio_tokenization.utils.prepare_data.common import (
     PREPARE_STATE_FILE,
+    add_audio_processing_args,
+    add_parallelism_args,
+    add_shar_output_args,
+    add_text_tokenizer_args,
+    apply_audio_pipeline,
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
@@ -55,11 +59,8 @@ from audio_tokenization.utils.prepare_data.common import (
     load_text_tokenizer,
     make_text_tokenize_fn,
     normalize_optional_path,
-    rms_db,
-    should_skip_quiet,
     run_aggregate,
     run_pool_and_finalize,
-    to_mono,
     validate_or_write_prepare_state,
     write_worker_result,
 )
@@ -134,8 +135,15 @@ def load_external_metadata(
                 result[obj[id_field]] = (obj.get(text_field), custom)
         if skipped:
             logger.warning(f"Skipped {skipped:,} malformed lines in {p}")
+    elif p.suffix == ".csv":
+        import csv
+        with open(p, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                custom = {k: row[k] for k in (custom_fields or ()) if k in row}
+                result[row[id_field]] = (row.get(text_field), custom)
     else:
-        raise ValueError(f"Unsupported external metadata format: {p.suffix} (expected .tsv or .jsonl)")
+        raise ValueError(f"Unsupported external metadata format: {p.suffix} (expected .tsv, .jsonl, or .csv)")
     logger.info(f"Loaded {len(result):,} entries from external metadata: {p}")
     return result
 
@@ -428,20 +436,19 @@ def _convert_worker(args_tuple):
                 ) if lang_lookup else None
 
                 for out_cut in out_cuts:
-                    out_cut = to_mono(out_cut, mono_downmix=mono_downmix, stats=runtime_counts)
-                    if _tokenize_text is not None:
-                        out_cut = _tokenize_text(out_cut)
                     if sample_lang is not None:
                         out_cut.custom = out_cut.custom or {}
                         out_cut.custom["lang"] = sample_lang
-                    # Precompute RMS (audio already decoded; avoids double load at tokenize time)
-                    out_cut.custom = out_cut.custom or {}
-                    rms_val = rms_db(out_cut)
-                    if should_skip_quiet(rms_val):
+                    out_cut, skip = apply_audio_pipeline(
+                        out_cut,
+                        target_sr=None,  # already resampled before VAD
+                        mono_downmix=mono_downmix,
+                        tokenize_fn=_tokenize_text,
+                        runtime_counts=runtime_counts,
+                    )
+                    if skip:
                         skipped += 1
-                        runtime_counts["skipped_quiet_audio"] += 1
                         continue
-                    out_cut.custom["rms_db"] = rms_val
                     writer.write(out_cut)
                     written += 1
                     total_duration_sec += out_cut.duration
@@ -512,26 +519,8 @@ def main(argv=None):
     parser.add_argument("--wds-shards", type=str, nargs="+", default=None,
                         help="Glob patterns or file paths for WDS tar shards")
 
-    # Shar output
-    parser.add_argument("--shar-dir", type=Path, default=None,
-                        help="Output directory for Shar format")
-    parser.add_argument("--shard-size", type=int, default=5000,
-                        help="Samples per Shar shard (default: 5000)")
-    parser.add_argument("--shar-format", type=str, default="flac",
-                        choices=["flac", "wav", "mp3", "opus"],
-                        help="Audio format in Shar (default: flac)")
-
-    # Audio processing
-    parser.add_argument("--target-sr", type=int, default=24000,
-                        help="Target sample rate (default: 24000)")
-    parser.add_argument("--resampling-backend", type=str, default=None,
-                        choices=["default", "sox"],
-                        help="Lhotse resampling backend override (default: use "
-                             "$LHOTSE_RESAMPLING_BACKEND or 'default')")
-    parser.add_argument("--min-sr", type=int, default=16000,
-                        help="Drop audio below this sample rate (default: 16000)")
-    parser.add_argument("--no-mono-downmix", action="store_true",
-                        help="Select channel 0 instead of averaging stereo channels")
+    add_shar_output_args(parser, shard_size_default=5000, shar_dir_required=False)
+    add_audio_processing_args(parser, include_min_sr=True, include_mono_downmix=True)
 
     # Text / metadata
     parser.add_argument("--external-metadata", type=str, default=None,
@@ -544,12 +533,8 @@ def main(argv=None):
                         help="JSON key for transcript text (default: 'text')")
     parser.add_argument("--custom-fields", type=str, nargs="*", default=None,
                         help="JSON keys to store in cut.custom (e.g. --custom-fields language speaker)")
-    parser.add_argument("--text-tokenizer", type=str, default=None,
-                        help="Path to tokenizer.json for pre-tokenizing supervision text")
-
-    # Parallelism
-    parser.add_argument("--num-workers", type=int, default=None,
-                        help="Number of parallel workers (default: one per WDS shard)")
+    add_text_tokenizer_args(parser)
+    add_parallelism_args(parser, num_workers_default=None)
     parser.add_argument("--vad-segmentation", action="store_true",
                         help="Split long recordings into speech-aware segments during prepare")
     parser.add_argument("--vad-per-shard-dir", type=Path, default=None,
