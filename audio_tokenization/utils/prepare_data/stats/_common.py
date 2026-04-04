@@ -2,7 +2,7 @@
 
 from typing import List, Optional, Sequence, Tuple
 
-from audio_tokenization.utils.prepare_data.chunking import (
+from audio_tokenization.utils.prepare_data.preprocess.chunking import (
     _parse_vad_jsonl_line,
     merge_and_pack_vad,
 )

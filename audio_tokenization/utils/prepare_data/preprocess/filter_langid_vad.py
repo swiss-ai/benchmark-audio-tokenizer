@@ -6,7 +6,7 @@ whose language prediction is in the allowed set, and writes a filtered
 VAD JSONL that can be used directly with vad_segmenting.py.
 
 Usage:
-    python -m audio_tokenization.utils.prepare_data.filter_langid_vad \
+    python -m audio_tokenization.utils.prepare_data.preprocess.filter_langid_vad \
         --data_dir /path/to/unsupervised_peoples_speech_commercial_wds \
         --output-per-shard-dir /path/to/output/vad_per_shard \
         --languages european

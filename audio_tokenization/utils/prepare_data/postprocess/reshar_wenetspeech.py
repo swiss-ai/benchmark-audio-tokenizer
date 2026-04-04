@@ -5,7 +5,7 @@ Reads existing Lhotse Shar (16kHz wav), resamples to 24kHz, encodes as FLAC,
 tokenizes supervision text, and writes a new Shar directory.
 
 Usage:
-    python -m audio_tokenization.utils.prepare_data.reshar_wenetspeech \
+    python -m audio_tokenization.utils.prepare_data.postprocess.reshar_wenetspeech \
         --input-dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/wenetspeech \
         --output-dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/wenetspeech_24k \
         --text-tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json \

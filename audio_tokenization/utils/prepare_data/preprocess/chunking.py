@@ -154,16 +154,21 @@ def load_vad_from_per_shard_dir(
     *,
     with_lang: bool = False,
     logger: Optional[logging.Logger] = None,
-) -> Dict[str, List[Tuple[int, int]]] | Tuple[Dict[str, List[Tuple[int, int]]], Dict[str, str]]:
+) -> Dict[str, List[Tuple[int, int]]] | Tuple[Dict[str, List[Tuple[int, int]]], ...]:
     """Load VAD entries from per-shard JSONL files for the given tar shards.
 
     Each worker calls this with its own tar_paths and gets only the
     relevant VAD entries. No pre-build step or cache needed.
 
-    When *with_lang* is True, returns ``(vad_lookup, lang_lookup)`` where
-    ``lang_lookup`` maps normalized sample keys to language codes.
+    Always returns ``(vad_lookup, sr_lookup, ...)`` where ``sr_lookup``
+    maps normalized sample keys to per-recording sample rates (int).
+    When *with_lang* is True, also returns ``lang_lookup``.
+
+    Returns:
+        ``(vad_lookup, sr_lookup)`` or ``(vad_lookup, sr_lookup, lang_lookup)``
     """
     lookup: Dict[str, List[Tuple[int, int]]] = {}
+    sr_lookup: Dict[str, int] = {}
     lang_lookup: Dict[str, str] = {}
     files_read = 0
     for tar_path in tar_paths:
@@ -174,23 +179,39 @@ def load_vad_from_per_shard_dir(
         files_read += 1
         with open(vad_file, "r", encoding="utf-8") as f:
             for line in f:
-                parsed = _parse_vad_jsonl_line(line, with_lang=with_lang)
-                if parsed is None:
+                line = line.strip()
+                if not line:
                     continue
-                if with_lang:
-                    key, timestamps, lang = parsed
-                    lang_lookup[key] = lang
-                else:
-                    key, timestamps = parsed
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict) or len(payload) != 1:
+                    continue
+                ((raw_key, raw_value),) = payload.items()
+                if not isinstance(raw_value, dict):
+                    continue
+                key = canonical_sample_key(str(raw_key))
+                timestamps = _normalize_raw_timestamps(raw_value.get("timestamps", []))
                 lookup[key] = timestamps
+                # Per-recording sample rate
+                sr_raw = raw_value.get("sample_rate")
+                if sr_raw is not None:
+                    try:
+                        sr_lookup[key] = int(sr_raw)
+                    except (TypeError, ValueError):
+                        pass
+                if with_lang:
+                    lang_lookup[key] = raw_value.get("lang", "unknown")
     if logger is not None:
         logger.info(
             f"Loaded {len(lookup)} VAD entries from "
-            f"{files_read}/{len(tar_paths)} shard files"
+            f"{files_read}/{len(tar_paths)} shard files "
+            f"({len(sr_lookup)} with per-recording sample rate)"
         )
     if with_lang:
-        return lookup, lang_lookup
-    return lookup
+        return lookup, sr_lookup, lang_lookup
+    return lookup, sr_lookup
 
 
 # ---------------------------------------------------------------------------
@@ -316,12 +337,16 @@ def split_cut_by_vad(
     sample_key: str,
     vad_lookup: Dict[str, List[Tuple[int, int]]],
     cfg: VADChunkingConfig,
+    sr_lookup: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[Any], str]:
     """Split one recording cut with VAD-aware chunking.
 
     All recordings are VAD-processed uniformly (no special treatment by
     duration).  Adjacent speech segments are merged when the gap is <=
     ``max_merge_gap_sec``, then packed into chunks up to ``max_chunk_sec``.
+
+    If *sr_lookup* is provided, the per-recording sample rate is used
+    to interpret VAD timestamps. Otherwise falls back to ``cfg.sample_rate``.
 
     Policy:
     - duration < min_chunk_sec: drop
@@ -341,7 +366,10 @@ def split_cut_by_vad(
         return [], "missing_vad"
     if not timestamps:
         return [], "empty_vad"
-    sr = float(cfg.sample_rate)
+    # VAD timestamps are always in the 16 kHz domain (Silero resamples
+    # internally). The per-recording sample_rate stored in the JSONL is the
+    # *original* recording SR, NOT the VAD domain — so always use cfg.sample_rate.
+    sr = cfg.sample_rate
     has_valid_span = any(
         min(duration, e / sr) > max(0.0, s / sr)
         for s, e in timestamps
@@ -353,7 +381,7 @@ def split_cut_by_vad(
     ranges = merge_and_pack_vad(
         timestamps=timestamps,
         audio_duration_sec=duration,
-        sample_rate=cfg.sample_rate,
+        sample_rate=sr,
         max_merge_gap_sec=cfg.max_merge_gap_sec,
         max_chunk_sec=cfg.max_chunk_sec,
         min_chunk_sec=cfg.min_chunk_sec,
@@ -373,8 +401,9 @@ def split_cut_by_vad(
             # Older Lhotse versions may not expose preserve_id.
             subcut = cut.truncate(offset=offset, duration=chunk_duration)
 
-        # Store global offset so we know where this chunk came from
+        # Store provenance so we can trace back / re-merge later.
         subcut.custom = subcut.custom or {}
+        subcut.custom["source_recording_id"] = cut.id
         subcut.custom["global_offset_sec"] = offset
         out.append(subcut)
     return out, "chunked"

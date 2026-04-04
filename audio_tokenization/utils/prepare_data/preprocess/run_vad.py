@@ -2,7 +2,7 @@
 """Run Silero VAD on a directory of audio files.
 
 Usage:
-    python -m audio_tokenization.utils.prepare_data.run_vad \
+    python -m audio_tokenization.utils.prepare_data.preprocess.run_vad \
         --audio_dir /capstor/store/cscs/swissai/infra01/audio-datasets/voxpopuli/raw_audios/en \
         --output_dir /capstor/store/cscs/swissai/infra01/audio-datasets/voxpopuli/vad_results \
         --dataset voxpopuli --num_workers 288

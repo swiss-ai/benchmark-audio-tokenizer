@@ -8,7 +8,7 @@ This script reads each shard's cuts jsonl.gz (for recording metadata) and tar.gz
 (for audio bytes), then writes a new tar in proper Lhotse Shar format.
 
 Usage:
-    python -m audio_tokenization.utils.prepare_data.repack_wenetspeech_shar \
+    python -m audio_tokenization.utils.prepare_data.postprocess.repack_wenetspeech_shar \
         --data-dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/wenetspeech/data \
         --output-dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/wenetspeech/shar \
         --split L_fixed \

@@ -8,7 +8,7 @@ dedup pipeline:
   3. Cross-language dedup across all languages
 
 Usage:
-    python -m audio_tokenization.utils.prepare_data.run_dedup_voxpopuli \
+    python -m audio_tokenization.utils.prepare_data.preprocess.run_dedup_voxpopuli \
         --audio_dir /capstor/store/cscs/swissai/infra01/audio-datasets/voxpopuli/raw_audios \
         --input /capstor/store/cscs/swissai/infra01/audio-datasets/voxpopuli/vad_results_merged/per_lang_year
 
