@@ -25,28 +25,36 @@ Usage (SPC-R):
 import argparse
 from collections import Counter
 import logging
-import subprocess
 import time
 from pathlib import Path
 
 from audio_tokenization.utils.prepare_data.common import (
     PREPARE_STATE_FILE,
     add_audio_processing_args,
+    add_external_metadata_args,
+    add_input_clip_id_parser_arg,
     add_parallelism_args,
     add_shar_output_args,
     add_text_tokenizer_args,
     apply_audio_pipeline,
+    build_recording_from_audio_bytes,
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
+    load_external_metadata,
     load_text_tokenizer,
     make_text_tokenize_fn,
     normalize_optional_path,
+    resolve_sample_text_and_custom,
+    resolve_input_source_and_clip_num,
     run_pool_and_finalize,
+    set_universal_cut_id,
     validate_or_write_prepare_state,
     write_worker_result,
 )
+from audio_tokenization.utils.clip_id_parsers import get_clip_id_parser
+from audio_tokenization.utils.prepare_data.streaming import iter_parquet_rows
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,89 +67,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _ITEMS_KEY = "resolved_parquets"
-
-
-def _is_ogg_bytes(audio_bytes: bytes) -> bool:
-    """Detect Ogg container from leading bytes."""
-    return audio_bytes.startswith(b"OggS")
-
-
-def _decode_audio_bytes_with_ffmpeg_to_wav(
-    audio_bytes: bytes,
-    *,
-    ffmpeg_bin: str,
-    timeout_s: float,
-) -> bytes:
-    """Decode encoded audio bytes to WAV bytes via ffmpeg stdin/stdout piping."""
-    cmd = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-i",
-        "pipe:0",
-        "-vn",
-        "-sn",
-        "-dn",
-        "-f",
-        "wav",
-        "-acodec",
-        "pcm_s16le",
-        "pipe:1",
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=audio_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=timeout_s,
-        )
-    except FileNotFoundError as e:
-        raise RuntimeError(
-            f"ffmpeg binary not found: {ffmpeg_bin}. "
-            "Set --ffmpeg-bin or add ffmpeg to PATH."
-        ) from e
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"ffmpeg decode timed out after {timeout_s:.1f}s") from e
-
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"ffmpeg decode failed (rc={proc.returncode}): {stderr[:400]}"
-        )
-    if not proc.stdout:
-        raise RuntimeError("ffmpeg decode produced empty output")
-    return proc.stdout
-
-
-def _assert_ffmpeg_available(ffmpeg_bin: str) -> None:
-    """Fail fast when an ffmpeg binary is required by decode mode."""
-    try:
-        proc = subprocess.run(
-            [ffmpeg_bin, "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=10,
-        )
-    except FileNotFoundError as e:
-        raise RuntimeError(
-            f"ffmpeg binary not found: {ffmpeg_bin}. "
-            "Set --ffmpeg-bin or add ffmpeg to PATH."
-        ) from e
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(
-            f"Timed out while probing ffmpeg binary: {ffmpeg_bin}"
-        ) from e
-
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"ffmpeg probe failed for '{ffmpeg_bin}' (rc={proc.returncode}): {stderr[:300]}"
-        )
+_EXTERNAL_METADATA = None
+_DEFAULT_READ_BATCH_SIZE = 256
 
 
 def _convert_worker(args_tuple):
@@ -166,7 +93,8 @@ def _convert_worker(args_tuple):
         text_tokenize_custom_columns,
         text_tokenizer,
         resampling_backend,
-        ffmpeg_bin,
+        input_clip_id_parser_name,
+        read_batch_size,
     ) = args_tuple
 
     reused = check_worker_reuse(worker_id, shar_dir)
@@ -174,8 +102,7 @@ def _convert_worker(args_tuple):
         return reused
     init_worker_process(resampling_backend)
 
-    import polars as pl
-    from lhotse import Recording, SupervisionSegment
+    from lhotse import SupervisionSegment
     from lhotse.shar import SharWriter
 
     worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
@@ -184,6 +111,12 @@ def _convert_worker(args_tuple):
     total_duration_sec = 0.0
     runtime_counts = Counter()
     _tokenize_text = make_text_tokenize_fn(text_tokenizer, text_tokenize_custom_columns) if text_tokenizer is not None else None
+    input_clip_id_parser = (
+        get_clip_id_parser(input_clip_id_parser_name)
+        if input_clip_id_parser_name
+        else None
+    )
+    external_metadata = _EXTERNAL_METADATA
 
     with SharWriter(
         output_dir=str(worker_dir),
@@ -193,9 +126,28 @@ def _convert_worker(args_tuple):
         for pq_path in parquet_paths:
             pq_name = Path(pq_path).name
             logger.info(f"Worker {worker_id}: reading {pq_name}")
-            df = pl.read_parquet(pq_path)
+            read_columns = []
+            if isinstance(id_column, list):
+                read_columns.extend(id_column)
+            elif id_column:
+                read_columns.append(id_column)
+            read_columns.append(audio_column)
+            if text_column:
+                read_columns.append(text_column)
+            if duration_column:
+                read_columns.append(duration_column)
+            if language_column:
+                read_columns.append(language_column)
+            if custom_columns:
+                read_columns.extend(custom_columns)
+            read_columns = list(dict.fromkeys(read_columns))
 
-            for row_idx, row in enumerate(df.iter_rows(named=True)):
+            row_idx = 0
+            for row in iter_parquet_rows(
+                pq_path,
+                columns=read_columns,
+                batch_size=read_batch_size,
+            ):
                 if not id_column:
                     row_id = f"{Path(pq_path).stem}_{row_idx}"
                 elif isinstance(id_column, list):
@@ -217,31 +169,29 @@ def _convert_worker(args_tuple):
                         runtime_counts["skipped_empty_audio"] += 1
                         continue
 
-                    # LegCo parquet stores many samples as Ogg/Opus bytes. In this
-                    # environment, Recording.from_bytes() fails on those bytes via
-                    # libsndfile, so decode them through ffmpeg pipe first.
-                    if _is_ogg_bytes(audio_bytes):
-                        runtime_counts["sniffed_ogg_bytes"] += 1
-                        wav_bytes = _decode_audio_bytes_with_ffmpeg_to_wav(
-                            audio_bytes,
-                            ffmpeg_bin=ffmpeg_bin,
-                            timeout_s=30.0,
-                        )
-                        recording = Recording.from_bytes(
-                            data=wav_bytes,
-                            recording_id=row_id,
-                        )
-                        runtime_counts["decoded_via_ffmpeg_pipe"] += 1
-                    else:
-                        recording = Recording.from_bytes(
-                            data=audio_bytes,
-                            recording_id=row_id,
-                        )
+                    recording = build_recording_from_audio_bytes(
+                        audio_bytes,
+                        row_id,
+                        runtime_counts=runtime_counts,
+                    )
 
                     cut = recording.to_cut()
 
-                    # Attach supervision with text
-                    text = row.get(text_column)
+                    custom = {}
+                    if custom_columns:
+                        for col in custom_columns:
+                            val = row.get(col)
+                            if val is not None:
+                                custom[col] = val
+                    text, custom = resolve_sample_text_and_custom(
+                        row_id,
+                        default_text=row.get(text_column),
+                        default_custom=custom,
+                        external_metadata=external_metadata,
+                        stats=runtime_counts,
+                    )
+                    if custom:
+                        cut.custom = custom
                     if text:
                         language = row.get(language_column) if language_column else None
                         cut.supervisions = [SupervisionSegment(
@@ -253,15 +203,6 @@ def _convert_worker(args_tuple):
                             language=language,
                         )]
 
-                    # Store additional columns in cut.custom
-                    if custom_columns:
-                        if cut.custom is None:
-                            cut.custom = {}
-                        for col in custom_columns:
-                            val = row.get(col)
-                            if val is not None:
-                                cut.custom[col] = val
-
                     cut, skip = apply_audio_pipeline(
                         cut,
                         target_sr=target_sr,
@@ -272,6 +213,16 @@ def _convert_worker(args_tuple):
                         skipped += 1
                         continue
 
+                    source_id, clip_num = resolve_input_source_and_clip_num(
+                        row_id,
+                        input_clip_id_parser=input_clip_id_parser,
+                    )
+                    set_universal_cut_id(
+                        cut,
+                        source_id,
+                        clip_num,
+                        clip_start=getattr(cut, "start", 0.0),
+                    )
                     writer.write(cut)
                     written += 1
                     total_duration_sec += cut.duration
@@ -288,6 +239,8 @@ def _convert_worker(args_tuple):
                     runtime_counts["processing_errors"] += 1
                     if errors <= 5:
                         logger.warning(f"Worker {worker_id} error on {row_id}: {e}")
+                finally:
+                    row_idx += 1
 
     return write_worker_result(
         worker_id=worker_id, worker_dir=worker_dir,
@@ -307,14 +260,30 @@ def _validate_or_write_prepare_state(args) -> None:
     expected = {
         "parquet_dir": str(Path(args.parquet_dir).resolve()),
         "text_tokenizer": normalize_optional_path(args.text_tokenizer),
+        "input_clip_id_parser": args.input_clip_id_parser,
+        "external_metadata": normalize_optional_path(args.external_metadata),
+        "id_field": args.id_field,
+        "text_field": args.text_field,
+        "custom_fields": sorted(args.custom_fields) if args.custom_fields else None,
     }
     wrote = validate_or_write_prepare_state(
         state_path,
         expected=expected,
-        invariant_keys=("parquet_dir", "text_tokenizer"),
+        invariant_keys=(
+            "parquet_dir",
+            "text_tokenizer",
+            "input_clip_id_parser",
+            "external_metadata",
+            "id_field",
+            "text_field",
+            "custom_fields",
+        ),
         guidance=(
-            "Use the same --parquet-dir and --text-tokenizer to resume this "
-            f"output directory, or remove {args.shar_dir} and restart from scratch."
+            "Use the same --parquet-dir, --text-tokenizer, "
+            "--input-clip-id-parser, --external-metadata, --id-field, "
+            "--text-field, and --custom-fields to resume this output "
+            "directory, or "
+            f"remove {args.shar_dir} and restart from scratch."
         ),
     )
     if wrote:
@@ -334,13 +303,6 @@ def main(argv=None):
 
     add_shar_output_args(parser)
     add_audio_processing_args(parser)
-    parser.add_argument(
-        "--ffmpeg-bin",
-        type=str,
-        default="ffmpeg",
-        help="ffmpeg binary used for Ogg/Opus bytes decoding (default: ffmpeg)",
-    )
-
     # Column names
     parser.add_argument("--id-column", type=str, nargs="*", default=None,
                         help="Column name(s) for row ID. Multiple columns are joined with '_'. "
@@ -355,6 +317,17 @@ def main(argv=None):
                         help="Column name for language code (default: None, not set)")
     parser.add_argument("--custom-columns", type=str, nargs="*", default=None,
                         help="Additional parquet columns to store in supervision.custom dict")
+    parser.add_argument(
+        "--read-batch-size",
+        type=int,
+        default=_DEFAULT_READ_BATCH_SIZE,
+        help=(
+            "Rows to materialize at once from each parquet shard. "
+            "Lower values reduce worker RSS; default: 256."
+        ),
+    )
+    add_external_metadata_args(parser, include_custom_fields=True)
+    add_input_clip_id_parser_arg(parser)
 
     add_text_tokenizer_args(parser, include_custom_columns=True)
     add_parallelism_args(parser, include_mp_start_method=True)
@@ -375,17 +348,27 @@ def main(argv=None):
         args.shar_dir, resolved, args.num_workers, _ITEMS_KEY, "parquet files",
     )
 
-    _assert_ffmpeg_available(args.ffmpeg_bin)
-
     logger.info(f"Found {len(resolved)} parquet files, using {num_workers} workers")
     logger.info(f"Output: {args.shar_dir}")
-    logger.info("Audio bytes decode: Ogg -> ffmpeg pipe; ffmpeg_bin=%s", args.ffmpeg_bin)
 
     # Distribute parquet files across workers (round-robin)
     worker_parquets = distribute_round_robin(resolved, num_workers)
 
     # Load text tokenizer before forking (shared via COW across workers)
     text_tokenizer = load_text_tokenizer(args.text_tokenizer)
+    global _EXTERNAL_METADATA
+    if args.external_metadata:
+        _EXTERNAL_METADATA = load_external_metadata(
+            args.external_metadata,
+            tuple(args.custom_fields) if args.custom_fields else None,
+            id_field=args.id_field,
+            text_field=args.text_field,
+        )
+        mp_start_method = "fork"
+        logger.info("Using fork start method for COW sharing of external metadata")
+    else:
+        _EXTERNAL_METADATA = None
+        mp_start_method = args.mp_start_method
 
     worker_args = [
         (
@@ -404,7 +387,8 @@ def main(argv=None):
             args.text_tokenize_custom_columns,
             text_tokenizer,
             args.resampling_backend,
-            args.ffmpeg_bin,
+            args.input_clip_id_parser,
+            args.read_batch_size,
         )
         for wid, parquets in enumerate(worker_parquets)
         if parquets
@@ -415,7 +399,7 @@ def main(argv=None):
         worker_args,
         args.shar_dir,
         num_workers,
-        mp_start_method=args.mp_start_method,
+        mp_start_method=mp_start_method,
     )
 
 

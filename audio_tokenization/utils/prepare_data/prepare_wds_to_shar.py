@@ -48,23 +48,31 @@ from typing import Any, Optional, Tuple
 from audio_tokenization.utils.prepare_data.common import (
     PREPARE_STATE_FILE,
     add_audio_processing_args,
+    add_external_metadata_args,
+    add_input_clip_id_parser_arg,
     add_parallelism_args,
     add_shar_output_args,
     add_text_tokenizer_args,
     apply_audio_pipeline,
+    build_recording_from_audio_bytes,
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
+    load_external_metadata,
     load_text_tokenizer,
+    lookup_external_metadata,
     make_text_tokenize_fn,
     normalize_optional_path,
+    resolve_input_source_and_clip_num,
     run_aggregate,
     run_pool_and_finalize,
+    set_universal_cut_id,
     validate_or_write_prepare_state,
     write_worker_result,
 )
-from audio_tokenization.utils.prepare_data.chunking import (
+from audio_tokenization.utils.clip_id_parsers import get_clip_id_parser
+from audio_tokenization.utils.prepare_data.preprocess.chunking import (
     VADChunkingConfig,
     canonical_sample_key,
     load_vad_from_per_shard_dir,
@@ -91,69 +99,14 @@ SIDECAR_SUFFIXES = (".txt", ".json")
 MetadataEntry = tuple[Optional[str], dict[str, Any]]
 
 
-def load_external_metadata(
-    path: str,
-    custom_fields: Optional[Tuple[str, ...]] = None,
-    id_field: str = "id",
-    text_field: str = "text",
-) -> dict[str, MetadataEntry]:
-    """Load transcript metadata from an external TSV or JSONL file.
-
-    Supported formats:
-      - ``.tsv``: headerless, tab-separated ``segment_id<TAB>text``
-      - ``.jsonl``: one JSON object per line keyed by *id_field* with
-        transcript in *text_field*.
-
-    Returns a ``{segment_id: (text, custom)}`` dict.
-    """
-    from pathlib import Path as _Path
-    p = _Path(path)
-    result: dict[str, MetadataEntry] = {}
-    if p.suffix == ".tsv":
-        with open(p) as f:
-            for line in f:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                parts = line.split("\t", 1)
-                if len(parts) == 2:
-                    result[parts[0]] = (parts[1], {})
-    elif p.suffix == ".jsonl":
-        import orjson
-        skipped = 0
-        with open(p, "rb") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = orjson.loads(line)
-                except (orjson.JSONDecodeError, ValueError):
-                    skipped += 1
-                    continue
-                custom = {k: obj[k] for k in (custom_fields or ()) if k in obj}
-                result[obj[id_field]] = (obj.get(text_field), custom)
-        if skipped:
-            logger.warning(f"Skipped {skipped:,} malformed lines in {p}")
-    elif p.suffix == ".csv":
-        import csv
-        with open(p, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                custom = {k: row[k] for k in (custom_fields or ()) if k in row}
-                result[row[id_field]] = (row.get(text_field), custom)
-    else:
-        raise ValueError(f"Unsupported external metadata format: {p.suffix} (expected .tsv, .jsonl, or .csv)")
-    logger.info(f"Loaded {len(result):,} entries from external metadata: {p}")
-    return result
-
-
 @dataclass
 class TarScanResult:
     """Per-tar scan state used by metadata providers."""
 
     audio_members: list
     metadata_state: Any = None
+    scan_complete: bool = True
+    scan_error: Optional[str] = None
 
 
 class MetadataProvider:
@@ -179,30 +132,53 @@ class SidecarMetadataProvider(MetadataProvider):
     custom_fields: Optional[Tuple[str, ...]] = None
 
     def scan_tar(self, tf, stats: Optional[Counter] = None) -> TarScanResult:
+        import tarfile
+
         metas: dict[str, MetadataEntry] = {}
         audio_members = []
-        for member in tf:
-            if not member.isfile():
-                continue
-            dot = member.name.rfind(".")
-            ext = member.name[dot:] if dot >= 0 else ""
-            if ext in SIDECAR_SUFFIXES:
-                stem = member.name[:dot]
-                try:
-                    text, custom = _parse_sidecar(
-                        tf.extractfile(member).read(), ext,
-                        self.text_field, self.custom_fields,
-                    )
-                    prev = metas.get(stem)
-                    if prev:
-                        text = text or prev[0]
-                        custom = {**prev[1], **custom}
-                    metas[stem] = (text, custom)
-                except Exception:
-                    if stats is not None:
-                        stats["text_decode_failed"] += 1
-            elif ext in AUDIO_SUFFIXES:
-                audio_members.append(member)
+        try:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                dot = member.name.rfind(".")
+                ext = member.name[dot:] if dot >= 0 else ""
+                if ext in SIDECAR_SUFFIXES:
+                    stem = member.name[:dot]
+                    try:
+                        extracted = tf.extractfile(member)
+                        if extracted is None:
+                            if stats is not None:
+                                stats["text_decode_failed"] += 1
+                            continue
+                        raw = extracted.read()
+                    except (EOFError, tarfile.ReadError, OSError) as e:
+                        return TarScanResult(
+                            audio_members=[],
+                            metadata_state=None,
+                            scan_complete=False,
+                            scan_error=str(e),
+                        )
+                    try:
+                        text, custom = _parse_sidecar(
+                            raw, ext, self.text_field, self.custom_fields,
+                        )
+                        prev = metas.get(stem)
+                        if prev:
+                            text = text or prev[0]
+                            custom = {**prev[1], **custom}
+                        metas[stem] = (text, custom)
+                    except Exception:
+                        if stats is not None:
+                            stats["text_decode_failed"] += 1
+                elif ext in AUDIO_SUFFIXES:
+                    audio_members.append(member)
+        except (EOFError, tarfile.ReadError, OSError) as e:
+            return TarScanResult(
+                audio_members=[],
+                metadata_state=None,
+                scan_complete=False,
+                scan_error=str(e),
+            )
         return TarScanResult(audio_members=audio_members, metadata_state=metas)
 
     def lookup(
@@ -234,25 +210,12 @@ class ExternalMetadataProvider(MetadataProvider):
         scan: TarScanResult,
         stats: Optional[Counter] = None,
     ) -> MetadataEntry:
-        # Build candidate keys once, check in priority order.
-        basename = stem.rsplit("/", 1)[-1] if "/" in stem else stem
-        candidates = [stem, basename] if basename != stem else [stem]
-
-        # Exact match (stem or basename without extension)
-        for key in candidates:
-            if key in self.metadata:
-                return self.metadata[key]
-
-        # Metadata may include file extension (e.g. "clip.wav") while tar
-        # stems are stripped — try appending common audio suffixes.
-        for key in candidates:
-            for ext in AUDIO_SUFFIXES:
-                if key + ext in self.metadata:
-                    return self.metadata[key + ext]
-
-        if stats is not None:
-            stats["external_meta_miss"] += 1
-        return None, {}
+        return lookup_external_metadata(
+            self.metadata,
+            stem,
+            stats=stats,
+            allow_extensions=AUDIO_SUFFIXES,
+        )
 
 
 # Module-level global for COW sharing of a large external metadata map across
@@ -278,30 +241,67 @@ def iter_tar_cuts(
     tar_paths,
     provider: MetadataProvider,
     stats: Optional[Counter] = None,
+    keep_ids: Optional[set] = None,
+    language: Optional[str] = None,
 ):
     """Iterate over tar shards and yield Lhotse cuts with supervisions.
 
-    The provider controls how metadata is gathered and looked up, while this
-    function keeps a single cut-building path.
+    Args:
+        tar_paths: Paths to WDS tar shards.
+        provider: Metadata source (sidecar or external).
+        stats: Optional counter for tracking decode/skip events.
+        keep_ids: If set, only decode members whose ``canonical_sample_key(stem)``
+            is in this set.  Skips expensive audio decoding for irrelevant
+            recordings (e.g. per-language VAD filtering).
     """
     import tarfile
-    from lhotse import Recording, SupervisionSegment
+    from lhotse import SupervisionSegment
 
     for tar_path in tar_paths:
-        with tarfile.open(tar_path) as tf:
-            scan = provider.scan_tar(tf, stats=stats)
+        try:
+            tf = tarfile.open(tar_path)
+        except (EOFError, tarfile.ReadError, OSError) as e:
+            logger.warning(f"Skipping corrupt tar: {tar_path}: {e}")
+            if stats is not None:
+                stats["skipped_corrupt_tar"] += 1
+            continue
 
-            # Phase 2: decode audio and attach supervision.
+        with tf:
+            try:
+                scan = provider.scan_tar(tf, stats=stats)
+            except (EOFError, tarfile.ReadError, OSError) as e:
+                logger.warning(f"Skipping corrupt tar: {tar_path}: {e}")
+                if stats is not None:
+                    stats["skipped_corrupt_tar"] += 1
+                continue
+            if not scan.scan_complete:
+                logger.warning(
+                    f"Skipping corrupt tar after partial scan: {tar_path}: "
+                    f"{scan.scan_error or 'incomplete tar scan'}"
+                )
+                if stats is not None:
+                    stats["skipped_corrupt_tar"] += 1
+                continue
+
             for member in scan.audio_members:
                 stem = member.name[:member.name.rfind(".")]
+
+                # Pre-filter: skip decoding for recordings we know we won't use.
+                if keep_ids is not None and canonical_sample_key(stem) not in keep_ids:
+                    if stats is not None:
+                        stats["skipped_no_match"] += 1
+                    continue
+
                 try:
                     extracted = tf.extractfile(member)
                     if extracted is None:
                         if stats is not None:
                             stats["missing_payload"] += 1
                         raise ValueError("tar member has no readable payload")
-                    recording = Recording.from_bytes(
-                        data=extracted.read(), recording_id=stem,
+                    recording = build_recording_from_audio_bytes(
+                        extracted.read(),
+                        stem,
+                        runtime_counts=stats,
                     )
                     cut = recording.to_cut()
                 except Exception as e:
@@ -311,7 +311,6 @@ def iter_tar_cuts(
                     continue
 
                 text, custom = provider.lookup(stem, scan, stats=stats)
-
                 if text:
                     cut.supervisions = [SupervisionSegment(
                         id=cut.id,
@@ -319,6 +318,7 @@ def iter_tar_cuts(
                         start=0.0,
                         duration=cut.duration,
                         text=text,
+                        language=language,
                     )]
                 if custom:
                     cut.custom = custom
@@ -358,6 +358,8 @@ def _convert_worker(args_tuple):
         vad_max_duration_sec,
         text_tokenizer,
         resampling_backend,
+        input_clip_id_parser_name,
+        language,
     ) = args_tuple
 
     reused = check_worker_reuse(worker_id, shar_dir)
@@ -379,12 +381,13 @@ def _convert_worker(args_tuple):
             max_merge_gap_sec=float(vad_max_merge_gap_sec),
             max_duration_sec=float(vad_max_duration_sec) if vad_max_duration_sec is not None else None,
         )
-        vad_lookup, lang_lookup = load_vad_from_per_shard_dir(
+        vad_lookup, sr_lookup, lang_lookup = load_vad_from_per_shard_dir(
             Path(vad_per_shard_dir), tar_paths, with_lang=True, logger=logger,
         )
     else:
         vad_cfg = None
         vad_lookup = {}
+        sr_lookup = {}
         lang_lookup = {}
 
     worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
@@ -393,6 +396,11 @@ def _convert_worker(args_tuple):
     total_duration_sec = 0.0
     runtime_counts = Counter()
     _tokenize_text = make_text_tokenize_fn(text_tokenizer) if text_tokenizer is not None else None
+    input_clip_id_parser = (
+        get_clip_id_parser(input_clip_id_parser_name)
+        if input_clip_id_parser_name
+        else None
+    )
     provider = _METADATA_PROVIDER or SidecarMetadataProvider(
         text_field=text_field,
         custom_fields=custom_fields,
@@ -403,7 +411,8 @@ def _convert_worker(args_tuple):
         fields={"recording": shar_format},
         shard_size=shard_size,
     ) as writer:
-        for cut in iter_tar_cuts(tar_paths, provider=provider, stats=runtime_counts):
+        keep_ids = set(vad_lookup) if use_vad_segmenting else None
+        for cut in iter_tar_cuts(tar_paths, provider=provider, stats=runtime_counts, keep_ids=keep_ids, language=language):
             try:
                 if min_sr and cut.sampling_rate < min_sr:
                     skipped += 1
@@ -421,6 +430,7 @@ def _convert_worker(args_tuple):
                         sample_key=cut.recording_id,
                         vad_lookup=vad_lookup,
                         cfg=vad_cfg,
+                        sr_lookup=sr_lookup,
                     )
                     reason_counts[reason] += 1
                 else:
@@ -435,7 +445,7 @@ def _convert_worker(args_tuple):
                     canonical_sample_key(cut.recording_id)
                 ) if lang_lookup else None
 
-                for out_cut in out_cuts:
+                for chunk_idx, out_cut in enumerate(out_cuts):
                     if sample_lang is not None:
                         out_cut.custom = out_cut.custom or {}
                         out_cut.custom["lang"] = sample_lang
@@ -449,6 +459,17 @@ def _convert_worker(args_tuple):
                     if skip:
                         skipped += 1
                         continue
+                    source_id, clip_num = resolve_input_source_and_clip_num(
+                        cut.recording_id,
+                        chunk_idx=chunk_idx,
+                        input_clip_id_parser=input_clip_id_parser,
+                    )
+                    set_universal_cut_id(
+                        out_cut,
+                        source_id,
+                        clip_num,
+                        clip_start=(out_cut.custom or {}).get("global_offset_sec", 0.0),
+                    )
                     writer.write(out_cut)
                     written += 1
                     total_duration_sec += out_cut.duration
@@ -496,14 +517,27 @@ def _validate_or_write_prepare_state(args) -> None:
         "text_field": args.text_field,
         "custom_fields": sorted(args.custom_fields) if args.custom_fields else None,
         "external_metadata": normalize_optional_path(args.external_metadata),
+        "id_field": args.id_field,
+        "input_clip_id_parser": args.input_clip_id_parser,
+        "language": args.language,
     }
     wrote = validate_or_write_prepare_state(
         state_path,
         expected=expected,
-        invariant_keys=("text_tokenizer", "text_field", "custom_fields", "external_metadata"),
+        invariant_keys=(
+            "text_tokenizer",
+            "text_field",
+            "custom_fields",
+            "external_metadata",
+            "id_field",
+            "input_clip_id_parser",
+            "language",
+        ),
         guidance=(
             "Use the same --text-tokenizer, --text-field, --custom-fields, "
-            f"and --external-metadata to resume, or remove {args.shar_dir} and restart from scratch."
+            "--external-metadata, --id-field, --language, and "
+            "--input-clip-id-parser to resume, or "
+            f"remove {args.shar_dir} and restart from scratch."
         ),
     )
     if wrote:
@@ -523,16 +557,10 @@ def main(argv=None):
     add_audio_processing_args(parser, include_min_sr=True, include_mono_downmix=True)
 
     # Text / metadata
-    parser.add_argument("--external-metadata", type=str, default=None,
-                        help="Path to external metadata file (.tsv or .jsonl). "
-                             "When set, transcripts are loaded from this file instead "
-                             "of sidecar files inside the tar archives.")
-    parser.add_argument("--id-field", type=str, default="id",
-                        help="JSON key for segment ID in external metadata JSONL (default: 'id')")
-    parser.add_argument("--text-field", type=str, default="text",
-                        help="JSON key for transcript text (default: 'text')")
-    parser.add_argument("--custom-fields", type=str, nargs="*", default=None,
-                        help="JSON keys to store in cut.custom (e.g. --custom-fields language speaker)")
+    add_external_metadata_args(parser, include_custom_fields=True)
+    parser.add_argument("--language", type=str, default=None,
+                        help="Language tag to set on all supervisions (e.g. fi, en, zh)")
+    add_input_clip_id_parser_arg(parser)
     add_text_tokenizer_args(parser)
     add_parallelism_args(parser, num_workers_default=None)
     parser.add_argument("--vad-segmentation", action="store_true",
@@ -615,6 +643,11 @@ def main(argv=None):
             raise ValueError("--vad-sample-rate must be > 0")
         if args.vad_max_merge_gap_sec < 0:
             raise ValueError("--vad-max-merge-gap-sec must be >= 0")
+        if args.input_clip_id_parser is not None:
+            raise ValueError(
+                "--input-clip-id-parser cannot be combined with "
+                "--vad-segmentation; input IDs already encode clip numbering."
+            )
         logger.info(f"VAD segmenting enabled: per_shard_dir={args.vad_per_shard_dir}")
     else:
         logger.info("VAD segmenting disabled; writing full recordings")
@@ -659,6 +692,8 @@ def main(argv=None):
             args.vad_max_duration_sec,
             text_tokenizer,
             args.resampling_backend,
+            args.input_clip_id_parser,
+            args.language,
         )
         for wid, shards in enumerate(worker_shards)
         if shards

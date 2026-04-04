@@ -119,6 +119,7 @@ from typing import Optional
 from audio_tokenization.utils.prepare_data.common import (
     PREPARE_STATE_FILE,
     SUCCESS_MARKER_FILE,
+    assign_universal_ids,
     build_shar_index_from_parts,
     load_text_tokenizer,
     make_rms_filter_fn,
@@ -376,6 +377,7 @@ def main():
     )
 
     cuts_list = list(cuts)
+    cuts_list = assign_universal_ids(cuts_list, store_clip_start=True)
     logger.info(f"Built CutSet with {len(cuts_list)} cuts from {args.recipe}/{args.split}")
     logger.info(f"Converting to Shar → {args.shar_dir}")
     logger.info(f"Using {args.num_workers} parallel workers")

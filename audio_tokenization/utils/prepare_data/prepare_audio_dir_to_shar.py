@@ -38,10 +38,11 @@ from audio_tokenization.utils.prepare_data.common import (
     init_worker_process,
     run_aggregate,
     run_pool_and_finalize,
+    set_universal_cut_id,
     to_mono,
     write_worker_result,
 )
-from audio_tokenization.utils.prepare_data.chunking import (
+from audio_tokenization.utils.prepare_data.preprocess.chunking import (
     _parse_vad_jsonl_line,
     merge_and_pack_vad,
 )
@@ -174,7 +175,7 @@ def _convert_worker(args_tuple):
 
                     reason_counts["chunked"] += 1
 
-                    for offset, chunk_duration in ranges:
+                    for chunk_idx, (offset, chunk_duration) in enumerate(ranges):
                         try:
                             try:
                                 subcut = cut.truncate(
@@ -195,6 +196,12 @@ def _convert_worker(args_tuple):
                             subcut.custom = subcut.custom or {}
                             subcut.custom["global_offset_sec"] = offset
                             subcut.custom["lang"] = lang
+                            set_universal_cut_id(
+                                subcut,
+                                key,
+                                chunk_idx,
+                                clip_start=offset,
+                            )
 
                             writer.write(subcut)
                             written += 1
