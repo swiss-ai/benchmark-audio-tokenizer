@@ -1,0 +1,10 @@
+# People's Speech train (clean + dirty v2) — audio-text direct transcribe.
+# ~26.7Kh English speech.
+
+dataset_name: peoples_speech
+output_name: peoples_speech
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/peoples_speech_train_v2
+
+num_buckets: 80

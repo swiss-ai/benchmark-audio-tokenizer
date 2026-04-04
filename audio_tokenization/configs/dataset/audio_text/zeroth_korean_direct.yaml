@@ -1,0 +1,10 @@
+# Zeroth Korean — audio-text direct tokenization.
+# ~51h Korean speech with transcription.
+
+dataset_name: zeroth_korean
+output_name: zeroth_korean
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/zeroth_korean_train_v2
+
+num_buckets: 20
