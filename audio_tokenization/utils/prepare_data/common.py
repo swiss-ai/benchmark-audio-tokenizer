@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import math
+import os
 import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
+
+from audio_tokenization.utils.clip_id_parsers import available_clip_id_parsers
 
 
 SUCCESS_MARKER_FILE = "_SUCCESS"
@@ -19,6 +23,356 @@ SUCCESS_MARKER_FILE = "_SUCCESS"
 # Samples below this are considered silent/near-silent and skipped.
 MIN_RMS_DB = -40.0
 PREPARE_STATE_FILE = "_PREPARE_STATE.json"
+MetadataEntry = tuple[Optional[str], dict]
+
+
+def add_input_clip_id_parser_arg(parser) -> None:
+    """Add a CLI option for parsing legacy input clip IDs at prepare time."""
+    parser.add_argument(
+        "--input-clip-id-parser",
+        type=str,
+        choices=available_clip_id_parsers(),
+        default=None,
+        help=(
+            "Parse incoming sample IDs into (source_id, clip_num) before writing "
+            "universal IDs. If unset, direct inputs become {raw_id}@000000 and "
+            "chunked inputs use dense chunk numbering."
+        ),
+    )
+
+
+def add_external_metadata_args(parser, *, include_custom_fields: bool = True) -> None:
+    """Add shared CLI options for transcript/custom metadata overrides."""
+    parser.add_argument(
+        "--external-metadata",
+        type=str,
+        default=None,
+        help=(
+            "Path to external metadata file (.tsv, .jsonl/.jsonl.gz, or .csv). "
+            "When set, entries are looked up by sample ID and can override text "
+            "and provide additional custom fields."
+        ),
+    )
+    parser.add_argument(
+        "--id-field",
+        type=str,
+        default="id",
+        help="Key/column name for sample ID in external metadata (default: 'id')",
+    )
+    parser.add_argument(
+        "--text-field",
+        type=str,
+        default="text",
+        help="Key/column name for transcript text in external metadata (default: 'text')",
+    )
+    if include_custom_fields:
+        parser.add_argument(
+            "--custom-fields",
+            type=str,
+            nargs="*",
+            default=None,
+            help=(
+                "Keys/columns to copy from external metadata into cut.custom "
+                "(e.g. --custom-fields language speaker)"
+            ),
+        )
+
+
+def resolve_input_source_and_clip_num(
+    raw_id: object,
+    *,
+    chunk_idx: int = 0,
+    input_clip_id_parser: Callable[[str], tuple[str, int]] | None = None,
+) -> tuple[str, int]:
+    """Resolve the output ``(source_id, clip_num)`` for a prepared cut."""
+    source_id = str(raw_id)
+    if input_clip_id_parser is None:
+        return source_id, int(chunk_idx)
+    if chunk_idx != 0:
+        raise ValueError(
+            "input_clip_id_parser cannot be combined with chunked outputs; "
+            "the input ID already encodes clip numbering."
+        )
+    return input_clip_id_parser(source_id)
+
+
+def _open_compressed(path: Path, mode: str = "rb"):
+    """Open a file, transparently decompressing .gz or .zst."""
+    if path.suffix == ".gz":
+        import gzip
+        return gzip.open(path, mode)
+    if path.suffix == ".zst":
+        import zstandard
+        # zstandard.open("rb") doesn't support line iteration;
+        # wrap in BufferedReader which does.
+        if "b" in mode:
+            raw = zstandard.open(path, mode)
+            return io.BufferedReader(raw)
+        return zstandard.open(path, mode)
+    return open(path, mode)
+
+
+def _strip_compression_suffix(path: Path) -> str:
+    """Return the format suffix, ignoring .gz/.zst compression."""
+    if path.suffix in (".gz", ".zst"):
+        return Path(path.stem).suffix
+    return path.suffix
+
+
+def load_external_metadata(
+    path: str,
+    custom_fields: Optional[tuple[str, ...]] = None,
+    *,
+    id_field: str = "id",
+    text_field: str = "text",
+) -> dict[str, MetadataEntry]:
+    """Load transcript metadata from an external file.
+
+    Supported formats: ``.tsv``, ``.csv``, ``.jsonl``.
+    Compression: ``.gz`` and ``.zst`` are handled transparently
+    (e.g. ``metadata.jsonl.zst``).
+    """
+    p = Path(path)
+    fmt = _strip_compression_suffix(p)
+    result: dict[str, MetadataEntry] = {}
+
+    if fmt == ".tsv":
+        with _open_compressed(p, "rt") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    result[parts[0]] = (parts[1], {})
+
+    elif fmt == ".jsonl":
+        import orjson
+
+        skipped = 0
+        with _open_compressed(p, "rb") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = orjson.loads(line)
+                except (orjson.JSONDecodeError, ValueError):
+                    skipped += 1
+                    continue
+                custom = {k: obj[k] for k in (custom_fields or ()) if k in obj}
+                result[str(obj[id_field])] = (obj.get(text_field), custom)
+        if skipped:
+            logging.getLogger(__name__).warning(
+                "Skipped %d malformed lines in %s", skipped, p
+            )
+
+    elif fmt == ".csv":
+        import csv
+
+        with _open_compressed(p, "rt") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                custom = {k: row[k] for k in (custom_fields or ()) if k in row}
+                result[str(row[id_field])] = (row.get(text_field), custom)
+
+    else:
+        raise ValueError(
+            f"Unsupported external metadata format: {p.name} "
+            "(expected .tsv, .csv, or .jsonl, optionally with .gz/.zst compression)"
+        )
+
+    logging.getLogger(__name__).info(
+        "Loaded %d entries from external metadata: %s", len(result), p
+    )
+    return result
+
+
+def lookup_external_metadata(
+    metadata: Mapping[str, MetadataEntry],
+    sample_id: str,
+    *,
+    stats: Counter | None = None,
+    allow_extensions: Iterable[str] = (),
+) -> MetadataEntry:
+    """Resolve a sample from an external metadata map."""
+    basename = sample_id.rsplit("/", 1)[-1] if "/" in sample_id else sample_id
+    candidates = [sample_id, basename] if basename != sample_id else [sample_id]
+
+    for key in candidates:
+        if key in metadata:
+            return metadata[key]
+
+    for key in candidates:
+        for ext in allow_extensions:
+            candidate = key + ext
+            if candidate in metadata:
+                return metadata[candidate]
+
+    if stats is not None:
+        stats["external_meta_miss"] += 1
+    return None, {}
+
+
+def resolve_sample_text_and_custom(
+    sample_id: str,
+    *,
+    default_text: str | None = None,
+    default_custom: Mapping[str, object] | None = None,
+    external_metadata: Mapping[str, MetadataEntry] | None = None,
+    stats: Counter | None = None,
+    allow_extensions: Iterable[str] = (),
+) -> MetadataEntry:
+    """Resolve text/custom for a sample, allowing external metadata overrides."""
+    text = default_text
+    custom = dict(default_custom or {})
+    if not external_metadata:
+        return text, custom
+
+    ext_text, ext_custom = lookup_external_metadata(
+        external_metadata,
+        sample_id,
+        stats=stats,
+        allow_extensions=allow_extensions,
+    )
+    if ext_text is not None:
+        text = ext_text
+    if ext_custom:
+        custom.update(ext_custom)
+    return text, custom
+
+
+def set_universal_cut_id(
+    cut,
+    source_id: str,
+    clip_num: int,
+    *,
+    clip_start: float | None = None,
+):
+    """Rewrite ``cut.id`` and store canonical interleaving metadata.
+
+    The conversion side is the source of truth for interleaving semantics:
+    ``cut.custom`` carries ``source_id``/``clip_num``/``clip_start`` so
+    downstream consumers do not need dataset-specific parsers.
+    """
+    if clip_num < 0:
+        raise ValueError(f"clip_num must be >= 0, got {clip_num}")
+    legacy_cut_id = getattr(cut, "id", None)
+    cut.id = f"{source_id}@{clip_num:06d}"
+    for supervision in getattr(cut, "supervisions", ()) or ():
+        supervision.id = cut.id
+    cut.custom = dict(cut.custom or {})
+    cut.custom["source_id"] = source_id
+    cut.custom["clip_num"] = int(clip_num)
+    if clip_start is not None:
+        cut.custom["clip_start"] = float(clip_start)
+    if legacy_cut_id is not None and legacy_cut_id != cut.id:
+        cut.custom["legacy_cut_id"] = legacy_cut_id
+    return cut
+
+
+def assign_universal_ids(
+    cuts: list,
+    store_clip_start: bool = True,
+    max_gap_sec: float | None = None,
+) -> list:
+    """Rewrite cut IDs to the universal format: ``{recording_id}@{clip_num:06d}``.
+
+    Groups cuts by ``recording_id``, sorts within each group by ``cut.start``
+    (supervision start time), and assigns dense 0-based clip numbers.
+
+    If *max_gap_sec* is set, a temporal gap larger than this between
+    consecutive clips breaks the run: the ``source_id`` gets a suffix
+    ``_R{run_idx}`` and ``clip_num`` resets to 0. This prevents the
+    interleaving pipeline from combining clips that are far apart in time.
+
+    If *store_clip_start* is True, stores ``cut.custom["clip_start"]``
+    with the segment's start time in the source recording.
+    """
+    groups = defaultdict(list)
+    for cut in cuts:
+        groups[cut.recording_id].append(cut)
+
+    result = []
+    for rec_id, group in groups.items():
+        group.sort(key=lambda c: (c.start, c.id))
+
+        run_idx = 0
+        clip_num = 0
+        prev_end = None
+
+        for cut in group:
+            # Break the run if gap exceeds threshold
+            if max_gap_sec is not None and prev_end is not None:
+                gap = cut.start - prev_end
+                if gap > max_gap_sec:
+                    run_idx += 1
+                    clip_num = 0
+
+            source_id = f"{rec_id}_R{run_idx}" if run_idx > 0 else rec_id
+            set_universal_cut_id(
+                cut,
+                source_id,
+                clip_num,
+                clip_start=cut.start if store_clip_start else None,
+            )
+
+            prev_end = cut.start + cut.duration
+            clip_num += 1
+            result.append(cut)
+    return result
+
+
+def _ffmpeg_cli_to_wav(audio_bytes: bytes, recording_id: str) -> bytes:
+    """Transcode audio bytes to WAV via ffmpeg CLI subprocess.
+
+    The CLI is more tolerant of malformed containers than the in-process
+    library API — it skips corrupted frames instead of failing.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        ["ffmpeg", "-v", "quiet", "-i", "pipe:0",
+         "-f", "wav", "-acodec", "pcm_s16le", "pipe:1"],
+        input=audio_bytes, capture_output=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg CLI decode failed for {recording_id}: "
+            f"{result.stderr.decode(errors='replace')[:200]}"
+        )
+    if not result.stdout:
+        raise RuntimeError(f"ffmpeg CLI produced empty output for {recording_id}")
+    return result.stdout
+
+
+def build_recording_from_audio_bytes(
+    audio_bytes: bytes,
+    recording_id: str,
+    *,
+    runtime_counts: Counter | None = None,
+):
+    """Create a Lhotse Recording from encoded audio bytes.
+
+    Tries the fast in-process path (``Recording.from_bytes``) first.
+    Falls back to ffmpeg CLI subprocess for malformed files.
+    """
+    from lhotse import Recording
+
+    recording_id = str(recording_id)
+    if runtime_counts is not None:
+        runtime_counts["recording_from_bytes"] += 1
+
+    try:
+        return Recording.from_bytes(data=audio_bytes, recording_id=recording_id)
+    except (ValueError, RuntimeError, OSError):
+        pass
+
+    # Fallback: transcode to WAV via ffmpeg CLI, then parse the clean WAV
+    if runtime_counts is not None:
+        runtime_counts["ffmpeg_cli_fallback"] += 1
+    wav_bytes = _ffmpeg_cli_to_wav(audio_bytes, recording_id)
+    return Recording.from_bytes(data=wav_bytes, recording_id=recording_id)
 
 
 def load_text_tokenizer(tokenizer_path: str | Path):
@@ -27,7 +381,6 @@ def load_text_tokenizer(tokenizer_path: str | Path):
     """
     if tokenizer_path is None:
         return None
-    import logging
     from tokenizers import Tokenizer
     path = Path(tokenizer_path)
     if not path.is_file():
@@ -44,7 +397,6 @@ def make_text_tokenize_fn(tokenizer, extra_custom_columns=None):
     If *extra_custom_columns* is provided, also tokenizes those
     cut.custom fields and stores as cut.custom["{col}_tokens"].
     """
-    import logging
     _logger = logging.getLogger(__name__)
     _extra = tuple(extra_custom_columns or ())
 
@@ -476,31 +828,23 @@ def check_worker_reuse(worker_id: int, shar_dir: str | Path) -> dict | None:
 
 
 def init_worker_process(resampling_backend: str | None = None) -> None:
-    """Per-process initialisation for pool workers.
+    """Per-process initialisation for pool workers."""
+    from lhotse.audio.resampling_backend import (
+        available_resampling_backends,
+        set_current_resampling_backend,
+    )
 
-    Notes:
-      - ``sox`` resampling has shown allocator crashes (``free(): invalid pointer``)
-        under high ``forkserver`` multiprocessing fan-out.
-      - Keep the safer ``default`` backend unless explicitly overridden.
-    """
-    try:
-        import os
-        from lhotse.audio.resampling_backend import (
-            available_resampling_backends,
-            set_current_resampling_backend,
+    backend = resampling_backend or os.environ.get(
+        "LHOTSE_RESAMPLING_BACKEND", "soxr"
+    )
+    if backend == "torchaudio":  # Lhotse registers torchaudio as "default"
+        backend = "default"
+    if backend not in available_resampling_backends():
+        raise RuntimeError(
+            f"Resampling backend {backend!r} not available. "
+            f"Installed: {available_resampling_backends()}"
         )
-
-        backend = resampling_backend or os.environ.get(
-            "LHOTSE_RESAMPLING_BACKEND", "default"
-        )
-        if backend not in available_resampling_backends():
-            logger.warning(
-                "Unknown resampling backend %r; falling back to 'default'", backend
-            )
-            backend = "default"
-        set_current_resampling_backend(backend)
-    except Exception:
-        pass
+    set_current_resampling_backend(backend)
 
 
 def write_worker_result(
@@ -748,9 +1092,9 @@ def add_audio_processing_args(parser, *, target_sr_default=24000,
     """Add --target-sr, --resampling-backend, and optionally --min-sr, --no-mono-downmix."""
     parser.add_argument("--target-sr", type=int, default=target_sr_default,
                         help=f"Target sample rate (default: {target_sr_default})")
-    parser.add_argument("--resampling-backend", type=str, default=None,
-                        choices=["default", "sox"],
-                        help="Lhotse resampling backend override")
+    parser.add_argument("--resampling-backend", type=str, default="soxr",
+                        choices=["torchaudio", "soxr", "ffmpeg"],
+                        help="Resampling backend (default: soxr)")
     if include_min_sr:
         parser.add_argument("--min-sr", type=int, default=16000,
                             help="Drop audio below this sample rate (default: 16000)")
