@@ -201,10 +201,7 @@ def _shar_exists(shar_dir: str) -> bool:
 
 
 def _set_resampling_backend(rank: int) -> None:
-    try:
-        from lhotse.audio.resampling_backend import set_current_resampling_backend
+    from lhotse.audio.resampling_backend import set_current_resampling_backend
 
-        set_current_resampling_backend("sox")
-        logger.info(f"[rank {rank}] Using SoX resampling backend")
-    except Exception:
-        logger.warning(f"[rank {rank}] SoX backend unavailable, using default sinc interpolation")
+    set_current_resampling_backend("soxr")
+    logger.info(f"[rank {rank}] Using soxr resampling backend")

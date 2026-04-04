@@ -200,15 +200,29 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     wandb_logger = None
     wandb_cfg = cfg.get("wandb", {})
     if wandb_cfg.get("enabled", False) and rank == 0:
+        # Auto-generate wandb run name: {task}/{dataset}_dur{min}-{max}
+        _wandb_name = wandb_cfg.get("name")
+        if not _wandb_name:
+            _output_name = cfg.get("output_name", "unknown")
+            _min_d = cfg.get("min_duration")
+            _max_d = cfg.get("max_duration")
+            _dur_tag = ""
+            if _min_d is not None or _max_d is not None:
+                _fmt = lambda v: str(int(v)) if v is not None and float(v).is_integer() else str(v).replace(".", "p") if v is not None else ""
+                _dur_tag = f"_dur{_fmt(_min_d) or 'min'}-{_fmt(_max_d) or 'max'}"
+            _wandb_name = f"{_build_output_subdir(cfg)}{_dur_tag}"
+
         wandb_logger = SimpleWandbLogger(
             project=wandb_cfg.get("project", "audio-tokenization"),
             entity=wandb_cfg.get("entity"),
-            name=wandb_cfg.get("name"),
+            name=_wandb_name,
             tags=wandb_cfg.get("tags", []),
             config={
                 "rank": rank,
                 "world_size": world_size,
                 "max_batch_duration": max_duration,
+                "min_duration": cfg.get("min_duration"),
+                "max_duration": cfg.get("max_duration"),
                 "num_buckets": num_buckets,
                 "buffer_size": buffer_size,
                 "target_sample_rate": target_sr,
@@ -409,6 +423,20 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
 
     result["output_dir"] = output_dir
 
+    try:
+        from .stats_reducer import write_rank_stats, maybe_write_stats_summary
+
+        write_rank_stats(output_dir, result)
+        summary = maybe_write_stats_summary(output_dir, expected_ranks=world_size)
+        if summary is not None:
+            logger.info(
+                f"[rank {rank}] Stats summary: {summary['samples_processed']:,} samples, "
+                f"{summary['audio_tokens']:,} audio tokens, "
+                f"{summary['text_tokens']:,} text tokens across {summary['num_ranks']} ranks"
+            )
+    except Exception:
+        logger.warning(f"[rank {rank}] Failed to write stats JSON", exc_info=True)
+
     # Re-raise after saving progress so the exit code signals failure.
     # This MUST come after all cleanup (checkpoint, metadata, wandb) so
     # partial work is never silently lost.
@@ -431,8 +459,13 @@ def _build_output_subdir(cfg: Dict[str, Any]) -> str:
 
     Layout::
 
-        audio_only:        audio_only/{output_name}[_dur{min}-{max}]
-        audio_text:  audio_text_{format}/{output_name}[_dur{min}-{max}]
+        audio_only:              audio_only/{output_name}
+        audio_text (direct):     {task}/{output_name}
+        audio_text (interleaved): interleave_cache/{output_name}
+
+    Where task is: transcribe, translate, annotate.
+    Interleave stage 2 (pattern build) writes to interleave/{output_name}
+    separately via build_interleaved.
     """
     output_name = cfg.get("output_name")
     if not output_name:
@@ -440,23 +473,14 @@ def _build_output_subdir(cfg: Dict[str, Any]) -> str:
 
     mode = cfg.get("mode", "audio_only")
 
-    dur_suffix = ""
-    min_dur = cfg.get("min_duration")
-    max_dur = cfg.get("max_duration")
-    if min_dur is not None or max_dur is not None:
-        def _fmt(v):
-            if v is None:
-                return ""
-            return str(int(v)) if float(v).is_integer() else str(v).replace(".", "p")
-        dur_suffix = f"_dur{_fmt(min_dur) or 'min'}-{_fmt(max_dur) or 'max'}"
-
-    dataset_name = f"{output_name}{dur_suffix}"
-
     if mode == "audio_text":
-        fmt = cfg.get("audio_text_format", "unknown")
-        return str(Path(f"audio_text_{fmt}") / dataset_name)
+        fmt = cfg.get("audio_text_format", "direct")
+        if fmt == "interleaved":
+            return str(Path("interleave_cache") / output_name)
+        task = cfg.get("audio_text_task", "transcribe")
+        return str(Path(task) / output_name)
 
-    return str(Path(mode) / dataset_name)
+    return str(Path("audio_only") / output_name)
 
 
 
