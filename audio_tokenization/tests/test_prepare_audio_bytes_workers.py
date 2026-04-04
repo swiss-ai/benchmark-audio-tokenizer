@@ -1,0 +1,442 @@
+import sys
+import types
+
+import pytest
+from audio_tokenization.utils.prepare_data import (
+    prepare_hf_to_shar,
+    prepare_parquet_to_shar,
+)
+
+
+class _FakeScalar:
+    def __init__(self, value):
+        self._value = value
+
+    def as_py(self):
+        return self._value
+
+
+class _FakeColumn:
+    def __init__(self, values):
+        self._values = values
+
+    def __getitem__(self, idx):
+        return _FakeScalar(self._values[idx])
+
+
+class _FakeArrowTable:
+    def __init__(self, columns):
+        self._columns = columns
+        self.num_rows = len(next(iter(columns.values())))
+
+    def column(self, name):
+        return _FakeColumn(self._columns[name])
+
+    def to_rows(self):
+        return [
+            {name: values[i] for name, values in self._columns.items()}
+            for i in range(self.num_rows)
+        ]
+
+
+class _FakeArrowBatch:
+    def __init__(self, rows):
+        self._rows = rows
+        self.num_rows = len(rows)
+
+    def to_pylist(self):
+        return list(self._rows)
+
+    def to_table(self):
+        return self
+
+    def to_batches(self, *, max_chunksize):
+        for start in range(0, len(self._rows), max_chunksize):
+            yield _FakeArrowBatch(self._rows[start:start + max_chunksize])
+
+
+class _FakeArrowReader:
+    def __init__(self, table):
+        self._table = table
+
+    def __iter__(self):
+        yield _FakeArrowBatch(self._table.to_rows())
+
+
+class _FakeParquetFile:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def iter_batches(self, *, columns=None, batch_size=None, use_threads=False):
+        assert use_threads is False
+        rows = self._rows
+        if columns is not None:
+            rows = [{k: row[k] for k in columns if k in row} for row in rows]
+        batch_size = batch_size or len(rows)
+        for start in range(0, len(rows), batch_size):
+            yield _FakeArrowBatch(rows[start:start + batch_size])
+
+
+class _FakeSupervisionSegment:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FakeSharWriter:
+    def __init__(self, *, sink, **kwargs):
+        self._sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def write(self, cut):
+        self._sink.append(cut)
+
+
+def _install_fake_lhotse(monkeypatch, written_cuts):
+    fake_lhotse = types.ModuleType("lhotse")
+    fake_lhotse.SupervisionSegment = _FakeSupervisionSegment
+
+    fake_lhotse_shar = types.ModuleType("lhotse.shar")
+    fake_lhotse_shar.SharWriter = lambda **kwargs: _FakeSharWriter(
+        sink=written_cuts,
+        **kwargs,
+    )
+
+    monkeypatch.setitem(sys.modules, "lhotse", fake_lhotse)
+    monkeypatch.setitem(sys.modules, "lhotse.shar", fake_lhotse_shar)
+
+
+def _install_fake_pyarrow(monkeypatch, table):
+    fake_pyarrow = types.ModuleType("pyarrow")
+    fake_ipc = types.ModuleType("pyarrow.ipc")
+    fake_ipc.open_stream = lambda _: _FakeArrowReader(table)
+    fake_parquet = types.ModuleType("pyarrow.parquet")
+    fake_parquet.ParquetFile = lambda _: _FakeParquetFile(table.to_rows())
+    fake_pyarrow.ipc = fake_ipc
+    fake_pyarrow.parquet = fake_parquet
+    monkeypatch.setitem(sys.modules, "pyarrow", fake_pyarrow)
+    monkeypatch.setitem(sys.modules, "pyarrow.ipc", fake_ipc)
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", fake_parquet)
+def _install_common_worker_patches(monkeypatch, module, helper_calls):
+    if hasattr(module, "_EXTERNAL_METADATA"):
+        monkeypatch.setattr(module, "_EXTERNAL_METADATA", None)
+    monkeypatch.setattr(module, "check_worker_reuse", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "init_worker_process", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "apply_audio_pipeline",
+        lambda cut, **kwargs: (cut, False),
+    )
+    monkeypatch.setattr(
+        module,
+        "write_worker_result",
+        lambda **kwargs: {
+            "written": kwargs["written"],
+            "skipped": kwargs["skipped"],
+            "errors": kwargs["errors"],
+            "total_duration_sec": kwargs["total_duration_sec"],
+            "worker_stats": {"runtime_counts": dict(kwargs["runtime_counts"])},
+        },
+    )
+
+    def fake_build_recording(
+        audio_bytes,
+        recording_id,
+        *,
+        runtime_counts=None,
+    ):
+        helper_calls.append(
+            {
+                "audio_bytes": audio_bytes,
+                "recording_id": recording_id,
+            }
+        )
+        if runtime_counts is not None:
+            runtime_counts["recording_from_bytes"] += 1
+
+        cut = types.SimpleNamespace(
+            id=str(recording_id),
+            recording_id=str(recording_id),
+            duration=1.5,
+            sampling_rate=16000,
+            num_channels=1,
+            supervisions=[],
+            custom=None,
+        )
+        return types.SimpleNamespace(to_cut=lambda: cut)
+
+    monkeypatch.setattr(module, "build_recording_from_audio_bytes", fake_build_recording)
+
+
+def test_prepare_hf_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["clip-1"],
+                "audio": [{"bytes": b"arrow-bytes"}],
+                "text": ["hello from hf"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_hf_to_shar, helper_calls)
+
+    result = prepare_hf_to_shar._convert_worker(
+        (
+            0,
+            ["dataset.arrow"],
+            str(tmp_path / "shar"),
+            None,
+            100,
+            "flac",
+            "id",
+            "audio",
+            "text",
+            None,
+            None,
+            None,
+            8,
+        )
+    )
+
+    assert helper_calls == [
+        {
+            "audio_bytes": b"arrow-bytes",
+            "recording_id": "clip-1",
+        }
+    ]
+    assert result["written"] == 1
+    assert result["worker_stats"]["runtime_counts"]["recording_from_bytes"] == 1
+    assert len(written_cuts) == 1
+    assert written_cuts[0].id == "clip-1@000000"
+    assert written_cuts[0].supervisions[0].id == "clip-1@000000"
+    assert written_cuts[0].supervisions[0].text == "hello from hf"
+
+
+def test_prepare_hf_worker_external_metadata_overrides_text(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["clip-1"],
+                "audio": [{"bytes": b"arrow-bytes"}],
+                "text": ["row text"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_hf_to_shar, helper_calls)
+    monkeypatch.setattr(
+        prepare_hf_to_shar,
+        "_EXTERNAL_METADATA",
+        {"clip-1": ("external text", {"speaker": "ext"})},
+    )
+
+    result = prepare_hf_to_shar._convert_worker(
+        (
+            0,
+            ["dataset.arrow"],
+            str(tmp_path / "shar"),
+            None,
+            100,
+            "flac",
+            "id",
+            "audio",
+            "text",
+            None,
+            None,
+            None,
+            8,
+        )
+    )
+
+    assert result["written"] == 1
+    assert written_cuts[0].supervisions[0].text == "external text"
+    assert written_cuts[0].custom == {
+        "speaker": "ext",
+        "source_id": "clip-1",
+        "clip_num": 0,
+        "clip_start": 0.0,
+        "legacy_cut_id": "clip-1",
+    }
+
+
+def test_prepare_parquet_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["row-1"],
+                "audio": [{"bytes": b"parquet-bytes"}],
+                "text": ["hello from parquet"],
+                "duration": [1.5],
+                "lang": ["tr"],
+                "speaker": ["narrator"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        (
+            0,
+            ["dataset.parquet"],
+            str(tmp_path / "shar"),
+            None,
+            100,
+            "flac",
+            "id",
+            "audio",
+            "text",
+            "duration",
+            "lang",
+            ("speaker",),
+            None,
+            None,
+            None,
+            None,
+            8,
+        )
+    )
+
+    assert helper_calls == [
+        {
+            "audio_bytes": b"parquet-bytes",
+            "recording_id": "row-1",
+        }
+    ]
+    assert result["written"] == 1
+    assert result["worker_stats"]["runtime_counts"]["recording_from_bytes"] == 1
+    assert len(written_cuts) == 1
+    assert written_cuts[0].id == "row-1@000000"
+    assert written_cuts[0].supervisions[0].id == "row-1@000000"
+    assert written_cuts[0].supervisions[0].text == "hello from parquet"
+    assert written_cuts[0].supervisions[0].language == "tr"
+    assert written_cuts[0].custom == {
+        "speaker": "narrator",
+        "source_id": "row-1",
+        "clip_num": 0,
+        "clip_start": 0.0,
+        "legacy_cut_id": "row-1",
+    }
+
+
+def test_prepare_parquet_worker_external_metadata_overrides_text_and_custom(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["row-1"],
+                "audio": [{"bytes": b"parquet-bytes"}],
+                "text": ["row text"],
+                "duration": [1.5],
+                "lang": ["tr"],
+                "speaker": ["row-speaker"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+    monkeypatch.setattr(
+        prepare_parquet_to_shar,
+        "_EXTERNAL_METADATA",
+        {"row-1": ("external text", {"speaker": "ext-speaker", "topic": "budget"})},
+    )
+
+    result = prepare_parquet_to_shar._convert_worker(
+        (
+            0,
+            ["dataset.parquet"],
+            str(tmp_path / "shar"),
+            None,
+            100,
+            "flac",
+            "id",
+            "audio",
+            "text",
+            "duration",
+            "lang",
+            ("speaker",),
+            None,
+            None,
+            None,
+            None,
+            8,
+        )
+    )
+
+    assert result["written"] == 1
+    assert written_cuts[0].supervisions[0].text == "external text"
+    assert written_cuts[0].custom == {
+        "speaker": "ext-speaker",
+        "topic": "budget",
+        "source_id": "row-1",
+        "clip_num": 0,
+        "clip_start": 0.0,
+        "legacy_cut_id": "row-1",
+    }
+
+
+def test_prepare_parquet_worker_applies_input_clip_id_parser(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "segment_id": ["row00000_seg003"],
+                "audio": [{"bytes": b"parquet-bytes"}],
+                "text": ["hello from spc"],
+                "duration": [1.5],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        (
+            0,
+            ["dataset.parquet"],
+            str(tmp_path / "shar"),
+            None,
+            100,
+            "flac",
+            "segment_id",
+            "audio",
+            "text",
+            "duration",
+            None,
+            None,
+            None,
+            None,
+            None,
+            "spc",
+            8,
+        )
+    )
+
+    assert result["written"] == 1
+    assert helper_calls[0]["recording_id"] == "row00000_seg003"
+    assert written_cuts[0].id == "row00000@000003"
+    assert written_cuts[0].supervisions[0].id == "row00000@000003"
+    assert written_cuts[0].custom == {
+        "source_id": "row00000",
+        "clip_num": 3,
+        "clip_start": 0.0,
+        "legacy_cut_id": "row00000_seg003",
+    }

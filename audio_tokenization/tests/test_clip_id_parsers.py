@@ -5,14 +5,12 @@ import pytest
 from audio_tokenization.utils.clip_id_parsers import (
     get_clip_id_parser,
     parse_aishell_clip_id,
-    parse_coral_clip_id,
     parse_emilia_clip_id,
     parse_generic_clip_id,
-    parse_legco_clip_id,
     parse_libriheavy_clip_id,
     parse_parlaspeech_clip_id,
-    parse_peoples_speech_clip_id,
     parse_spc_clip_id,
+    parse_trailing_number_clip_id,
     parse_wenetspeech_clip_id,
 )
 
@@ -32,18 +30,29 @@ class TestEmilia:
             parse_emilia_clip_id("no_w_suffix")
 
 
-class TestPeoplesSpeech:
+class TestTrailingNumber:
     def test_with_flac(self):
-        assert parse_peoples_speech_clip_id(
+        assert parse_trailing_number_clip_id(
             "forum_SLASH_foo_DOT_mp3_00002.flac"
         ) == ("forum_SLASH_foo_DOT_mp3", 2)
 
     def test_without_extension(self):
-        assert parse_peoples_speech_clip_id("src_00010") == ("src", 10)
+        assert parse_trailing_number_clip_id("src_00010") == ("src", 10)
+
+    def test_dedup_suffix(self):
+        assert parse_trailing_number_clip_id("rIa-Qb8EYsA_123-0") == ("rIa-Qb8EYsA", 123)
+
+    def test_coral_style(self):
+        assert parse_trailing_number_clip_id(
+            "conv_07f9708fc0b8316a9dea85d473db112b_00005"
+        ) == ("conv_07f9708fc0b8316a9dea85d473db112b", 5)
+
+    def test_zeroth_korean(self):
+        assert parse_trailing_number_clip_id("187_003_0011") == ("187_003", 11)
 
     def test_invalid(self):
         with pytest.raises(ValueError):
-            parse_peoples_speech_clip_id("no_number")
+            parse_trailing_number_clip_id("no_number")
 
 
 class TestWenetSpeech:
@@ -85,34 +94,6 @@ class TestAishell:
             parse_aishell_clip_id("no_w_marker")
 
 
-class TestLegco:
-    def test_basic(self):
-        assert parse_legco_clip_id("rIa-Qb8EYsA_123") == ("rIa-Qb8EYsA", 123)
-
-    def test_dedup_suffix(self):
-        assert parse_legco_clip_id("rIa-Qb8EYsA_123-0") == ("rIa-Qb8EYsA", 123)
-
-    def test_invalid(self):
-        with pytest.raises(ValueError):
-            parse_legco_clip_id("")
-
-
-class TestCoral:
-    def test_basic(self):
-        assert parse_coral_clip_id(
-            "conv_07f9708fc0b8316a9dea85d473db112b_00005"
-        ) == ("conv_07f9708fc0b8316a9dea85d473db112b", 5)
-
-    def test_dedup_suffix(self):
-        assert parse_coral_clip_id(
-            "conv_07f9708fc0b8316a9dea85d473db112b_00005-1"
-        ) == ("conv_07f9708fc0b8316a9dea85d473db112b", 5)
-
-    def test_invalid(self):
-        with pytest.raises(ValueError):
-            parse_coral_clip_id("")
-
-
 class TestLibriHeavy:
     def test_basic(self):
         assert parse_libriheavy_clip_id(
@@ -149,13 +130,11 @@ class TestGeneric:
 class TestRegistry:
     def test_all_known_parsers(self):
         for name in [
+            "trailing_number",
             "emilia",
-            "peoples_speech",
             "wenetspeech",
             "spc",
             "aishell",
-            "legco",
-            "coral",
             "libriheavy",
             "parlaspeech",
             "generic",
