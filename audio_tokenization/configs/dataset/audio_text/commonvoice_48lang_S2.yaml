@@ -1,7 +1,7 @@
 # CommonVoice 48-language stage_2 (train) — audio-text direct tokenization.
 dataset_name: commonvoice
 output_name: commonvoice_48lang_S2
-clip_id_parser: generic
+clip_id_parser: universal
 
 # Pre-built Shar directories (one per language)
 shar_dir:

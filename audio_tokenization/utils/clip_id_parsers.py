@@ -26,15 +26,18 @@ def parse_emilia_clip_id(clip_id: str) -> Tuple[str, int]:
     return source_id, clip_num
 
 
-def parse_peoples_speech_clip_id(clip_id: str) -> Tuple[str, int]:
-    """Parse People's Speech clip IDs.
+def parse_trailing_number_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Generic parser: split on the last ``_DIGITS`` with optional file extension.
 
-    Format: ``{source_path_with_SLASH_DOT}_NNNNN.flac``
-    e.g. ``forum_SLASH_foo_DOT_mp3_00002.flac`` -> ``("forum_SLASH_foo_DOT_mp3", 2)``
+    Works for any ID format ending in ``_{number}`` or ``_{number}.ext``:
+        ``forum_SLASH_foo_DOT_mp3_00002.flac`` -> ``("forum_SLASH_foo_DOT_mp3", 2)``
+        ``187_003_0011``                       -> ``("187_003", 11)``
+        ``rIa-Qb8EYsA_123-0``                 -> ``("rIa-Qb8EYsA", 123)``
+        ``conv_07f9708fc0b8_00005``            -> ``("conv_07f9708fc0b8", 5)``
     """
-    match = re.match(r"^(.+?)_(\d+)(?:\.\w+)?$", clip_id)
+    match = re.match(r"^(.+?)_(\d+)(?:-\d+)?(?:\.\w+)?$", clip_id)
     if match is None:
-        raise ValueError(f"Cannot parse People's Speech clip ID: {clip_id!r}")
+        raise ValueError(f"Cannot parse clip ID (expected trailing _NUMBER): {clip_id!r}")
     source_id = match.group(1)
     clip_num = int(match.group(2))
     return source_id, clip_num
@@ -83,36 +86,6 @@ def parse_aishell_clip_id(clip_id: str) -> Tuple[str, int]:
     return source_id, clip_num
 
 
-def parse_legco_clip_id(clip_id: str) -> Tuple[str, int]:
-    """Parse LegCo speech clip IDs.
-
-    Format: ``{recording_id}_{clip_num}`` with optional dedup suffix.
-    e.g. ``rIa-Qb8EYsA_123`` -> ``("rIa-Qb8EYsA", 123)``
-         ``rIa-Qb8EYsA_123-0`` -> ``("rIa-Qb8EYsA", 123)``
-    """
-    match = re.match(r"^(.+?)_(\d+)(?:-\d+)?$", clip_id)
-    if match is None:
-        raise ValueError(f"Cannot parse LegCo clip ID: {clip_id!r}")
-    source_id = match.group(1)
-    clip_num = int(match.group(2))
-    return source_id, clip_num
-
-
-def parse_coral_clip_id(clip_id: str) -> Tuple[str, int]:
-    """Parse CoRal conversation clip IDs.
-
-    Format: ``{source_id}_{clip_num}`` with optional dedup suffix.
-    e.g. ``conv_07f9708fc0b8316a9dea85d473db112b_00005``
-      -> ``("conv_07f9708fc0b8316a9dea85d473db112b", 5)``
-    """
-    match = re.match(r"^(.+?)_(\d+)(?:-\d+)?$", clip_id)
-    if match is None:
-        raise ValueError(f"Cannot parse CoRal clip ID: {clip_id!r}")
-    source_id = match.group(1)
-    clip_num = int(match.group(2))
-    return source_id, clip_num
-
-
 def parse_libriheavy_clip_id(clip_id: str) -> Tuple[str, int]:
     """Parse LibriHeavy clip IDs.
 
@@ -143,6 +116,54 @@ def parse_parlaspeech_clip_id(clip_id: str) -> Tuple[str, int]:
     return source_id, clip_num
 
 
+def parse_voxpopuli_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse VoxPopuli clip IDs.
+
+    Format: ``{session}_{lang}_{clip_num}``
+    e.g. ``20160118-0900-PLENARY-12_fi_3`` -> ``("20160118-0900-PLENARY-12_fi", 3)``
+    """
+    last_underscore = clip_id.rfind("_")
+    if last_underscore < 0:
+        raise ValueError(f"Cannot parse VoxPopuli clip ID: {clip_id!r}")
+    source_id = clip_id[:last_underscore]
+    clip_num = int(clip_id[last_underscore + 1:])
+    return source_id, clip_num
+
+
+def parse_ytc_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse YTC (YouTube Captions) clip IDs.
+
+    Format: ``{video_id}-{start_ms}-{duration_ms}``
+    e.g. ``WydnCJflnNU-189904-96`` -> ``("WydnCJflnNU", 189904)``
+
+    Uses start_ms as clip_num for temporal ordering.
+    """
+    parts = clip_id.rsplit("-", 2)
+    if len(parts) < 3:
+        raise ValueError(f"Cannot parse YTC clip ID: {clip_id!r}")
+    video_id = parts[0]
+    start_ms = int(parts[1])
+    return video_id, start_ms
+
+
+def parse_universal_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse the universal clip ID format: ``{source_id}@{clip_num:06d}``.
+
+    This is the standard format for all datasets. The ``@`` separator is
+    chosen because it does not appear in any known source ID.
+
+    e.g. ``EN_tKvmUvxYZXI@000006`` -> ``("EN_tKvmUvxYZXI", 6)``
+         ``DIY_-3ywrgCA-1I@000042`` -> ``("DIY_-3ywrgCA-1I", 42)``
+    """
+    at_pos = clip_id.rfind("@")
+    if at_pos < 0:
+        raise ValueError(
+            f"Universal clip ID missing '@' separator: {clip_id!r}. "
+            "Expected format: {{source_id}}@{{clip_num:06d}}"
+        )
+    return clip_id[:at_pos], int(clip_id[at_pos + 1:])
+
+
 def parse_generic_clip_id(clip_id: str) -> Tuple[str, int]:
     """Fallback parser: treats entire clip ID as source, clip_num=0."""
     return clip_id, 0
@@ -153,25 +174,32 @@ def parse_generic_clip_id(clip_id: str) -> Tuple[str, int]:
 # ---------------------------------------------------------------------------
 
 _PARSERS = {
+    "universal": parse_universal_clip_id,
+    "trailing_number": parse_trailing_number_clip_id,
+    "voxpopuli": parse_voxpopuli_clip_id,
+    "ytc": parse_ytc_clip_id,
     "emilia": parse_emilia_clip_id,
-    "peoples_speech": parse_peoples_speech_clip_id,
     "wenetspeech": parse_wenetspeech_clip_id,
     "spc": parse_spc_clip_id,
     "aishell": parse_aishell_clip_id,
-    "legco": parse_legco_clip_id,
-    "coral": parse_coral_clip_id,
     "libriheavy": parse_libriheavy_clip_id,
     "parlaspeech": parse_parlaspeech_clip_id,
     "generic": parse_generic_clip_id,
 }
 
 
+def available_clip_id_parsers() -> Tuple[str, ...]:
+    """Return the registered clip-ID parser names in stable order."""
+    return tuple(sorted(_PARSERS))
+
+
 def get_clip_id_parser(name: str):
     """Look up a clip ID parser by name.
 
     Args:
-        name: One of ``"emilia"``, ``"peoples_speech"``, ``"wenetspeech"``,
-            ``"spc"``, ``"aishell"``, ``"legco"``, ``"coral"``, ``"generic"``.
+        name: Parser name. ``"universal"`` is the standard format for all
+            new datasets. Prepare-time input parsers are kept only for
+            datasets whose raw IDs still need normalization.
 
     Returns:
         Callable[[str], Tuple[str, int]]
@@ -179,6 +207,6 @@ def get_clip_id_parser(name: str):
     if name not in _PARSERS:
         raise ValueError(
             f"Unknown clip_id_parser: {name!r}. "
-            f"Available: {sorted(_PARSERS.keys())}"
+            f"Available: {list(available_clip_id_parsers())}"
         )
     return _PARSERS[name]

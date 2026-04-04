@@ -2,7 +2,7 @@
 
 dataset_name: wenetspeech
 output_name: wenetspeech_interleaved
-clip_id_parser: wenetspeech
+clip_id_parser: universal
 
 shar_dir:
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/wenetspeech_24k

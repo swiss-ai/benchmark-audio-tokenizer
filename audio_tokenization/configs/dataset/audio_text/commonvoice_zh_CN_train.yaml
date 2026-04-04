@@ -2,7 +2,7 @@
 
 dataset_name: commonvoice_zh_CN
 output_name: commonvoice_zh_CN_train
-clip_id_parser: generic
+clip_id_parser: universal
 
 # Pre-built Shar directory
 shar_dir: /iopsstor/scratch/cscs/xyixuan/audio-datasets/audio_text_as_repetition_shar/commonvoice_zh-CN_train_shar

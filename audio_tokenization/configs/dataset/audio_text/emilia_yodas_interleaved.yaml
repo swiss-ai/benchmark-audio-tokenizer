@@ -2,7 +2,7 @@
 
 dataset_name: emilia_yodas
 output_name: emilia_yodas_interleaved
-clip_id_parser: emilia
+clip_id_parser: universal
 
 shar_dir:
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/emilia_yodas_interleaved_shar

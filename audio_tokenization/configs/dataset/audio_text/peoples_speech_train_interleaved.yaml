@@ -2,14 +2,9 @@
 
 dataset_name: peoples_speech
 output_name: peoples_speech_train_interleaved
-clip_id_parser: peoples_speech
+clip_id_parser: universal
 
 shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/peoples_speech_clean_train/node_00
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/peoples_speech_clean_train/node_01
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/peoples_speech_clean_train/node_02
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/peoples_speech_clean_train/node_03
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/peoples_speech_dirty_train/node_00
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/peoples_speech_dirty_train/node_01
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/peoples_speech_train_v2
 
-min_duration: 0.1
+min_duration: 1.0

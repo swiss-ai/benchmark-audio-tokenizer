@@ -67,6 +67,7 @@ class ParquetChunkWriter:
                 ("clip_id", pa.string()),
                 ("source_id", pa.string()),
                 ("clip_num", pa.int64()),
+                ("clip_start", pa.float64()),
                 ("speaker", pa.string()),
                 ("duration", pa.float64()),
                 ("text", pa.string()),

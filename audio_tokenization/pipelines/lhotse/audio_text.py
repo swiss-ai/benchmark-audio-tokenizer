@@ -22,6 +22,33 @@ TASK_TOKEN_MAP = {
 }
 
 
+def resolve_interleaving_metadata(cut, clip_id_parser=None):
+    """Resolve canonical interleaving metadata for a cut.
+
+    Preferred source of truth is ``cut.custom`` written during SHAR conversion:
+    ``source_id``, ``clip_num``, and optional ``clip_start``.
+
+    ``clip_id_parser`` is only used as a fallback for legacy SHAR that do not
+    carry canonical metadata yet.
+    """
+    custom = cut.custom or {}
+    source_id = custom.get("source_id")
+    clip_num = custom.get("clip_num")
+    clip_start = custom.get("clip_start", cut.start)
+
+    if source_id is not None and clip_num is not None:
+        return str(source_id), int(clip_num), float(clip_start)
+
+    if clip_id_parser is None:
+        raise ValueError(
+            f"Cut {cut.id!r} is missing canonical interleaving metadata "
+            "(cut.custom.source_id / clip_num) and no clip_id_parser was configured."
+        )
+
+    source_id, clip_num = clip_id_parser(cut.id)
+    return str(source_id), int(clip_num), float(clip_start)
+
+
 class AudioTextHandler:
     """Handler for audio-text tokenization mode.
 
@@ -36,7 +63,12 @@ class AudioTextHandler:
 
     def __init__(self, cfg):
         from audio_tokenization.utils.clip_id_parsers import get_clip_id_parser
-        self.clip_id_parser = get_clip_id_parser(cfg.get("clip_id_parser", "generic"))
+        clip_id_parser_name = cfg.get("clip_id_parser")
+        self.clip_id_parser = (
+            get_clip_id_parser(clip_id_parser_name)
+            if clip_id_parser_name
+            else None
+        )
         self.dataset_name = cfg.get("dataset_name", "")
         self.chunk_samples = 0
 
@@ -166,7 +198,10 @@ class AudioTextHandler:
         batch_audio_tok = 0
         batch_text_tok = 0
         for tokens, cut in zip(raw_tokens, cuts):
-            source_id, clip_num = self.clip_id_parser(cut.id)
+            source_id, clip_num, clip_start = resolve_interleaving_metadata(
+                cut,
+                clip_id_parser=self.clip_id_parser,
+            )
             text = cut.supervisions[0].text if cut.supervisions else ""
             speaker = cut.supervisions[0].speaker if cut.supervisions else ""
             text_tokens = cut.custom.get("text_tokens", []) if cut.custom else []
@@ -175,6 +210,7 @@ class AudioTextHandler:
                 "clip_id": cut.id,
                 "source_id": source_id,
                 "clip_num": clip_num,
+                "clip_start": clip_start,
                 "speaker": speaker or "",
                 "duration": cut.duration,
                 "text": text or "",
