@@ -1,0 +1,7 @@
+dataset_name: thorsten_de
+output_name: thorsten_de
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/thorsten_de
+
+num_buckets: 8

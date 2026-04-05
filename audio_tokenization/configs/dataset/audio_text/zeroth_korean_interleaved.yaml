@@ -7,5 +7,4 @@ output_name: zeroth_korean
 shar_dir:
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/zeroth_korean_train_v2
 
-clip_id_parser: universal
 num_buckets: 20

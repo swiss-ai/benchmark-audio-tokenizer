@@ -1,0 +1,10 @@
+# ParlaSpeech-RS interleaved — audio-text tokenization.
+# ~738h, Serbian parliamentary speech, ~5 clips/run (10s gap).
+
+dataset_name: parlaspeech_rs
+output_name: parlaspeech_rs_interleave
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/parlaspeech_rs_train
+
+num_buckets: 80

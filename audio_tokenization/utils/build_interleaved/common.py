@@ -124,6 +124,16 @@ def _detect_runs(df: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray, np.ndarray
     A new run starts whenever the source changes **or** clip_num is not the
     previous clip_num + 1.
 
+    **Invariant**: this function assumes clip_num is dense (0, 1, 2, ...)
+    within each source_id in the SHAR before tokenization. Gaps in clip_num
+    after tokenization indicate filtered clips (min_duration, min_rms_db)
+    and are treated as real discontinuities — the run breaks and isolated
+    clips become transcribe sequences.
+
+    Sparse or timestamp-based clip_num (e.g. start_ms) will cause excessive
+    fragmentation. Ensure SHAR patching assigns dense clip_num before
+    tokenization.
+
     Returns (sorted_df, run_starts, run_lengths) where *run_starts* and
     *run_lengths* are 1-D int arrays indexing into the sorted dataframe.
     """

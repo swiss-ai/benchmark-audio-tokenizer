@@ -1,0 +1,7 @@
+dataset_name: nb_tale
+output_name: nb_tale
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/nb_tale_all
+
+num_buckets: 8

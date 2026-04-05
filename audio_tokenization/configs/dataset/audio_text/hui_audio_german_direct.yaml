@@ -1,0 +1,7 @@
+dataset_name: hui_audio_german
+output_name: hui_audio_german_interleave
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/hui_audio_corpus_german_clean
+
+num_buckets: 20

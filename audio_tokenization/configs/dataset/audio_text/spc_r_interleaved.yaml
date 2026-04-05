@@ -2,7 +2,6 @@
 
 dataset_name: spc_r
 output_name: spc_r_interleaved
-clip_id_parser: universal
 
 shar_dir:
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/spc_r_segmented

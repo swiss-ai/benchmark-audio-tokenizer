@@ -31,6 +31,7 @@ from pathlib import Path
 from audio_tokenization.utils.prepare_data.common import (
     add_audio_processing_args,
     add_external_metadata_args,
+    add_language_arg,
     add_input_clip_id_parser_arg,
     add_parallelism_args,
     add_shar_output_args,
@@ -88,6 +89,7 @@ def _convert_worker(args_tuple):
         resampling_backend,
         input_clip_id_parser_name,
         read_batch_size,
+        language,
     ) = args_tuple
 
     reused = check_worker_reuse(worker_id, shar_dir)
@@ -151,6 +153,7 @@ def _convert_worker(args_tuple):
                             start=0.0,
                             duration=cut.duration,
                             text=text,
+                            language=language,
                         )]
 
                     cut, skip = apply_audio_pipeline(
@@ -238,6 +241,7 @@ def main(argv=None):
     add_external_metadata_args(parser, include_custom_fields=True)
     add_input_clip_id_parser_arg(parser)
 
+    add_language_arg(parser)
     add_text_tokenizer_args(parser)
     add_parallelism_args(parser)
     args = parser.parse_args(argv)
@@ -295,6 +299,7 @@ def main(argv=None):
             args.resampling_backend,
             args.input_clip_id_parser,
             args.read_batch_size,
+            args.language,
         )
         for wid, arrows in enumerate(worker_arrows)
         if arrows

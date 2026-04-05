@@ -20,8 +20,8 @@ from audio_tokenization.utils.clip_id_parsers import available_clip_id_parsers
 SUCCESS_MARKER_FILE = "_SUCCESS"
 
 # Minimum RMS threshold (dB) for keeping audio during SHAR conversion.
-# Samples below this are considered silent/near-silent and skipped.
-MIN_RMS_DB = -40.0
+# -50dB keeps quiet but audible speech; only drops near-silence.
+MIN_RMS_DB = -50.0
 PREPARE_STATE_FILE = "_PREPARE_STATE.json"
 MetadataEntry = tuple[Optional[str], dict]
 
@@ -1101,6 +1101,13 @@ def add_audio_processing_args(parser, *, target_sr_default=24000,
     if include_mono_downmix:
         parser.add_argument("--no-mono-downmix", action="store_true",
                             help="Select channel 0 instead of averaging stereo channels")
+
+
+def add_language_arg(parser):
+    """Add --language for setting supervision.language on all cuts."""
+    parser.add_argument("--language", type=str, default=None,
+                        help="Language tag to set on all supervisions (e.g. fi, en, zh). "
+                             "Overridden by --language-column if both are set.")
 
 
 def add_text_tokenizer_args(parser, *, include_custom_columns=False):

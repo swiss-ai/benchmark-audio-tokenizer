@@ -1,8 +1,10 @@
 # WenetSpeech L-split interleaved — audio-text tokenization.
+# 14.5M cuts, ~10Kh Chinese speech.
 
 dataset_name: wenetspeech
-output_name: wenetspeech_interleaved
-clip_id_parser: universal
+output_name: wenetspeech
 
 shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/wenetspeech_24k
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/wenetspeech
+
+num_buckets: 80

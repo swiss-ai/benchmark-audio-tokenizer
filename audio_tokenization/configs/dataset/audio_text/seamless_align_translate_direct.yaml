@@ -1,0 +1,10 @@
+# SeamlessAlign (ai4bharat) translate direct — audio-text tokenization.
+# ~7.4Kh, 5 Indic languages (hin, kan, tam, tel, urd), English translation.
+
+dataset_name: seamless_align_translate
+output_name: seamless_align_translate
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/translate/seamless_align
+
+num_buckets: 80

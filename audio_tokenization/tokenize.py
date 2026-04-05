@@ -108,7 +108,7 @@ def main(cfg: DictConfig):
         # Output subdirectory name (overrides auto-inferred name)
         "output_name": cfg.dataset.get("output_name"),
         # audio_text mode
-        "clip_id_parser": cfg.dataset.get("clip_id_parser", "generic"),
+        "clip_id_parser": cfg.dataset.get("clip_id_parser"),  # deprecated, fail-fast if set
         "dataset_name": cfg.dataset.get("dataset_name", cfg.dataset.get("output_name", "")),
         "audio_text_format": cfg.get("audio_text_format", "interleaved"),
         "audio_text_task": cfg.get("audio_text_task", "transcribe"),

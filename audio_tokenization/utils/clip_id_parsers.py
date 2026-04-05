@@ -164,6 +164,81 @@ def parse_universal_clip_id(clip_id: str) -> Tuple[str, int]:
     return clip_id[:at_pos], int(clip_id[at_pos + 1:])
 
 
+def parse_eurospeech_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse EuroSpeech clip IDs.
+
+    Format: ``{country}_{country}_{speaker}_{date}_{start_ms}_{end_ms}``
+    e.g. ``bulgaria_bulgaria_0_01022012_50288_69767``
+      -> ``("bulgaria_bulgaria_0_01022012", 50288)``
+
+    Uses start_ms as clip_num for temporal ordering.
+    """
+    parts = clip_id.rsplit("_", 2)
+    if len(parts) < 3:
+        raise ValueError(f"Cannot parse EuroSpeech clip ID: {clip_id!r}")
+    source_id = parts[0]
+    start_ms = int(parts[1])
+    return source_id, start_ms
+
+
+def parse_hui_audio_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse HUI Audio Corpus clip IDs.
+
+    Format: ``{book_chapter}_f{NNNNNN}-{idx}``
+    e.g. ``jane_eyre_die_waise_von_lowood_37_f000008-0``
+      -> ``("jane_eyre_die_waise_von_lowood_37", 8)``
+    """
+    m = re.match(r"^(.+)_f(\d+)-\d+$", clip_id)
+    if m is None:
+        raise ValueError(f"Cannot parse HUI Audio clip ID: {clip_id!r}")
+    return m.group(1), int(m.group(2))
+
+
+def parse_trailing_dash_number_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse clip IDs with trailing dash-separated number.
+
+    Format: ``{source_id}-{clip_num}``
+    e.g. ``BAC009S0195W0359-0``     -> ``("BAC009S0195W0359", 0)``
+         ``SSB00050001-0``          -> ``("SSB00050001", 0)``
+         ``session-SPK0001-129``    -> ``("session-SPK0001", 129)``
+    """
+    last_dash = clip_id.rfind("-")
+    if last_dash < 0:
+        raise ValueError(f"Cannot parse clip ID (expected trailing -NUMBER): {clip_id!r}")
+    source_id = clip_id[:last_dash]
+    clip_num = int(clip_id[last_dash + 1:])
+    return source_id, clip_num
+
+
+def parse_f1_radio_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Parse F1 team radio clip IDs.
+
+    Format: ``{grand_prix}_{driver_id}_{racing_num}_{YYYYMMDD}_{HHMMSS}``
+    e.g. ``2018_Australian_Grand_Prix_BREHAR01_28_20180325_161424``
+      -> ``("2018_Australian_Grand_Prix_BREHAR01", 20180325161424)``
+
+    Uses datetime as clip_num for temporal ordering.
+    """
+    # Split from the right: last two parts are YYYYMMDD and HHMMSS
+    parts = clip_id.rsplit("_", 2)
+    if len(parts) < 3:
+        raise ValueError(f"Cannot parse F1 radio clip ID: {clip_id!r}")
+    # parts[0] = everything before racing_num, parts[1] = YYYYMMDD, parts[2] = HHMMSS
+    # But racing_num is also before YYYYMMDD. Split more carefully.
+    # ID: 2018_Australian_Grand_Prix_BREHAR01_28_20180325_161424
+    # Last 2 underscored parts: 20180325_161424
+    timestamp = int(parts[1] + parts[2])  # 20180325161424
+    # source_id: everything before racing_num_YYYYMMDD_HHMMSS
+    # The racing_num is the part just before YYYYMMDD
+    prefix_parts = parts[0].rsplit("_", 1)
+    source_id = prefix_parts[0]  # grand_prix_driver_id
+    return source_id, timestamp
+
+
+# parse_vimedcss_clip_id is identical to parse_trailing_dash_number_clip_id
+parse_vimedcss_clip_id = parse_trailing_dash_number_clip_id
+
+
 def parse_generic_clip_id(clip_id: str) -> Tuple[str, int]:
     """Fallback parser: treats entire clip ID as source, clip_num=0."""
     return clip_id, 0
@@ -184,13 +259,32 @@ _PARSERS = {
     "aishell": parse_aishell_clip_id,
     "libriheavy": parse_libriheavy_clip_id,
     "parlaspeech": parse_parlaspeech_clip_id,
+    "eurospeech": parse_eurospeech_clip_id,
+    "hui_audio": parse_hui_audio_clip_id,
+    "trailing_dash_number": parse_trailing_dash_number_clip_id,
+    "f1_radio": parse_f1_radio_clip_id,
+    "vimedcss": parse_vimedcss_clip_id,
     "generic": parse_generic_clip_id,
+}
+
+
+# Clip-num to seconds conversion for parsers that use non-second units.
+# Parsers not listed here have clip_num in arbitrary sequential units (no time meaning).
+_CLIP_NUM_TO_SEC = {
+    "ytc": 0.001,          # clip_num is start_ms
+    "eurospeech": 0.001,   # clip_num is start_ms
+    "parlaspeech": 0.1,    # clip_num is start_deciseconds
 }
 
 
 def available_clip_id_parsers() -> Tuple[str, ...]:
     """Return the registered clip-ID parser names in stable order."""
     return tuple(sorted(_PARSERS))
+
+
+def get_clip_num_to_sec(name: str) -> float | None:
+    """Return the scale factor to convert clip_num to seconds, or None if not applicable."""
+    return _CLIP_NUM_TO_SEC.get(name)
 
 
 def get_clip_id_parser(name: str):

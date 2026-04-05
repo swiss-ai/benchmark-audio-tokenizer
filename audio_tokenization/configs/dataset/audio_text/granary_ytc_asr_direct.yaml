@@ -1,0 +1,32 @@
+# Granary YTC ASR direct — audio-text tokenization.
+# ~9.4Kh, 23 languages, YouTube captions with native language text.
+
+dataset_name: granary_ytc_asr
+output_name: granary_ytc_asr
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/bg
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/cs
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/da
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/de
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/el
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/en
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/es
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/et
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/fi
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/fr
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/hr
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/hu
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/it
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/lt
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/lv
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/nl
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/pl
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/pt
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/ro
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/sk
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/sl
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/sv
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/granary_ytc_asr/uk
+
+num_buckets: 80

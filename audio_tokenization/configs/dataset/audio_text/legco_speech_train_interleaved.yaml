@@ -2,7 +2,6 @@
 
 dataset_name: legco_speech
 output_name: legco_speech_train_interleaved
-clip_id_parser: universal
 
 shar_dir:
   - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/legco_speech_train/node_00

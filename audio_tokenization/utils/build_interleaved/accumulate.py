@@ -230,10 +230,13 @@ def _accumulate_run_chunk(
     tts_continue_id: int,
     dtype: type,
     tmp_dir: str,
+    seq_threshold: int | None = None,
 ) -> dict[str, dict]:
     """Process a contiguous range of runs for accumulate mode.
 
     Reads Arrow / run arrays from module-level globals (inherited via fork COW).
+    When *seq_threshold* is set, sequences are routed to ``stage2/`` or ``lct/``
+    subdirectories based on whether their length exceeds the threshold.
     """
     audio_arrow = _shared_audio_arrow
     text_arrow = _shared_text_arrow
@@ -241,14 +244,38 @@ def _accumulate_run_chunk(
     run_lengths_arr = _shared_run_lengths
     transcribe_only_runs = _shared_transcribe_only_runs
 
+    # Build output keys: with routing, each key gets stage2/ and lct/ variants
+    if seq_threshold is not None:
+        buckets = ["stage2", "lct"]
+    else:
+        buckets = [None]
+
     builders: dict[str, IndexedDatasetBuilder] = {}
     counters: dict[str, dict[str, int]] = {}
+    shard_prefixes: dict[str, str] = {}
     for key in all_keys:
-        shard_prefix = f"{tmp_dir}/{key}_shard{worker_id:04d}"
-        builders[key] = IndexedDatasetBuilder(
-            get_bin_path(shard_prefix), dtype=dtype,
-        )
-        counters[key] = {"seqs": 0, "tokens": 0}
+        for bucket in buckets:
+            if bucket is not None:
+                bkey = f"{bucket}/{key}"
+                shard_prefix = f"{tmp_dir}/{bucket}_{key}_shard{worker_id:04d}"
+            else:
+                bkey = key
+                shard_prefix = f"{tmp_dir}/{key}_shard{worker_id:04d}"
+            builders[bkey] = IndexedDatasetBuilder(
+                get_bin_path(shard_prefix), dtype=dtype,
+            )
+            counters[bkey] = {"seqs": 0, "tokens": 0}
+            shard_prefixes[bkey] = shard_prefix
+
+    # Pre-compute routed keys to avoid per-sequence f-string allocation
+    if seq_threshold is not None:
+        _routed_stage2 = {k: f"stage2/{k}" for k in all_keys}
+        _routed_lct = {k: f"lct/{k}" for k in all_keys}
+        def _route_key(base_key: str, seq_len: int) -> str:
+            return _routed_stage2[base_key] if seq_len <= seq_threshold else _routed_lct[base_key]
+    else:
+        def _route_key(base_key: str, seq_len: int) -> str:
+            return base_key
 
     for r in range(run_start, run_end):
         rs = int(run_starts_arr[r])
@@ -266,10 +293,11 @@ def _accumulate_run_chunk(
                 seq.extend(run_text[c])
                 seq.append(eos_id)
 
-                builders[TR_KEY].add_item(seq)
-                builders[TR_KEY].end_document()
-                counters[TR_KEY]["seqs"] += 1
-                counters[TR_KEY]["tokens"] += len(seq)
+                rk = _route_key(TR_KEY, len(seq))
+                builders[rk].add_item(seq)
+                builders[rk].end_document()
+                counters[rk]["seqs"] += 1
+                counters[rk]["tokens"] += len(seq)
             continue
 
         if rl == 1:
@@ -280,10 +308,11 @@ def _accumulate_run_chunk(
             seq.extend(run_text[0])
             seq.append(eos_id)
 
-            builders[TR_KEY].add_item(seq)
-            builders[TR_KEY].end_document()
-            counters[TR_KEY]["seqs"] += 1
-            counters[TR_KEY]["tokens"] += len(seq)
+            rk = _route_key(TR_KEY, len(seq))
+            builders[rk].add_item(seq)
+            builders[rk].end_document()
+            counters[rk]["seqs"] += 1
+            counters[rk]["tokens"] += len(seq)
             continue
 
         # Multi-clip run → accumulate for each direction
@@ -296,10 +325,11 @@ def _accumulate_run_chunk(
                 bos_id, eos_id, stt_continue_id, tts_continue_id,
             )
             for seq in sequences:
-                builders[direction].add_item(seq)
-                builders[direction].end_document()
-                counters[direction]["seqs"] += 1
-                counters[direction]["tokens"] += len(seq)
+                rk = _route_key(direction, len(seq))
+                builders[rk].add_item(seq)
+                builders[rk].end_document()
+                counters[rk]["seqs"] += 1
+                counters[rk]["tokens"] += len(seq)
 
             all_single_indices.update(single_indices)
 
@@ -311,22 +341,22 @@ def _accumulate_run_chunk(
             seq.extend(run_text[idx])
             seq.append(eos_id)
 
-            builders[TR_KEY].add_item(seq)
-            builders[TR_KEY].end_document()
-            counters[TR_KEY]["seqs"] += 1
-            counters[TR_KEY]["tokens"] += len(seq)
+            rk = _route_key(TR_KEY, len(seq))
+            builders[rk].add_item(seq)
+            builders[rk].end_document()
+            counters[rk]["seqs"] += 1
+            counters[rk]["tokens"] += len(seq)
 
     # Save sidecar .npy files, close .bin
     result: dict[str, dict] = {}
-    for key in all_keys:
-        b = builders[key]
+    for bkey, b in builders.items():
         b.data_file.close()
-        shard_prefix = f"{tmp_dir}/{key}_shard{worker_id:04d}"
+        shard_prefix = shard_prefixes[bkey]
         np.save(f"{shard_prefix}_seqlens.npy", np.array(b.sequence_lengths, dtype=np.int32))
         np.save(f"{shard_prefix}_docidx.npy", np.array(b.document_indices, dtype=np.int64))
-        result[key] = {
-            "seqs": counters[key]["seqs"],
-            "tokens": counters[key]["tokens"],
+        result[bkey] = {
+            "seqs": counters[bkey]["seqs"],
+            "tokens": counters[bkey]["tokens"],
             "shard_prefix": shard_prefix,
         }
 
@@ -487,6 +517,7 @@ def _dry_run_accumulate(
     dtype: type,
     parquet_dir: Path,
     transcribe_ratio: float | None = None,
+    seq_threshold: int | None = None,
 ) -> None:
     """Compute and print accumulate-mode statistics without materializing tokens."""
     import polars as pl
@@ -658,6 +689,19 @@ def _dry_run_accumulate(
         for line in format_distribution(combined_sl, indent="    "):
             print(line)
 
+    # Stage2 / LCT routing summary
+    if seq_threshold is not None and len(combined_sl) > 0:
+        stage2_mask = combined_sl <= seq_threshold
+        lct_mask = ~stage2_mask
+        s2_seqs = int(stage2_mask.sum())
+        lct_seqs = int(lct_mask.sum())
+        s2_toks = int(combined_sl[stage2_mask].sum())
+        lct_toks = int(combined_sl[lct_mask].sum())
+        print(f"\n  {'─' * 50}")
+        print(f"  ROUTING (seq_threshold = {seq_threshold:,})")
+        print(f"    stage2: {s2_seqs:>12,} seqs  {s2_toks:>14,} tokens ({100*s2_toks/(s2_toks+lct_toks):.1f}%)")
+        print(f"    lct:    {lct_seqs:>12,} seqs  {lct_toks:>14,} tokens ({100*lct_toks/(s2_toks+lct_toks):.1f}%)")
+
     print(f"\n  Sources: {n_sources:,}  |  Time: {elapsed:.1f}s")
     print("=" * 70)
 
@@ -759,6 +803,13 @@ def main() -> None:
         "is met.",
     )
     parser.add_argument(
+        "--seq-threshold",
+        type=int,
+        default=None,
+        help="Sequence length threshold for routing. Sequences <= threshold "
+        "go to stage2/, longer to lct/. If not set, no routing.",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=0,
@@ -813,6 +864,7 @@ def main() -> None:
             bos_id, eos_id, stt_continue_id, stt_transcribe_id,
             tts_continue_id, dtype, parquet_dir,
             transcribe_ratio=transcribe_ratio,
+            seq_threshold=args.seq_threshold,
         )
         return
 
@@ -853,6 +905,10 @@ def main() -> None:
     # 5. Collect all output keys
     # ------------------------------------------------------------------
     all_keys: list[str] = list(DIRECTIONS) + [TR_KEY]
+    if args.seq_threshold is not None:
+        # Create output subdirectories for routing
+        (output_dir / "stage2").mkdir(parents=True, exist_ok=True)
+        (output_dir / "lct").mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # 6. Determine worker count
@@ -908,6 +964,7 @@ def main() -> None:
                 tts_continue_id,
                 dtype,
                 str(tmp_dir),
+                args.seq_threshold,
             )
             for wid, rng in enumerate(run_ranges)
         ]
@@ -920,7 +977,11 @@ def main() -> None:
         print(f"\nWorkers finished in {elapsed:.1f}s")
 
         t_merge = time.time()
-        counters = _merge_shards(worker_results, all_keys, output_dir, dtype, tmp_dir)
+        if args.seq_threshold is not None:
+            merge_keys = [f"{bucket}/{k}" for bucket in ("stage2", "lct") for k in all_keys]
+        else:
+            merge_keys = all_keys
+        counters = _merge_shards(worker_results, merge_keys, output_dir, dtype, tmp_dir)
         print(f"Merged shards in {time.time() - t_merge:.1f}s")
 
         shutil.rmtree(tmp_dir)
@@ -954,7 +1015,7 @@ def main() -> None:
         "outputs": {},
     }
 
-    for key in all_keys:
+    for key in sorted(counters.keys()):
         c = counters[key]
         metadata["outputs"][key] = {
             "sequences": c["seqs"],

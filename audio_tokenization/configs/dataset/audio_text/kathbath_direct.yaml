@@ -1,0 +1,10 @@
+# Kathbath direct — audio-text tokenization.
+# ~1420h, 12 Indic languages, read-aloud speech.
+
+dataset_name: kathbath
+output_name: kathbath
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/kathbath_v2
+
+num_buckets: 80

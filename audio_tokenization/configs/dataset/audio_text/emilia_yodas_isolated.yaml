@@ -2,7 +2,6 @@
 
 dataset_name: emilia_yodas
 output_name: emilia_yodas_isolated
-clip_id_parser: universal
 
 shar_dir:
   - /iopsstor/scratch/cscs/xyixuan/audio-datasets/emilia_yodas_isolated_shar

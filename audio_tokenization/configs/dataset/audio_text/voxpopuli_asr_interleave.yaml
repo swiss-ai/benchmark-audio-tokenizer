@@ -1,0 +1,32 @@
+# Granary VoxPopuli ASR interleaved — audio-text tokenization.
+# ~359Kh, 23 languages, European Parliament speech.
+
+dataset_name: voxpopuli_asr
+output_name: voxpopuli_asr_interleave
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/bg
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/cs
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/da
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/de
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/el
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/en
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/es
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/et
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/fi
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/fr
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/hr
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/hu
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/it
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/lt
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/lv
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/mt
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/nl
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/pl
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/pt
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/ro
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/sk
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/sl
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/voxpopuli_asr/sv
+
+num_buckets: 80

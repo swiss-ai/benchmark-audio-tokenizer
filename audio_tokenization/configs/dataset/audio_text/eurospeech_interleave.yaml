@@ -1,0 +1,10 @@
+# EuroSpeech interleaved — audio-text tokenization.
+# ~14.6Kh, 5 European languages, parliamentary speech, ~4.5 clips/run (10s gap).
+
+dataset_name: eurospeech
+output_name: eurospeech_interleave
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/eurospeech
+
+num_buckets: 80

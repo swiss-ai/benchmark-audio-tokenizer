@@ -1,0 +1,10 @@
+# CommonVoice 24.0 direct — audio-text tokenization.
+# ~8Kh, 47 languages, crowd-sourced read-aloud speech.
+
+dataset_name: commonvoice
+output_name: commonvoice_48lang
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/commonvoice
+
+num_buckets: 80

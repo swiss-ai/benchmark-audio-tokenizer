@@ -1,7 +1,6 @@
 # CommonVoice ca/de/en/fr/it/pt/zh-CN train — audio-text tokenization.
 dataset_name: commonvoice
 output_name: commonvoice_ca_de_en_fr_it_pt_zh-CN_train
-clip_id_parser: universal
 
 # Pre-built Shar directories
 shar_dir:

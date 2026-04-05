@@ -1,0 +1,7 @@
+dataset_name: audiocite
+output_name: audiocite
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/audiocite_processed
+
+num_buckets: 20

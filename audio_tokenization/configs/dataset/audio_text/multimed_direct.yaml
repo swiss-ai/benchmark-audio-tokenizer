@@ -1,0 +1,7 @@
+dataset_name: multimed
+output_name: multimed
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/multimed
+
+num_buckets: 20

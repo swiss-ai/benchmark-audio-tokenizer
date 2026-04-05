@@ -1,0 +1,10 @@
+# MLS (Multilingual LibriSpeech) 7 languages — audio-text interleaved tokenization.
+# ~44Kh, audiobook readings (no English — overlaps with LibriHeavy).
+
+dataset_name: mls
+output_name: mls_7lang_interleave
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/mls_v2
+
+num_buckets: 80
