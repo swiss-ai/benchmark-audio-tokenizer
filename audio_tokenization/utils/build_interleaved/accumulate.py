@@ -78,6 +78,26 @@ _shared_run_starts = None
 _shared_run_lengths = None
 _shared_transcribe_only_runs: set[int] = set()
 
+
+class _LazyArrowList:
+    """Lazy list-like wrapper around an Arrow chunked array slice.
+
+    Converts one element at a time via ``as_py()`` on access instead of
+    materializing the entire slice upfront with ``to_pylist()``.
+    Reduces peak memory for long runs.
+    """
+    __slots__ = ("_arr",)
+
+    def __init__(self, arr):
+        self._arr = arr
+
+    def __getitem__(self, idx):
+        return self._arr[idx].as_py()
+
+    def __len__(self):
+        return len(self._arr)
+
+
 # Both directions are always produced (separate bin/idx each).
 DIRECTIONS = ["AT", "TA"]
 
@@ -281,8 +301,12 @@ def _accumulate_run_chunk(
         rs = int(run_starts_arr[r])
         rl = int(run_lengths_arr[r])
 
-        run_audio: list[list[int]] = audio_arrow[rs : rs + rl].to_pylist()
-        run_text: list[list[int]] = text_arrow[rs : rs + rl].to_pylist()
+        # Lazy per-clip conversion: avoid materializing all clips upfront.
+        # Arrow slices are cheap; .as_py() converts one list at a time.
+        _audio_slice = audio_arrow[rs : rs + rl]
+        _text_slice = text_arrow[rs : rs + rl]
+        run_audio = _LazyArrowList(_audio_slice)
+        run_text = _LazyArrowList(_text_slice)
 
         # Ratio-adjusted: convert entire run to individual transcribe seqs
         if r in transcribe_only_runs:
