@@ -834,6 +834,14 @@ def main() -> None:
         "go to stage2/, longer to lct/. If not set, no routing.",
     )
     parser.add_argument(
+        "--tmp-dir",
+        type=str,
+        default=None,
+        help="Directory for temporary shard files during build. "
+        "Defaults to output_dir/_tmp_shards. Use fast node-local "
+        "storage (e.g. /tmp) for best performance.",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=0,
@@ -970,7 +978,10 @@ def main() -> None:
             )
             counters[key] = {"seqs": 0, "tokens": 0}
     else:
-        tmp_dir = output_dir / "_tmp_shards"
+        if args.tmp_dir:
+            tmp_dir = Path(args.tmp_dir) / f"_greedy_shards_{os.getpid()}"
+        else:
+            tmp_dir = output_dir / "_tmp_shards"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         worker_args = [
@@ -995,20 +1006,21 @@ def main() -> None:
 
         t0 = time.time()
         ctx = multiprocessing.get_context("fork")
-        with ctx.Pool(actual_workers) as pool:
-            worker_results = pool.starmap(_accumulate_run_chunk, worker_args)
-        elapsed = time.time() - t0
-        print(f"\nWorkers finished in {elapsed:.1f}s")
+        try:
+            with ctx.Pool(actual_workers) as pool:
+                worker_results = pool.starmap(_accumulate_run_chunk, worker_args)
+            elapsed = time.time() - t0
+            print(f"\nWorkers finished in {elapsed:.1f}s")
 
-        t_merge = time.time()
-        if args.seq_threshold is not None:
-            merge_keys = [f"{bucket}/{k}" for bucket in ("stage2", "lct") for k in all_keys]
-        else:
-            merge_keys = all_keys
-        counters = _merge_shards(worker_results, merge_keys, output_dir, dtype, tmp_dir)
-        print(f"Merged shards in {time.time() - t_merge:.1f}s")
-
-        shutil.rmtree(tmp_dir)
+            t_merge = time.time()
+            if args.seq_threshold is not None:
+                merge_keys = [f"{bucket}/{k}" for bucket in ("stage2", "lct") for k in all_keys]
+            else:
+                merge_keys = all_keys
+            counters = _merge_shards(worker_results, merge_keys, output_dir, dtype, tmp_dir)
+            print(f"Merged shards in {time.time() - t_merge:.1f}s")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     _shared_audio_arrow = None
     _shared_text_arrow = None

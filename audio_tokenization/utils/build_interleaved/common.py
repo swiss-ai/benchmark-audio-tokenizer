@@ -205,14 +205,7 @@ def _merge_shards(
                 shard_prefixes.append(info["shard_prefix"])
 
         if not shard_prefixes:
-            # No data for this key — write empty files
-            open(get_bin_path(str(output_dir / key)), "wb").close()
-            _write_idx_file(
-                get_idx_path(str(output_dir / key)),
-                dtype,
-                np.array([], dtype=np.int32),
-                np.array([0], dtype=np.int64),
-            )
+            # No data for this key — skip instead of writing empty files
             continue
 
         # Concatenate .bin shards
@@ -320,12 +313,24 @@ def format_distribution(arr: np.ndarray, indent: str = "    ") -> list[str]:
 
 
 def load_parquets(parquet_dir: Path) -> pl.DataFrame:
-    """Glob rank_*_chunk_*.parquet, read columns, print stats."""
+    """Load token parquets from a cache directory.
+
+    Prefer the original tokenization cache naming scheme
+    ``rank_*_chunk_*.parquet``. If none are present, fall back to any
+    ``*.parquet`` files in the directory so repartitioned caches such as
+    per-language ``part_*.parquet`` layouts remain compatible.
+    """
     parquet_files = sorted(
         p
         for p in parquet_dir.glob("rank_*_chunk_*.parquet")
         if not p.name.endswith(".tmp")
     )
+    if not parquet_files:
+        parquet_files = sorted(
+            p
+            for p in parquet_dir.glob("*.parquet")
+            if not p.name.endswith(".tmp")
+        )
     print(f"\nFound {len(parquet_files)} parquet files in {parquet_dir}")
 
     t0 = time.time()

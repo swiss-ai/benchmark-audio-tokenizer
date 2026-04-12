@@ -29,7 +29,7 @@ filter:
   min_duration: 1.0
   max_duration: 200.0
   min_sample_rate: 16000
-  min_rms_db: -40                # drop clips quieter than -40 dB (near-silence)
+  min_rms_db: -50                # drop clips quieter than -50 dB (normalization handles quiet-but-audible)
   normalize_rms_db: -3           # peak normalize to -3 dBFS (matches WavTokenizer training)
 
 # Resume

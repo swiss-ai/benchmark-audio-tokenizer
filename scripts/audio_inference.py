@@ -56,7 +56,7 @@ def load_special_token_ids(tokenizer, tokenizer_path: str) -> dict[str, int]:
     """Load audio structure token IDs from the mapping file (single source of truth)."""
     from audio_tokenization.utils.token_mapping import get_structure_tokens
 
-    required = ["audio_start", "audio_end", "stt_transcribe", "stt_continue", "tts_continue"]
+    required = ["audio_start", "audio_end", "stt_transcribe", "stt_continue", "tts_continue", "stt_translate"]
     st = get_structure_tokens(tokenizer_path, required=required)
     return {key: st[key] for key in required}
 
@@ -79,6 +79,8 @@ def build_prompt(
         prompt.append(special_ids["stt_transcribe"])
     elif task == "continue":
         prompt.append(special_ids["stt_continue"])
+    elif task == "translate":
+        prompt.append(special_ids["stt_translate"])
 
     return prompt
 
@@ -192,18 +194,23 @@ def load_wav_dir_dataset(wav_dir: str, num_samples: int):
     audio_files.sort()
     print(f"  Found {len(audio_files)} audio files")
 
-    # Optional metadata for ground-truth text
+    # Optional metadata for ground-truth text (and optional dataset column)
     meta_path = os.path.join(wav_dir, "metadata.tsv")
     text_map: dict[str, str] = {}
+    dataset_map: dict[str, str] = {}
     if os.path.isfile(meta_path):
         with open(meta_path) as f:
+            header = f.readline().strip().split("\t")
+            has_dataset_col = len(header) >= 3 and header[2] == "dataset"
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("filename"):
+                if not line:
                     continue
-                parts = line.split("\t", 1)
-                if len(parts) == 2:
+                parts = line.split("\t")
+                if len(parts) >= 2:
                     text_map[parts[0]] = parts[1]
+                if has_dataset_col and len(parts) >= 3:
+                    dataset_map[parts[0]] = parts[2]
         print(f"  Loaded metadata for {len(text_map)} files")
 
     n = min(num_samples, len(audio_files))
@@ -217,6 +224,7 @@ def load_wav_dir_dataset(wav_dir: str, num_samples: int):
             "sr": sr,
             "text": text_map.get(fname, ""),
             "id": sample_id,
+            "dataset": dataset_map.get(fname, ""),
         })
 
     print(f"  Loaded {len(samples)} samples")
@@ -251,7 +259,7 @@ def main() -> None:
              "Optionally include metadata.tsv (filename<TAB>text) for ground truth.",
     )
     parser.add_argument(
-        "--task", type=str, choices=["transcribe", "continue"],
+        "--task", type=str, choices=["transcribe", "continue", "translate"],
         default="transcribe",
     )
     parser.add_argument("--num-samples", type=int, default=5)
@@ -270,6 +278,8 @@ def main() -> None:
                              "Auto-derived from --audio-dir/--parquet-dir basename if not specified.")
     parser.add_argument("--output-file", type=str, default=None,
                         help="Path to save results as JSON. Auto-generated if not specified.")
+    parser.add_argument("--no-normalize", action="store_true",
+                        help="Skip peak normalization (-3 dBFS).")
     args = parser.parse_args()
 
     tokenizer_path = args.tokenizer_path or args.model_path
@@ -284,7 +294,7 @@ def main() -> None:
     special_ids = load_special_token_ids(tokenizer, tokenizer_path)
     print(f"  bos={bos_id}  eos={eos_id}")
     print(f"  audio_start={special_ids['audio_start']}  audio_end={special_ids['audio_end']}")
-    print(f"  stt_transcribe={special_ids['stt_transcribe']}  stt_continue={special_ids['stt_continue']}  tts_continue={special_ids['tts_continue']}")
+    print(f"  stt_transcribe={special_ids['stt_transcribe']}  stt_continue={special_ids['stt_continue']}  tts_continue={special_ids['tts_continue']}  stt_translate={special_ids['stt_translate']}")
 
     # ------------------------------------------------------------------
     # 2. Load model
@@ -307,6 +317,7 @@ def main() -> None:
                 "vLLM backend requested but vllm is not installed. "
                 "Install it or run with --backend transformers."
             ) from e
+        os.environ["VLLM_USE_V1"] = "0"
         model = LLM(
             model=args.model_path,
             tokenizer=tokenizer_path,
@@ -381,6 +392,7 @@ def main() -> None:
         sr = sample["sr"]
         ground_truth = sample["text"]
         sample_id = sample["id"]
+        sample_dataset = sample.get("dataset", "")
 
         audio_tensor = torch.from_numpy(audio_array).float()
         if audio_tensor.dim() == 1:
@@ -404,6 +416,12 @@ def main() -> None:
             audio_24k = resampler(audio_tensor)
         else:
             audio_24k = audio_tensor
+
+        # Peak normalize to -3 dBFS (matches tokenization pipeline)
+        if not args.no_normalize:
+            peak = audio_24k.abs().max().clamp(min=1e-10)
+            target_peak = 10 ** (-3.0 / 20.0)
+            audio_24k = audio_24k * (target_peak / peak)
 
         # Encode with WavTokenizer
         with torch.no_grad():
@@ -457,8 +475,8 @@ def main() -> None:
         )
         n_text_out = n_new - n_audio_out
 
-        # For transcribe, the text is ground truth; for continue, it's the audio prompt
-        ref_label = "audio_prompt" if args.task == "continue" else "ground_truth"
+        # Name the model output based on the task
+        output_label = {"transcribe": "transcription", "continue": "continuation", "translate": "translation"}[args.task]
 
         result = {
             "sample_idx": i,
@@ -470,17 +488,19 @@ def main() -> None:
             "text_tokens": n_text_out,
             "audio_tokens_out": n_audio_out,
             "gen_time_s": round(gen_time, 2),
-            "text_output": text_output,
-            ref_label: ground_truth,
+            output_label: text_output,
+            "ground_truth": ground_truth,
         }
+        if sample_dataset:
+            result["dataset"] = sample_dataset
         results.append(result)
 
         print(f"\n--- Sample {i} (id={sample_id}) ---")
         print(f"  Duration: {duration_s:.2f}s | Audio codes: {len(codes)} | Prompt tokens: {len(prompt_ids)}")
         print(f"  Generated: {n_new} tokens ({n_text_out} text, {n_audio_out} audio) in {gen_time:.2f}s")
         if ground_truth:
-            print(f"  {ref_label.replace('_', ' ').title()}: {ground_truth[:200]}")
-        print(f"  Prediction:   {text_output}")
+            print(f"  Ground Truth: {ground_truth[:200]}")
+        print(f"  {output_label.title()}: {text_output}")
         print()
 
     # ------------------------------------------------------------------
