@@ -41,6 +41,44 @@ from .data import build_cutset
 logger = logging.getLogger(__name__)
 
 
+def _build_sampler_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Build DynamicBucketingSampler kwargs from config."""
+    sampler_kwargs = dict(
+        max_duration=cfg.get("max_batch_duration", 1500.0),
+        num_buckets=cfg.get("num_buckets", 20),
+        buffer_size=cfg.get("bucket_buffer_size", 20000),
+        shuffle=cfg.get("sampler_shuffle", True),
+        seed=cfg.get("sampler_seed", 42),
+        world_size=1,
+        rank=0,
+        drop_last=False,
+    )
+
+    max_cuts = cfg.get("max_batch_cuts")
+    if max_cuts is not None:
+        sampler_kwargs["max_cuts"] = max_cuts
+
+    quadratic_duration = cfg.get("quadratic_duration")
+    if quadratic_duration is not None:
+        sampler_kwargs["quadratic_duration"] = quadratic_duration
+
+    duration_bins = cfg.get("duration_bins")
+    if duration_bins is not None:
+        sampler_kwargs["duration_bins"] = list(duration_bins)
+
+    num_cuts_for_bins_estimate = cfg.get("num_cuts_for_bins_estimate")
+    if num_cuts_for_bins_estimate is not None:
+        sampler_kwargs["num_cuts_for_bins_estimate"] = int(num_cuts_for_bins_estimate)
+
+    if "sampler_concurrent" in cfg:
+        sampler_kwargs["concurrent"] = bool(cfg.get("sampler_concurrent"))
+
+    if "sampler_sync_buckets" in cfg:
+        sampler_kwargs["sync_buckets"] = bool(cfg.get("sampler_sync_buckets"))
+
+    return sampler_kwargs
+
+
 def _normalize_batch(batch: dict, target_db: float, device: str = "cpu") -> dict:
     """Peak-normalize audio in a batch dict (works for all handler modes).
 
@@ -94,29 +132,10 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     #    at the shard level (see data.py), so the sampler uses
     #    world_size=1 to avoid the O(world_size) strided distribution.
     # ------------------------------------------------------------------
-    max_duration = cfg.get("max_batch_duration", 1500.0)
-    max_cuts = cfg.get("max_batch_cuts")
-    num_buckets = cfg.get("num_buckets", 20)
-    buffer_size = cfg.get("bucket_buffer_size", 20000)
-    shuffle = cfg.get("sampler_shuffle", True)
-    seed = cfg.get("sampler_seed", 42)
-    quadratic_duration = cfg.get("quadratic_duration")
-
-    sampler_kwargs = dict(
-        max_duration=max_duration,
-        num_buckets=num_buckets,
-        buffer_size=buffer_size,
-        shuffle=shuffle,
-        seed=seed,
-        world_size=1,
-        rank=0,
-        drop_last=False,
-    )
-    if max_cuts is not None:
-        sampler_kwargs["max_cuts"] = max_cuts
-    if quadratic_duration is not None:
-        sampler_kwargs["quadratic_duration"] = quadratic_duration
-
+    sampler_kwargs = _build_sampler_kwargs(cfg)
+    max_duration = sampler_kwargs["max_duration"]
+    num_buckets = sampler_kwargs["num_buckets"]
+    buffer_size = sampler_kwargs["buffer_size"]
     sampler = DynamicBucketingSampler(cuts, **sampler_kwargs)
 
     # ------------------------------------------------------------------
@@ -161,6 +180,15 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     num_workers = min(cfg.get("num_workers", 4), max_workers)
     prefetch_factor = cfg.get("prefetch_factor", 4)
     dataloader_timeout = cfg.get("dataloader_timeout", 300)  # 5 min default
+    worker_init_fn = None
+    if num_workers > 0:
+        from lhotse.dataset.dataloading import make_worker_init_fn
+
+        worker_init_fn = make_worker_init_fn(
+            rank=rank,
+            world_size=world_size,
+            seed=cfg.get("sampler_seed", 42),
+        )
 
     dataset = handler.create_dataset()
     dataloader = torch.utils.data.DataLoader(
@@ -172,6 +200,7 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
         persistent_workers=num_workers > 0,
         pin_memory=True,
         timeout=dataloader_timeout if num_workers > 0 else 0,
+        worker_init_fn=worker_init_fn,
     )
 
     # ------------------------------------------------------------------
@@ -284,6 +313,7 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
                 _t_start.record()
 
             try:
+                _host_process_start = _time.monotonic()
                 # Normalize audio volume before tokenization (all modes).
                 if normalize_rms_db is not None:
                     batch = _normalize_batch(batch, normalize_rms_db, device)
@@ -299,6 +329,7 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
                     _t_encode_end.record()
 
                 total_audio_seconds += batch_audio_secs
+                _process_batch_wall_ms = (_time.monotonic() - _host_process_start) * 1000
                 consecutive_errors = 0  # reset on batch success
 
             except Exception as batch_err:
@@ -345,6 +376,7 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
                         "timing/dataloader_wait_ms": _dataloader_wait_ms,
                         "timing/tokenize_wall_ms": tokenize_wall_ms,
                         "timing/tokenize_gpu_ms": tokenize_gpu_ms,
+                        "timing/process_batch_wall_ms": _process_batch_wall_ms,
                         "memory/rss_gb": _get_rss_gb(),
                         "memory/cuda_alloc_gb": torch.cuda.memory_allocated() / (1024 ** 3),
                         "memory/cuda_reserved_gb": torch.cuda.memory_reserved() / (1024 ** 3),

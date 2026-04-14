@@ -13,6 +13,9 @@ variable-length *accumulate* mode:
 
 from __future__ import annotations
 
+import json
+import os
+import resource
 import shutil
 import struct
 import time
@@ -51,6 +54,9 @@ __all__ = [
     "_partition_runs",
     "load_parquets",
     "prepare_arrow_and_runs",
+    "load_interleave_cache",
+    "prepare_interleave_cache_and_runs",
+    "prepare_length_metadata",
     "compute_ratio_adjustment",
     "_LazyArrowList",
 ]
@@ -77,6 +83,226 @@ class _LazyArrowList:
 
     def __len__(self):
         return len(self._arr)
+
+
+class _TokenRunView:
+    """Lazy list-like view over token sequences in a prepared cache."""
+
+    __slots__ = ("_accessor", "_start", "_length")
+
+    def __init__(self, accessor, start: int, length: int):
+        self._accessor = accessor
+        self._start = start
+        self._length = length
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(self._length)
+            if step != 1:
+                return [self._accessor.get(self._start + i) for i in range(start, stop, step)]
+            return _TokenRunView(self._accessor, self._start + start, stop - start)
+        if idx < 0:
+            idx += self._length
+        if idx < 0 or idx >= self._length:
+            raise IndexError(idx)
+        return self._accessor.get(self._start + idx)
+
+    def __len__(self):
+        return self._length
+
+    def to_pylist(self) -> list[list[int]]:
+        return [self._accessor.get(self._start + i) for i in range(self._length)]
+
+
+class _ArrowTokenAccessor:
+    __slots__ = ("_arr", "_lengths")
+
+    def __init__(self, arr):
+        import pyarrow.compute as pc
+
+        self._arr = arr
+        self._lengths = pc.list_value_length(arr).to_numpy()
+
+    def get(self, idx: int) -> list[int]:
+        return self._arr[idx].as_py()
+
+    def slice(self, start: int, length: int) -> _TokenRunView:
+        return _TokenRunView(self, start, length)
+
+    @property
+    def lengths(self) -> np.ndarray:
+        return self._lengths
+
+
+class _MemmapTokenAccessor:
+    __slots__ = ("_mmaps", "_chunk_indices", "_starts", "_lengths")
+
+    def __init__(
+        self,
+        mmaps: list[np.memmap],
+        chunk_indices: np.ndarray,
+        starts: np.ndarray,
+        lengths: np.ndarray,
+    ):
+        self._mmaps = mmaps
+        self._chunk_indices = chunk_indices
+        self._starts = starts
+        self._lengths = lengths
+
+    def get(self, idx: int) -> list[int]:
+        chunk_idx = int(self._chunk_indices[idx])
+        start = int(self._starts[idx])
+        length = int(self._lengths[idx])
+        return self._mmaps[chunk_idx][start:start + length].tolist()
+
+    def slice(self, start: int, length: int) -> _TokenRunView:
+        return _TokenRunView(self, start, length)
+
+    @property
+    def lengths(self) -> np.ndarray:
+        return self._lengths
+
+
+class PreparedInterleaveCache:
+    __slots__ = ("audio", "text")
+
+    def __init__(self, audio, text):
+        self.audio = audio
+        self.text = text
+
+    @property
+    def audio_lengths(self) -> np.ndarray:
+        return self.audio.lengths
+
+    @property
+    def text_lengths(self) -> np.ndarray:
+        return self.text.lengths
+
+
+class _V1InterleaveCacheReader:
+    def __init__(self, parquet_dir: Path):
+        self.parquet_dir = parquet_dir
+        self.parquet_files = sorted(
+            p
+            for p in parquet_dir.glob("rank_*_chunk_*.parquet")
+            if not p.name.endswith(".tmp")
+        )
+        if not self.parquet_files:
+            self.parquet_files = sorted(
+                p
+                for p in parquet_dir.glob("*.parquet")
+                if not p.name.endswith(".tmp")
+            )
+
+    def load_metadata(self) -> pl.DataFrame:
+        return pl.read_parquet(
+            self.parquet_files,
+            columns=["source_id", "clip_num", "audio_tokens", "text_tokens"],
+        )
+
+    def prepare(self, sorted_df: pl.DataFrame) -> PreparedInterleaveCache:
+        _audio_raw = sorted_df["audio_tokens"].to_arrow()
+        _text_raw = sorted_df["text_tokens"].to_arrow()
+        audio_arrow = _audio_raw.combine_chunks() if isinstance(_audio_raw, pa.ChunkedArray) else _audio_raw
+        text_arrow = _text_raw.combine_chunks() if isinstance(_text_raw, pa.ChunkedArray) else _text_raw
+        del _audio_raw, _text_raw
+        return PreparedInterleaveCache(
+            _ArrowTokenAccessor(audio_arrow),
+            _ArrowTokenAccessor(text_arrow),
+        )
+
+
+class _V2InterleaveCacheReader:
+    def __init__(self, cache_dir: Path, layout: dict[str, object]):
+        self.cache_dir = cache_dir
+        self.layout = layout
+        self.chunks: list[tuple[Path, Path, Path]] = []
+        for rank_dir in sorted(p for p in cache_dir.glob("rank_*") if p.is_dir()):
+            for clips_path in sorted(rank_dir.glob("clips.*.parquet")):
+                stem = clips_path.name.split(".")[1]
+                audio_path = rank_dir / f"audio_tokens.{stem}.bin"
+                text_path = rank_dir / f"text_tokens.{stem}.bin"
+                if not audio_path.exists() or not text_path.exists():
+                    raise RuntimeError(
+                        f"Incomplete v2 structured cache chunk under {rank_dir}: "
+                        f"{clips_path.name} missing token bins"
+                    )
+                self.chunks.append((clips_path, audio_path, text_path))
+
+    def load_metadata(self) -> pl.DataFrame:
+        parts: list[pl.DataFrame] = []
+        for chunk_idx, (clips_path, _audio_path, _text_path) in enumerate(self.chunks):
+            part = pl.read_parquet(
+                clips_path,
+                columns=[
+                    "source_id",
+                    "clip_num",
+                    "audio_token_offset",
+                    "audio_token_length",
+                    "text_token_offset",
+                    "text_token_length",
+                ],
+            ).with_columns(
+                pl.lit(chunk_idx).alias("_chunk_idx"),
+                (pl.col("audio_token_offset") // np.dtype(np.int32).itemsize).cast(pl.Int64).alias("_audio_token_start"),
+                (pl.col("text_token_offset") // np.dtype(np.int32).itemsize).cast(pl.Int64).alias("_text_token_start"),
+            )
+            parts.append(part)
+        if not parts:
+            return pl.DataFrame(
+                {
+                    "source_id": pl.Series([], dtype=pl.String),
+                    "clip_num": pl.Series([], dtype=pl.Int64),
+                    "audio_token_offset": pl.Series([], dtype=pl.Int64),
+                    "audio_token_length": pl.Series([], dtype=pl.Int32),
+                    "text_token_offset": pl.Series([], dtype=pl.Int64),
+                    "text_token_length": pl.Series([], dtype=pl.Int32),
+                    "_chunk_idx": pl.Series([], dtype=pl.Int32),
+                    "_audio_token_start": pl.Series([], dtype=pl.Int64),
+                    "_text_token_start": pl.Series([], dtype=pl.Int64),
+                }
+            )
+        return pl.concat(parts, how="vertical")
+
+    def _ensure_fd_budget(self) -> None:
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit in (-1, resource.RLIM_INFINITY):
+            return
+
+        required_fds = 2 * len(self.chunks)
+        reserve_fds = 32
+        try:
+            current_open = len(os.listdir("/proc/self/fd"))
+        except OSError:
+            current_open = None
+
+        projected = required_fds + reserve_fds
+        if current_open is not None:
+            projected += current_open
+
+        if projected > soft_limit:
+            current_part = f"current_open={current_open}, " if current_open is not None else ""
+            raise RuntimeError(
+                "Insufficient file descriptor budget for v2 structured cache: "
+                f"{current_part}required_memmaps={required_fds}, reserve={reserve_fds}, "
+                f"soft_limit={soft_limit}. Split planning by partition or raise ulimit -n."
+            )
+
+    def prepare(self, sorted_df: pl.DataFrame) -> PreparedInterleaveCache:
+        self._ensure_fd_budget()
+        audio_mmaps = [np.memmap(audio_path, dtype=np.int32, mode="r") for _clips_path, audio_path, _text_path in self.chunks]
+        text_mmaps = [np.memmap(text_path, dtype=np.int32, mode="r") for _clips_path, _audio_path, text_path in self.chunks]
+
+        chunk_indices = sorted_df["_chunk_idx"].to_numpy()
+        audio_starts = sorted_df["_audio_token_start"].to_numpy()
+        audio_lengths = sorted_df["audio_token_length"].to_numpy()
+        text_starts = sorted_df["_text_token_start"].to_numpy()
+        text_lengths = sorted_df["text_token_length"].to_numpy()
+
+        return PreparedInterleaveCache(
+            _MemmapTokenAccessor(audio_mmaps, chunk_indices, audio_starts, audio_lengths),
+            _MemmapTokenAccessor(text_mmaps, chunk_indices, text_starts, text_lengths),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +561,75 @@ def format_distribution(arr: np.ndarray, indent: str = "    ") -> list[str]:
 # ---------------------------------------------------------------------------
 # Parquet loading & Arrow preparation helpers
 # ---------------------------------------------------------------------------
+
+
+def _load_cache_layout(parquet_dir: Path) -> dict[str, object] | None:
+    layout_path = parquet_dir / "_CACHE_LAYOUT.json"
+    if not layout_path.exists():
+        return None
+    with open(layout_path) as f:
+        return json.load(f)
+
+
+def load_interleave_cache(parquet_dir: Path) -> tuple[pl.DataFrame, object]:
+    """Load interleave cache metadata and return the matching cache reader."""
+    layout = _load_cache_layout(parquet_dir)
+    if layout:
+        version = layout.get("version")
+        if version == "v2":
+            reader = _V2InterleaveCacheReader(parquet_dir, layout)
+            df = reader.load_metadata()
+            print(f"\nFound {len(reader.chunks)} v2 cache chunks in {parquet_dir}")
+            print("Cache layout: v2 (metadata parquet + token bins)")
+            return df, reader
+        raise RuntimeError(
+            f"Unsupported interleave cache layout version at {parquet_dir / '_CACHE_LAYOUT.json'}: {version!r}"
+        )
+
+    reader = _V1InterleaveCacheReader(parquet_dir)
+    print(f"\nFound {len(reader.parquet_files)} parquet files in {parquet_dir}")
+    print("Cache layout: v1 (nested token parquet)")
+    t0 = time.time()
+    df = reader.load_metadata()
+    elapsed = time.time() - t0
+    print(f"Loaded {len(df):,} clips in {elapsed:.1f}s")
+    return df, reader
+
+
+def prepare_length_metadata(df: pl.DataFrame) -> pl.DataFrame:
+    """Return a metadata-only dataframe with token lengths for dry runs/planning."""
+    if "audio_tokens" in df.columns and "text_tokens" in df.columns:
+        return df.with_columns(
+            df["audio_tokens"].list.len().cast(pl.UInt64).alias("_alen"),
+            df["text_tokens"].list.len().cast(pl.UInt64).alias("_tlen"),
+        ).select(["source_id", "clip_num", "_alen", "_tlen"])
+
+    if "audio_token_length" in df.columns and "text_token_length" in df.columns:
+        return df.select(
+            "source_id",
+            "clip_num",
+            pl.col("audio_token_length").cast(pl.UInt64).alias("_alen"),
+            pl.col("text_token_length").cast(pl.UInt64).alias("_tlen"),
+        )
+
+    raise ValueError("Unsupported interleave metadata schema: token lengths not available")
+
+
+def prepare_interleave_cache_and_runs(
+    df: pl.DataFrame,
+    reader,
+) -> tuple[PreparedInterleaveCache, np.ndarray, np.ndarray, int, int]:
+    """Prepare a sorted cache view and run boundaries from interleave metadata."""
+    print("\nDetecting consecutive runs ...")
+    sorted_df, run_starts, run_lengths = _detect_runs(df)
+    n_runs = len(run_starts)
+    print(f"  {n_runs:,} runs")
+
+    n_clips = len(sorted_df)
+    n_sources = sorted_df["source_id"].n_unique()
+    cache = reader.prepare(sorted_df)
+    del sorted_df
+    return cache, run_starts, run_lengths, n_clips, n_sources
 
 
 def load_parquets(parquet_dir: Path) -> pl.DataFrame:

@@ -51,7 +51,9 @@ class AudioTextHandler:
     with text metadata from Lhotse cuts, and writes output in one of two
     formats controlled by ``audio_text_format``:
 
-    - ``interleaved``: Raw audio/text token lists to Parquet (no BOS/EOS).
+    - ``interleaved``: Raw audio/text token cache.
+      ``cache_layout_version=v1`` writes nested-token Parquet, while ``v2``
+      writes metadata Parquet plus flat token bins.
     - ``direct``: Full ``[BOS, audio_start, audio_tokens, audio_end,
       task_token, text_tokens, EOS]`` sequences to Megatron bin/idx.
     """
@@ -67,6 +69,7 @@ class AudioTextHandler:
 
         self.audio_text_format = cfg.get("audio_text_format", "interleaved")
         self.audio_text_task = cfg.get("audio_text_task", "transcribe")
+        self.cache_layout_version = str(cfg.get("cache_layout_version", "v1"))
         if self.audio_text_format not in ("direct", "interleaved"):
             raise ValueError(
                 f"Unsupported audio_text_format: {self.audio_text_format!r}. "
@@ -76,6 +79,11 @@ class AudioTextHandler:
             raise ValueError(
                 f"Unsupported audio_text_task: {self.audio_text_task!r}. "
                 f"Must be one of {list(TASK_TOKEN_MAP)}."
+            )
+        if self.cache_layout_version not in ("v1", "v2"):
+            raise ValueError(
+                f"Unsupported cache_layout_version: {self.cache_layout_version!r}. "
+                "Must be 'v1' or 'v2'."
             )
 
     def create_dataset(self):
@@ -106,7 +114,14 @@ class AudioTextHandler:
             open_chunk_writer(output_dir, rank, chunk_id, self._vocab_size)
 
     def _setup_writer_interleaved(self, output_dir, rank, chunk_id):
+        if self.cache_layout_version == "v2":
+            from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
+
+            self._writer = StructuredCacheChunkWriter(output_dir, rank, chunk_id)
+            return
+
         from audio_tokenization.pipelines.shard_io import ParquetChunkWriter
+
         pdir = Path(output_dir)
         pdir.mkdir(parents=True, exist_ok=True)
         for tmp in pdir.glob(f"rank_{rank:04d}_*.parquet.tmp"):

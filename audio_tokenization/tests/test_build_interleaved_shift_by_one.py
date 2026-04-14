@@ -1,9 +1,27 @@
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
 
 from audio_tokenization.utils.build_interleaved import shift_by_one as sbo
+from audio_tokenization.utils.build_interleaved.common import (
+    load_interleave_cache,
+    prepare_interleave_cache_and_runs,
+)
+from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
+
+
+class _FakeSliceableAccessor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def slice(self, start: int, length: int):
+        return self._rows[start:start + length]
+
+
+class _FakePreparedCache:
+    def __init__(self, audio_rows, text_rows):
+        self.audio = _FakeSliceableAccessor(audio_rows)
+        self.text = _FakeSliceableAccessor(text_rows)
 
 
 def test_shift_by_one_mock_symbols_cover_multiple_interleavings() -> None:
@@ -79,8 +97,7 @@ def test_accumulate_shift_sequences_tracks_leftovers() -> None:
 
 
 def test_shift_run_chunk_emits_offsets_and_transcribe(tmp_path: Path) -> None:
-    sbo._shared_audio_arrow = pa.array([[10], [11], [12]])
-    sbo._shared_text_arrow = pa.array([[20], [21], [22]])
+    sbo._shared_cache = _FakePreparedCache([[10], [11], [12]], [[20], [21], [22]])
     sbo._shared_run_starts = np.array([0], dtype=np.int64)
     sbo._shared_run_lengths = np.array([3], dtype=np.int64)
     sbo._shared_transcribe_only_runs = set()
@@ -102,8 +119,7 @@ def test_shift_run_chunk_emits_offsets_and_transcribe(tmp_path: Path) -> None:
             seq_threshold=None,
         )
     finally:
-        sbo._shared_audio_arrow = None
-        sbo._shared_text_arrow = None
+        sbo._shared_cache = None
         sbo._shared_run_starts = None
         sbo._shared_run_lengths = None
         sbo._shared_transcribe_only_runs = set()
@@ -123,8 +139,7 @@ def test_shift_run_chunk_emits_offsets_and_transcribe(tmp_path: Path) -> None:
 
 
 def test_shift_run_chunk_routes_by_seq_threshold(tmp_path: Path) -> None:
-    sbo._shared_audio_arrow = pa.array([[10], [11]])
-    sbo._shared_text_arrow = pa.array([[20], [21]])
+    sbo._shared_cache = _FakePreparedCache([[10], [11]], [[20], [21]])
     sbo._shared_run_starts = np.array([0], dtype=np.int64)
     sbo._shared_run_lengths = np.array([2], dtype=np.int64)
     sbo._shared_transcribe_only_runs = set()
@@ -146,8 +161,7 @@ def test_shift_run_chunk_routes_by_seq_threshold(tmp_path: Path) -> None:
             seq_threshold=4,
         )
     finally:
-        sbo._shared_audio_arrow = None
-        sbo._shared_text_arrow = None
+        sbo._shared_cache = None
         sbo._shared_run_starts = None
         sbo._shared_run_lengths = None
         sbo._shared_transcribe_only_runs = set()
@@ -158,3 +172,82 @@ def test_shift_run_chunk_routes_by_seq_threshold(tmp_path: Path) -> None:
     assert result["lct/offset_1"]["seqs"] == 0
     assert result["stage2/transcribe"]["seqs"] == 0
     assert result["lct/transcribe"]["seqs"] == 1
+
+
+def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
+    writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, chunk_id=0)
+    writer.add_rows([
+        {
+            "clip_id": "s1@000000",
+            "source_id": "s1",
+            "clip_num": 0,
+            "clip_start": 0.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "a",
+            "text_tokens": [20],
+            "audio_tokens": [10],
+            "dataset": "ds",
+        },
+        {
+            "clip_id": "s1@000001",
+            "source_id": "s1",
+            "clip_num": 1,
+            "clip_start": 1.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "b",
+            "text_tokens": [21],
+            "audio_tokens": [11],
+            "dataset": "ds",
+        },
+        {
+            "clip_id": "s1@000002",
+            "source_id": "s1",
+            "clip_num": 2,
+            "clip_start": 2.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "c",
+            "text_tokens": [22],
+            "audio_tokens": [12],
+            "dataset": "ds",
+        },
+    ])
+    writer.finalize()
+
+    df, reader = load_interleave_cache(tmp_path)
+    cache, starts, lengths, _n_clips, _n_sources = prepare_interleave_cache_and_runs(df, reader)
+
+    sbo._shared_cache = cache
+    sbo._shared_run_starts = starts
+    sbo._shared_run_lengths = lengths
+    sbo._shared_transcribe_only_runs = set()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    try:
+        result = sbo._shift_run_chunk(
+            worker_id=0,
+            run_start=0,
+            run_end=1,
+            all_keys=sbo.OFFSET_KEYS + [sbo.TR_KEY],
+            max_seq_len=100,
+            bos_id=1,
+            eos_id=2,
+            stt_continue_id=99,
+            stt_transcribe_id=98,
+            tts_continue_id=97,
+            dtype=np.int32,
+            tmp_dir=str(out_dir),
+            seq_threshold=None,
+        )
+    finally:
+        sbo._shared_cache = None
+        sbo._shared_run_starts = None
+        sbo._shared_run_lengths = None
+        sbo._shared_transcribe_only_runs = set()
+
+    assert result["offset_0"]["seqs"] == 1
+    assert result["offset_1"]["seqs"] == 1
+    assert result["transcribe"]["seqs"] == 1

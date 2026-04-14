@@ -49,10 +49,10 @@ from .common import (
     compute_ratio_adjustment,
     format_distribution,
     get_bin_path,
-    _LazyArrowList,
-    load_parquets,
+    load_interleave_cache,
     load_token_ids,
-    prepare_arrow_and_runs,
+    prepare_interleave_cache_and_runs,
+    prepare_length_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,8 +60,7 @@ logger = logging.getLogger(__name__)
 OFFSETS = [0, 1]
 OFFSET_KEYS = ["offset_0", "offset_1"]
 
-_shared_audio_arrow = None
-_shared_text_arrow = None
+_shared_cache = None
 _shared_run_starts = None
 _shared_run_lengths = None
 _shared_transcribe_only_runs: set[int] = set()
@@ -169,8 +168,7 @@ def _shift_run_chunk(
     """Process a range of runs with shift-by-one accumulation."""
     from audio_tokenization.utils.indexed_dataset.indexed_dataset_megatron import IndexedDatasetBuilder
 
-    audio_arrow = _shared_audio_arrow
-    text_arrow = _shared_text_arrow
+    cache = _shared_cache
     run_starts_arr = _shared_run_starts
     run_lengths_arr = _shared_run_lengths
     transcribe_only_runs = _shared_transcribe_only_runs
@@ -213,8 +211,8 @@ def _shift_run_chunk(
         rs = int(run_starts_arr[r])
         rl = int(run_lengths_arr[r])
 
-        run_audio = _LazyArrowList(audio_arrow[rs: rs + rl])
-        run_text = _LazyArrowList(text_arrow[rs: rs + rl])
+        run_audio = cache.audio.slice(rs, rl)
+        run_text = cache.text.slice(rs, rl)
 
         # Ratio-adjusted: entire run → individual transcribe
         if r in transcribe_only_runs:
@@ -290,13 +288,8 @@ def _dry_run_shift(
     seq_threshold: int | None = None,
 ) -> None:
     """Compute and print shift-by-one statistics without materializing tokens."""
-    import polars as pl
-
     print("Computing token lengths ...")
-    df = df.with_columns(
-        df["audio_tokens"].list.len().cast(pl.UInt64).alias("_alen"),
-        df["text_tokens"].list.len().cast(pl.UInt64).alias("_tlen"),
-    ).select(["source_id", "clip_num", "_alen", "_tlen"])
+    df = prepare_length_metadata(df)
 
     print("Detecting consecutive runs ...")
     df, run_starts, run_lengths = _detect_runs(df)
@@ -474,7 +467,7 @@ def main() -> None:
     )
     dtype = DType.optimal_dtype(vocab_size)
 
-    df = load_parquets(parquet_dir)
+    df, cache_reader = load_interleave_cache(parquet_dir)
 
     if args.dry_run:
         _dry_run_shift(
@@ -487,13 +480,12 @@ def main() -> None:
         return
 
     # Full build
-    global _shared_audio_arrow, _shared_text_arrow, _shared_run_starts, _shared_run_lengths, _shared_transcribe_only_runs
+    global _shared_cache, _shared_run_starts, _shared_run_lengths, _shared_transcribe_only_runs
 
-    audio_arrow, text_arrow, run_starts, run_lengths, n_clips, n_sources = (
-        prepare_arrow_and_runs(df)
+    cache, run_starts, run_lengths, n_clips, n_sources = (
+        prepare_interleave_cache_and_runs(df, cache_reader)
     )
-    _shared_audio_arrow = audio_arrow
-    _shared_text_arrow = text_arrow
+    _shared_cache = cache
     _shared_run_starts = run_starts
     _shared_run_lengths = run_lengths
 
@@ -551,8 +543,7 @@ def main() -> None:
 
     shutil.rmtree(tmp_dir)
 
-    _shared_audio_arrow = None
-    _shared_text_arrow = None
+    _shared_cache = None
 
     for key in sorted(counters.keys()):
         c = counters[key]

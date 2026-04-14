@@ -185,6 +185,11 @@ def _load_shar_cutset(cfg, rank, world_size=1):
             f"{len(merged_fields['cuts'])}/{total_shards} shards"
         )
 
+    # Intentionally keep split_for_dataloading disabled here.
+    # This pipeline assigns whole SHAR shards to ranks explicitly above so
+    # checkpoint ownership and output ownership are both rank-local. Switching
+    # to Lhotse's worker/node striding would blur that ownership boundary and
+    # make recovery/output layout harder to reason about.
     return CutSet.from_shar(fields=merged_fields, split_for_dataloading=False, shuffle_shards=True)
 
 
