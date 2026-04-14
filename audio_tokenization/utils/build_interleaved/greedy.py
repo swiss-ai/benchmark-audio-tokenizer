@@ -63,6 +63,7 @@ from audio_tokenization.utils.build_interleaved.common import (
     format_distribution,
     get_bin_path,
     get_idx_path,
+    _LazyArrowList,
     load_parquets,
     load_token_ids,
     prepare_arrow_and_runs,
@@ -77,25 +78,6 @@ _shared_text_arrow = None
 _shared_run_starts = None
 _shared_run_lengths = None
 _shared_transcribe_only_runs: set[int] = set()
-
-
-class _LazyArrowList:
-    """Lazy list-like wrapper around an Arrow chunked array slice.
-
-    Converts one element at a time via ``as_py()`` on access instead of
-    materializing the entire slice upfront with ``to_pylist()``.
-    Reduces peak memory for long runs.
-    """
-    __slots__ = ("_arr",)
-
-    def __init__(self, arr):
-        self._arr = arr
-
-    def __getitem__(self, idx):
-        return self._arr[idx].as_py()
-
-    def __len__(self):
-        return len(self._arr)
 
 
 # Both directions are always produced (separate bin/idx each).

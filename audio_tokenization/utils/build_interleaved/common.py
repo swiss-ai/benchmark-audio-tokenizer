@@ -52,7 +52,32 @@ __all__ = [
     "load_parquets",
     "prepare_arrow_and_runs",
     "compute_ratio_adjustment",
+    "_LazyArrowList",
 ]
+
+# ---------------------------------------------------------------------------
+# Lazy Arrow helper
+# ---------------------------------------------------------------------------
+
+
+class _LazyArrowList:
+    """Lazy list-like wrapper around an Arrow chunked array slice.
+
+    Converts one element at a time via ``as_py()`` on access instead of
+    materializing the entire slice upfront with ``to_pylist()``.
+    Reduces peak memory for long runs.
+    """
+    __slots__ = ("_arr",)
+
+    def __init__(self, arr):
+        self._arr = arr
+
+    def __getitem__(self, idx):
+        return self._arr[idx].as_py()
+
+    def __len__(self):
+        return len(self._arr)
+
 
 # ---------------------------------------------------------------------------
 # Constants

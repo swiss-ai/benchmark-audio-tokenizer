@@ -1,5 +1,7 @@
 """Tests for build_interleaved helper functions (pattern + common)."""
 
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import pytest
@@ -8,6 +10,7 @@ from audio_tokenization.utils.build_interleaved.common import (
     find_consecutive_runs,
     _detect_runs,
     compute_ratio_adjustment,
+    load_parquets,
 )
 from audio_tokenization.utils.build_interleaved.pattern import (
     build_sequence,
@@ -304,6 +307,25 @@ class TestDetectRuns:
         )
         _, starts, lengths = _detect_runs(df)
         assert int(lengths.sum()) == len(df)
+
+
+class TestLoadParquets:
+    def test_falls_back_to_generic_parquet_names(self, tmp_path: Path):
+        df = pl.DataFrame(
+            {
+                "source_id": ["s1", "s1"],
+                "clip_num": [0, 1],
+                "audio_tokens": [[1, 2], [3, 4]],
+                "text_tokens": [[5], [6]],
+            }
+        )
+        df.write_parquet(tmp_path / "part_00000.parquet")
+
+        loaded = load_parquets(tmp_path)
+
+        assert loaded.shape == (2, 4)
+        assert loaded["source_id"].to_list() == ["s1", "s1"]
+        assert loaded["clip_num"].to_list() == [0, 1]
 
 
 # ── compute_ratio_adjustment ─────────────────────────────────────────

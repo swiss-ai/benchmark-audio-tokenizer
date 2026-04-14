@@ -49,11 +49,11 @@ from .common import (
     compute_ratio_adjustment,
     format_distribution,
     get_bin_path,
+    _LazyArrowList,
     load_parquets,
     load_token_ids,
     prepare_arrow_and_runs,
 )
-from .greedy import _LazyArrowList
 
 logger = logging.getLogger(__name__)
 
