@@ -96,7 +96,7 @@ def decode_output(
         tid for tid in new_ids
         if not (AUDIO_TOKEN_OFFSET <= tid < AUDIO_TOKEN_OFFSET + AUDIO_VOCAB_SIZE)
     ]
-    return tokenizer.decode(text_ids, skip_special_tokens=False)
+    return tokenizer.decode(text_ids, skip_special_tokens=True)
 
 
 # ---------------------------------------------------------------------------
@@ -311,13 +311,13 @@ def main() -> None:
         model.eval()
     else:
         try:
+            os.environ["VLLM_USE_V1"] = "0"
             from vllm import LLM, SamplingParams
         except ImportError as e:
             raise ImportError(
                 "vLLM backend requested but vllm is not installed. "
                 "Install it or run with --backend transformers."
             ) from e
-        os.environ["VLLM_USE_V1"] = "0"
         model = LLM(
             model=args.model_path,
             tokenizer=tokenizer_path,
@@ -386,6 +386,7 @@ def main() -> None:
     print("=" * 70)
 
     results = []
+    _resamplers: dict[int, torchaudio.transforms.Resample] = {}
 
     for i, sample in enumerate(samples):
         audio_array = sample["audio_array"]
@@ -394,9 +395,11 @@ def main() -> None:
         sample_id = sample["id"]
         sample_dataset = sample.get("dataset", "")
 
-        audio_tensor = torch.from_numpy(audio_array).float()
-        if audio_tensor.dim() == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)  # (1, T)
+        # soundfile/numpy convention: mono is (T,), multi-channel is (T, C).
+        # Downmix channels before adding the batch dim.
+        if audio_array.ndim == 2:
+            audio_array = audio_array.mean(axis=1)
+        audio_tensor = torch.from_numpy(audio_array).float().unsqueeze(0)  # (1, T)
 
         duration_s = audio_tensor.shape[-1] / sr
 
@@ -410,10 +413,11 @@ def main() -> None:
             if not os.path.exists(wav_path):
                 sf.write(wav_path, audio_array, sr)
 
-        # Resample to 24 kHz for WavTokenizer
+        # Resample to 24 kHz for WavTokenizer (cache resampler per sample rate)
         if sr != 24000:
-            resampler = torchaudio.transforms.Resample(sr, 24000)
-            audio_24k = resampler(audio_tensor)
+            if sr not in _resamplers:
+                _resamplers[sr] = torchaudio.transforms.Resample(sr, 24000)
+            audio_24k = _resamplers[sr](audio_tensor)
         else:
             audio_24k = audio_tensor
 
