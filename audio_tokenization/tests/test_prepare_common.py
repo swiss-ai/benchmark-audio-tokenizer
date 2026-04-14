@@ -3,6 +3,8 @@ import types
 from collections import Counter
 import gzip
 
+import pytest
+
 from audio_tokenization.utils.prepare_data import common
 
 
@@ -134,3 +136,190 @@ def test_resolve_sample_text_and_custom_prefers_external_metadata():
 
     assert text == "external text"
     assert custom == {"speaker": "ext", "lang": "yue", "topic": "budget"}
+
+
+# ---------------------------------------------------------------------------
+# extract_row_metadata
+# ---------------------------------------------------------------------------
+
+
+def test_extract_row_metadata_basic():
+    row = {"id": "abc", "text": "hello world", "lang": "en", "speaker": "alice"}
+    row_id, text, lang, custom = common.extract_row_metadata(
+        row,
+        id_column="id",
+        text_column="text",
+        language_column="lang",
+        custom_columns=["speaker"],
+    )
+    assert row_id == "abc"
+    assert text == "hello world"
+    assert lang == "en"
+    assert custom == {"speaker": "alice"}
+
+
+def test_extract_row_metadata_fallback_id_when_no_column():
+    row = {"text": "hello"}
+    row_id, _, _, _ = common.extract_row_metadata(
+        row,
+        id_column=None,
+        text_column="text",
+        fallback_id="filename_42",
+    )
+    assert row_id == "filename_42"
+
+
+def test_extract_row_metadata_multi_column_id_joined_with_underscore():
+    row = {"session": 19, "seg": 108}
+    row_id, _, _, _ = common.extract_row_metadata(
+        row,
+        id_column=["session", "seg"],
+    )
+    assert row_id == "19_108"
+
+
+def test_extract_row_metadata_id_is_always_string():
+    row = {"id": 42}
+    row_id, _, _, _ = common.extract_row_metadata(row, id_column="id")
+    assert row_id == "42"
+    assert isinstance(row_id, str)
+
+
+def test_extract_row_metadata_language_column_takes_precedence_over_global():
+    row = {"lang": "de"}
+    _, _, lang, _ = common.extract_row_metadata(
+        row,
+        language_column="lang",
+        language="fr",  # global fallback, should be overridden
+    )
+    assert lang == "de"
+
+
+def test_extract_row_metadata_language_falls_back_to_global_when_column_missing():
+    row = {"text": "bonjour"}
+    _, _, lang, _ = common.extract_row_metadata(
+        row,
+        language_column="lang",  # column not in row
+        language="fr",
+    )
+    assert lang == "fr"
+
+
+def test_extract_row_metadata_language_global_when_no_column_specified():
+    row = {"text": "hello"}
+    _, _, lang, _ = common.extract_row_metadata(
+        row,
+        language="en",
+    )
+    assert lang == "en"
+
+
+def test_extract_row_metadata_text_none_when_no_column():
+    row = {"id": "abc"}
+    _, text, _, _ = common.extract_row_metadata(row, id_column="id")
+    assert text is None
+
+
+def test_extract_row_metadata_custom_skips_none_values():
+    row = {"id": "abc", "speaker": "alice", "age": None, "dialect": "us"}
+    _, _, _, custom = common.extract_row_metadata(
+        row,
+        id_column="id",
+        custom_columns=["speaker", "age", "dialect"],
+    )
+    assert custom == {"speaker": "alice", "dialect": "us"}
+
+
+def test_extract_row_metadata_custom_empty_when_no_columns():
+    row = {"id": "abc"}
+    _, _, _, custom = common.extract_row_metadata(row, id_column="id")
+    assert custom == {}
+
+
+def test_extract_row_metadata_custom_empty_when_all_values_none():
+    row = {"id": "abc", "speaker": None}
+    _, _, _, custom = common.extract_row_metadata(
+        row,
+        id_column="id",
+        custom_columns=["speaker"],
+    )
+    assert custom == {}
+
+
+def test_extract_row_metadata_dotted_path():
+    row = {
+        "audio": {"path": "x.wav"},
+        "meta": {"text": "hello", "lang": "fa"},
+        "speaker": {"info": {"name": "alice"}},
+    }
+    row_id, text, lang, custom = common.extract_row_metadata(
+        row,
+        id_column="audio.path",
+        text_column="meta.text",
+        language_column="meta.lang",
+        custom_columns=["speaker.info.name"],
+    )
+    assert row_id == "x.wav"
+    assert text == "hello"
+    assert lang == "fa"
+    assert custom == {"speaker.info.name": "alice"}
+
+
+def test_extract_row_metadata_missing_required_id_raises():
+    row = {"audio": {}}
+    with pytest.raises(ValueError, match="audio.path"):
+        common.extract_row_metadata(
+            row,
+            id_column="audio.path",
+        )
+
+
+def test_extract_row_metadata_null_required_id_raises():
+    row = {"audio": {"path": None}}
+    with pytest.raises(ValueError, match="audio.path"):
+        common.extract_row_metadata(
+            row,
+            id_column="audio.path",
+        )
+
+
+def test_extract_row_metadata_multi_column_id_any_null_raises():
+    row = {"audio": {"path": "x.wav"}, "meta": {"seg": None}}
+    with pytest.raises(ValueError, match="meta.seg"):
+        common.extract_row_metadata(
+            row,
+            id_column=["audio.path", "meta.seg"],
+        )
+
+
+def test_extract_row_metadata_dotted_path_missing_intermediate_is_graceful():
+    row = {"audio": {}}
+    row_id, text, lang, custom = common.extract_row_metadata(
+        row,
+        id_column=None,
+        text_column="audio.path",
+        language_column="meta.lang",
+        language="fa",
+        custom_columns=["speaker.info.name"],
+        fallback_id="fallback",
+    )
+    assert row_id == "fallback"
+    assert text is None
+    assert lang == "fa"
+    assert custom == {}
+
+
+def test_projected_columns_keeps_dotted_leaf_when_no_ancestor():
+    assert common._projected_columns("audio.path") == ["audio.path"]
+
+
+def test_projected_columns_drops_leaf_when_ancestor_present():
+    assert common._projected_columns("audio", "audio.path") == ["audio"]
+
+
+def test_projected_columns_deduplicates():
+    assert common._projected_columns("audio.path", "audio.path") == ["audio.path"]
+
+
+def test_projected_columns_handles_list_id_column():
+    assert common._projected_columns(["audio.path"], "text") == ["audio.path", "text"]

@@ -30,17 +30,17 @@ from pathlib import Path
 
 from audio_tokenization.utils.prepare_data.common import (
     add_audio_processing_args,
+    add_columnar_metadata_args,
     add_external_metadata_args,
-    add_language_arg,
     add_input_clip_id_parser_arg,
     add_parallelism_args,
     add_shar_output_args,
-    add_text_tokenizer_args,
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
+    extract_row_metadata,
     init_worker_process,
     load_external_metadata,
     load_text_tokenizer,
@@ -85,11 +85,14 @@ def _convert_worker(args_tuple):
         id_column,
         audio_column,
         text_column,
+        language_column,
+        language,
+        custom_columns,
+        text_tokenize_custom_columns,
         text_tokenizer,
         resampling_backend,
         input_clip_id_parser_name,
         read_batch_size,
-        language,
     ) = args_tuple
 
     reused = check_worker_reuse(worker_id, shar_dir)
@@ -105,7 +108,7 @@ def _convert_worker(args_tuple):
     written = skipped = errors = 0
     total_duration_sec = 0.0
     runtime_counts = Counter()
-    _tokenize_text = make_text_tokenize_fn(text_tokenizer) if text_tokenizer is not None else None
+    _tokenize_text = make_text_tokenize_fn(text_tokenizer, text_tokenize_custom_columns) if text_tokenizer is not None else None
     input_clip_id_parser = (
         get_clip_id_parser(input_clip_id_parser_name)
         if input_clip_id_parser_name
@@ -120,9 +123,21 @@ def _convert_worker(args_tuple):
     ) as writer:
         for arrow_path in arrow_paths:
             arrow_name = Path(arrow_path).name
+            arrow_stem = Path(arrow_path).stem
             logger.info(f"Worker {worker_id}: reading {arrow_name}")
+            row_idx = 0
             for row in iter_arrow_rows(arrow_path, batch_size=read_batch_size):
-                row_id = row[id_column]
+                fallback_id = f"{arrow_stem}_{row_idx}" if not id_column else None
+                row_idx += 1
+                row_id, default_text, lang, custom = extract_row_metadata(
+                    row,
+                    id_column=id_column,
+                    text_column=text_column,
+                    language_column=language_column,
+                    language=language,
+                    custom_columns=custom_columns,
+                    fallback_id=fallback_id,
+                )
                 try:
                     audio_struct = row[audio_column]
                     audio_bytes = audio_struct.get("bytes") if isinstance(audio_struct, dict) else None
@@ -140,7 +155,8 @@ def _convert_worker(args_tuple):
 
                     text, custom = resolve_sample_text_and_custom(
                         row_id,
-                        default_text=row.get(text_column) if text_column else None,
+                        default_text=default_text,
+                        default_custom=custom,
                         external_metadata=external_metadata,
                         stats=runtime_counts,
                     )
@@ -153,7 +169,7 @@ def _convert_worker(args_tuple):
                             start=0.0,
                             duration=cut.duration,
                             text=text,
-                            language=language,
+                            language=lang,
                         )]
 
                     cut, skip = apply_audio_pipeline(
@@ -221,14 +237,11 @@ def main(argv=None):
 
     add_shar_output_args(parser)
     add_audio_processing_args(parser, target_sr_default=None)
-
-    # Column names
-    parser.add_argument("--id-column", type=str, default="id",
-                        help="Column name for row ID (default: 'id')")
-    parser.add_argument("--audio-column", type=str, default="audio",
-                        help="Column name for audio struct (default: 'audio')")
-    parser.add_argument("--text-column", type=str, default=None,
-                        help="Column name for transcription text (default: None)")
+    add_columnar_metadata_args(
+        parser,
+        id_column_default="id",
+        text_column_default=None,
+    )
     parser.add_argument(
         "--read-batch-size",
         type=int,
@@ -240,9 +253,6 @@ def main(argv=None):
     )
     add_external_metadata_args(parser, include_custom_fields=True)
     add_input_clip_id_parser_arg(parser)
-
-    add_language_arg(parser)
-    add_text_tokenizer_args(parser)
     add_parallelism_args(parser)
     args = parser.parse_args(argv)
 
@@ -295,11 +305,14 @@ def main(argv=None):
             args.id_column,
             args.audio_column,
             args.text_column,
+            args.language_column,
+            args.language,
+            args.custom_columns,
+            args.text_tokenize_custom_columns,
             text_tokenizer,
             args.resampling_backend,
             args.input_clip_id_parser,
             args.read_batch_size,
-            args.language,
         )
         for wid, arrows in enumerate(worker_arrows)
         if arrows

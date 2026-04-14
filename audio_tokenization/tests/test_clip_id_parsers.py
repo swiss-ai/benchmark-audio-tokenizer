@@ -10,6 +10,7 @@ from audio_tokenization.utils.clip_id_parsers import (
     parse_libriheavy_clip_id,
     parse_parlaspeech_clip_id,
     parse_spc_clip_id,
+    parse_trailing_number_basename_clip_id,
     parse_trailing_number_clip_id,
     parse_wenetspeech_clip_id,
 )
@@ -53,6 +54,20 @@ class TestTrailingNumber:
     def test_invalid(self):
         with pytest.raises(ValueError):
             parse_trailing_number_clip_id("no_number")
+
+
+class TestTrailingNumberBasename:
+    def test_with_directory_prefix(self):
+        assert parse_trailing_number_basename_clip_id(
+            "Amirkaye_ziba_Goftegoo/Amrikaye_Ziba_radio-goftego-99_04_12-19_30_86.wav"
+        ) == ("Amrikaye_Ziba_radio-goftego-99_04_12-19_30", 86)
+
+    def test_flat_filename_matches_trailing_number(self):
+        assert parse_trailing_number_basename_clip_id("src_00010.wav") == ("src", 10)
+
+    def test_registry_lookup(self):
+        parser = get_clip_id_parser("trailing_number_basename")
+        assert parser("nested/foo_00002.flac") == ("foo", 2)
 
 
 class TestWenetSpeech:
@@ -131,6 +146,7 @@ class TestRegistry:
     def test_all_known_parsers(self):
         for name in [
             "trailing_number",
+            "trailing_number_basename",
             "emilia",
             "wenetspeech",
             "spc",

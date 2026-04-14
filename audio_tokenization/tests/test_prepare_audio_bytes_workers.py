@@ -202,6 +202,10 @@ def test_prepare_hf_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_path)
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
             8,
         )
     )
@@ -255,6 +259,10 @@ def test_prepare_hf_worker_external_metadata_overrides_text(monkeypatch, tmp_pat
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
             8,
         )
     )
@@ -302,6 +310,7 @@ def test_prepare_parquet_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_
             "text",
             "duration",
             "lang",
+            None,
             ("speaker",),
             None,
             None,
@@ -370,6 +379,7 @@ def test_prepare_parquet_worker_external_metadata_overrides_text_and_custom(monk
             "text",
             "duration",
             "lang",
+            None,
             ("speaker",),
             None,
             None,
@@ -425,6 +435,7 @@ def test_prepare_parquet_worker_applies_input_clip_id_parser(monkeypatch, tmp_pa
             None,
             None,
             None,
+            None,
             "spc",
             8,
         )
@@ -439,4 +450,66 @@ def test_prepare_parquet_worker_applies_input_clip_id_parser(monkeypatch, tmp_pa
         "clip_num": 3,
         "clip_start": 0.0,
         "legacy_cut_id": "row00000_seg003",
+    }
+
+
+def test_prepare_parquet_worker_nested_audio_path_with_basename_parser(monkeypatch, tmp_path):
+    """Farsi/Infore2 flow: id_column=audio.path + trailing_number_basename parser.
+
+    Covers the full nested-field → basename-stripping → clip_num flow through
+    the parquet worker, locking in dotted-path resolution + directory prefix
+    handling.
+    """
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "audio": [{"bytes": b"farsi-bytes", "path": "radio_program/foo_042.wav"}],
+                "transcription": ["سلام دنیا"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        (
+            0,
+            ["dataset.parquet"],
+            str(tmp_path / "shar"),
+            None,
+            100,
+            "flac",
+            "audio.path",       # dotted id_column
+            "audio",
+            "transcription",
+            None,               # duration_column
+            None,               # language_column
+            "fa",               # language (global)
+            None,               # custom_columns
+            None,               # text_tokenize_custom_columns
+            None,               # text_tokenizer
+            None,               # resampling_backend
+            "trailing_number_basename",  # input_clip_id_parser
+            8,
+        )
+    )
+
+    assert result["written"] == 1
+    # Audio path reaches the recording builder unchanged
+    assert helper_calls[0]["audio_bytes"] == b"farsi-bytes"
+    # recording_id is the full audio.path string (path/foo_042.wav)
+    assert helper_calls[0]["recording_id"] == "radio_program/foo_042.wav"
+    # cut.id has source_id derived from basename (no "/"), clip_num from trailing number
+    assert written_cuts[0].id == "foo@000042"
+    assert "/" not in written_cuts[0].id
+    assert written_cuts[0].supervisions[0].text == "سلام دنیا"
+    assert written_cuts[0].supervisions[0].language == "fa"
+    assert written_cuts[0].custom == {
+        "source_id": "foo",
+        "clip_num": 42,
+        "clip_start": 0.0,
+        "legacy_cut_id": "radio_program/foo_042.wav",
     }

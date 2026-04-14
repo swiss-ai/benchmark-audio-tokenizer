@@ -29,18 +29,21 @@ import time
 from pathlib import Path
 
 from audio_tokenization.utils.prepare_data.common import (
+    _get_field,
+    _projected_columns,
     PREPARE_STATE_FILE,
     add_audio_processing_args,
+    add_columnar_metadata_args,
     add_external_metadata_args,
     add_input_clip_id_parser_arg,
     add_parallelism_args,
     add_shar_output_args,
-    add_text_tokenizer_args,
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
+    extract_row_metadata,
     init_worker_process,
     load_external_metadata,
     load_text_tokenizer,
@@ -89,6 +92,7 @@ def _convert_worker(args_tuple):
         text_column,
         duration_column,
         language_column,
+        language,
         custom_columns,
         text_tokenize_custom_columns,
         text_tokenizer,
@@ -126,21 +130,14 @@ def _convert_worker(args_tuple):
         for pq_path in parquet_paths:
             pq_name = Path(pq_path).name
             logger.info(f"Worker {worker_id}: reading {pq_name}")
-            read_columns = []
-            if isinstance(id_column, list):
-                read_columns.extend(id_column)
-            elif id_column:
-                read_columns.append(id_column)
-            read_columns.append(audio_column)
-            if text_column:
-                read_columns.append(text_column)
-            if duration_column:
-                read_columns.append(duration_column)
-            if language_column:
-                read_columns.append(language_column)
-            if custom_columns:
-                read_columns.extend(custom_columns)
-            read_columns = list(dict.fromkeys(read_columns))
+            read_columns = _projected_columns(
+                audio_column,
+                text_column,
+                duration_column,
+                id_column,
+                language_column,
+                custom_columns,
+            )
 
             row_idx = 0
             for row in iter_parquet_rows(
@@ -148,15 +145,19 @@ def _convert_worker(args_tuple):
                 columns=read_columns,
                 batch_size=read_batch_size,
             ):
-                if not id_column:
-                    row_id = f"{Path(pq_path).stem}_{row_idx}"
-                elif isinstance(id_column, list):
-                    row_id = "_".join(str(row[c]) for c in id_column)
-                else:
-                    row_id = row[id_column]
+                fallback_id = f"{Path(pq_path).stem}_{row_idx}" if not id_column else None
+                row_id, default_text, lang, custom = extract_row_metadata(
+                    row,
+                    id_column=id_column,
+                    text_column=text_column,
+                    language_column=language_column,
+                    language=language,
+                    custom_columns=custom_columns,
+                    fallback_id=fallback_id,
+                )
                 try:
                     # Filter bad rows
-                    duration = row.get(duration_column)
+                    duration = _get_field(row, duration_column) if duration_column else None
                     if duration is not None and duration <= 0:
                         skipped += 1
                         runtime_counts["skipped_non_positive_duration"] += 1
@@ -177,15 +178,9 @@ def _convert_worker(args_tuple):
 
                     cut = recording.to_cut()
 
-                    custom = {}
-                    if custom_columns:
-                        for col in custom_columns:
-                            val = row.get(col)
-                            if val is not None:
-                                custom[col] = val
                     text, custom = resolve_sample_text_and_custom(
                         row_id,
-                        default_text=row.get(text_column),
+                        default_text=default_text,
                         default_custom=custom,
                         external_metadata=external_metadata,
                         stats=runtime_counts,
@@ -193,14 +188,13 @@ def _convert_worker(args_tuple):
                     if custom:
                         cut.custom = custom
                     if text:
-                        language = row.get(language_column) if language_column else None
                         cut.supervisions = [SupervisionSegment(
                             id=cut.id,
                             recording_id=cut.recording_id,
                             start=0.0,
                             duration=cut.duration,
                             text=text,
-                            language=language,
+                            language=lang,
                         )]
 
                     cut, skip = apply_audio_pipeline(
@@ -303,20 +297,11 @@ def main(argv=None):
 
     add_shar_output_args(parser)
     add_audio_processing_args(parser)
-    # Column names
-    parser.add_argument("--id-column", type=str, nargs="*", default=None,
-                        help="Column name(s) for row ID. Multiple columns are joined with '_'. "
-                             "Omit to auto-generate IDs from filename + row index.")
-    parser.add_argument("--audio-column", type=str, default="audio",
-                        help="Column name for audio struct (default: 'audio')")
-    parser.add_argument("--text-column", type=str, default="text",
-                        help="Column name for transcription text (default: 'text')")
-    parser.add_argument("--duration-column", type=str, default="duration",
-                        help="Column name for duration (default: 'duration')")
-    parser.add_argument("--language-column", type=str, default=None,
-                        help="Column name for language code (default: None, not set)")
-    parser.add_argument("--custom-columns", type=str, nargs="*", default=None,
-                        help="Additional parquet columns to store in supervision.custom dict")
+    add_columnar_metadata_args(
+        parser,
+        text_column_default="text",
+        duration_column_default="duration",
+    )
     parser.add_argument(
         "--read-batch-size",
         type=int,
@@ -328,8 +313,6 @@ def main(argv=None):
     )
     add_external_metadata_args(parser, include_custom_fields=True)
     add_input_clip_id_parser_arg(parser)
-
-    add_text_tokenizer_args(parser, include_custom_columns=True)
     add_parallelism_args(parser, include_mp_start_method=True)
 
     args = parser.parse_args(argv)
@@ -383,6 +366,7 @@ def main(argv=None):
             args.text_column,
             args.duration_column,
             args.language_column,
+            args.language,
             args.custom_columns,
             args.text_tokenize_custom_columns,
             text_tokenizer,

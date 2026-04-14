@@ -43,6 +43,12 @@ def parse_trailing_number_clip_id(clip_id: str) -> Tuple[str, int]:
     return source_id, clip_num
 
 
+def parse_trailing_number_basename_clip_id(clip_id: str) -> Tuple[str, int]:
+    """Strip any leading directory prefix, then parse a trailing-number clip ID."""
+    basename = clip_id.rsplit("/", 1)[-1]
+    return parse_trailing_number_clip_id(basename)
+
+
 def parse_wenetspeech_clip_id(clip_id: str) -> Tuple[str, int]:
     """Parse WenetSpeech clip IDs.
 
@@ -251,6 +257,7 @@ def parse_generic_clip_id(clip_id: str) -> Tuple[str, int]:
 _PARSERS = {
     "universal": parse_universal_clip_id,
     "trailing_number": parse_trailing_number_clip_id,
+    "trailing_number_basename": parse_trailing_number_basename_clip_id,
     "voxpopuli": parse_voxpopuli_clip_id,
     "ytc": parse_ytc_clip_id,
     "emilia": parse_emilia_clip_id,
