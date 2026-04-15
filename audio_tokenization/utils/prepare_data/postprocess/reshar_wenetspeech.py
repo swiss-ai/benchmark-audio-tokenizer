@@ -21,15 +21,17 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from audio_tokenization.utils.prepare_data.common import (
+from audio_tokenization.utils.prepare_data.runtime import (
     build_shar_index,
     check_worker_reuse,
     distribute_round_robin,
     init_worker_process,
-    load_text_tokenizer,
-    make_text_tokenize_fn,
     mark_partition_success,
     write_worker_result,
+)
+from audio_tokenization.utils.prepare_data.text_ops import (
+    load_text_tokenizer,
+    make_text_tokenize_fn,
 )
 
 logging.basicConfig(

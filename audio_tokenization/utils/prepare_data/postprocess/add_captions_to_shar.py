@@ -57,11 +57,29 @@ def _rewrite_cut_id_to_universal(cut_id: str) -> str:
     return f"{cut_id}@000000"
 
 
+def _assert_id_stability_for_symlinked_recordings(raw_dicts: list[dict], *, cuts_path: Path) -> None:
+    """Reject ID rewrites when recording tar shards are left untouched.
+
+    This script currently symlinks the original ``recording.*.tar`` files, so
+    changing ``cut.id`` would make the output SHAR unreadable. Scripts that need
+    to rewrite IDs must rebuild the recording tar shards too.
+    """
+    for d in raw_dicts:
+        old_id = d["id"]
+        new_id = _rewrite_cut_id_to_universal(old_id)
+        if new_id != old_id:
+            raise RuntimeError(
+                "add_captions_to_shar cannot rewrite cut IDs while symlinking "
+                f"recording tar shards unchanged (first mismatch in {cuts_path}: "
+                f"{old_id!r} -> {new_id!r}). Full shard rewrite is required."
+            )
+
+
 def _process_shard(args):
     """Process one cuts shard: add captions, rewrite IDs, optionally tokenize."""
     cuts_path, captions, tokenizer_path, output_path, caption_custom_key = args
 
-    from audio_tokenization.utils.prepare_data.common import load_text_tokenizer
+    from audio_tokenization.utils.prepare_data.text_ops import load_text_tokenizer
     tokenizer = load_text_tokenizer(tokenizer_path)
 
     raw_dicts = []
@@ -69,6 +87,8 @@ def _process_shard(args):
         for line in f:
             if line.strip():
                 raw_dicts.append(json.loads(line))
+
+    _assert_id_stability_for_symlinked_recordings(raw_dicts, cuts_path=cuts_path)
 
     patched = 0
     missing = 0
@@ -124,7 +144,7 @@ def _process_shard(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Patch SHAR cuts with captions and universal clip IDs"
+        description="Patch SHAR cuts with captions without rewriting recording tar shards"
     )
     parser.add_argument("--shar-dir", type=Path, required=True,
                         help="Input SHAR directory")
@@ -160,7 +180,8 @@ def main():
         output_path = args.output_dir / rel
         work.append((cuts_path, captions, args.text_tokenizer, output_path, args.caption_from_custom))
 
-    # Process in parallel
+    # Process in parallel. ID-rewriting modes are rejected inside workers until
+    # this script is upgraded to rebuild recording tar shards as well.
     t0 = time.time()
     total_patched = total_missing = total_cuts = 0
     with Pool(min(args.workers, len(work))) as pool:

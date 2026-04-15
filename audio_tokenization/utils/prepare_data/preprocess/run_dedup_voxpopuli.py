@@ -25,7 +25,7 @@ from typing import Dict, List, Set, Tuple
 
 import orjson
 
-from audio_tokenization.utils.prepare_data.common import audio_md5, build_audio_index
+from audio_tokenization.utils.prepare_data.runtime import audio_md5, build_audio_index
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
