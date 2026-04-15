@@ -52,6 +52,26 @@ AUDIO_TOKEN_OFFSET = 262344
 AUDIO_VOCAB_SIZE = 4096
 
 
+def _downmix_audio_array(audio_array: np.ndarray, *, channel_layout: str | None) -> np.ndarray:
+    """Return mono audio while preserving the time axis for known layouts.
+
+    HuggingFace ``datasets.Audio(mono=False)`` decodes stereo as ``(channels, time)``.
+    ``soundfile.read()`` returns multi-channel audio as ``(time, channels)``.
+    """
+    if audio_array.ndim != 2:
+        return audio_array
+    if channel_layout == "channels_first":
+        return audio_array.mean(axis=0)
+    if channel_layout == "channels_last":
+        return audio_array.mean(axis=1)
+
+    # Conservative fallback for unknown 2D layouts: small leading dimension is
+    # usually channel count, otherwise assume soundfile's (time, channels).
+    if audio_array.shape[0] <= 8 and audio_array.shape[1] > audio_array.shape[0]:
+        return audio_array.mean(axis=0)
+    return audio_array.mean(axis=1)
+
+
 def load_special_token_ids(tokenizer, tokenizer_path: str) -> dict[str, int]:
     """Load audio structure token IDs from the mapping file (single source of truth)."""
     from audio_tokenization.utils.token_mapping import get_structure_tokens
@@ -124,9 +144,11 @@ def load_arrow_dataset(audio_dir: str, audio_column: str, num_samples: int):
         if isinstance(audio_field, dict):
             audio_array = np.array(audio_field["array"], dtype=np.float32)
             sr = audio_field["sampling_rate"]
+            channel_layout = "channels_first"
         elif isinstance(audio_field, (np.ndarray, list)):
             audio_array = np.array(audio_field, dtype=np.float32)
             sr = 16000
+            channel_layout = None
         else:
             continue
 
@@ -137,6 +159,7 @@ def load_arrow_dataset(audio_dir: str, audio_column: str, num_samples: int):
             "sr": sr,
             "text": text or "",
             "id": sample_id,
+            "channel_layout": channel_layout,
         })
     return samples
 
@@ -175,6 +198,7 @@ def load_parquet_dataset(parquet_dir: str, audio_column: str, num_samples: int):
                 "sr": sr,
                 "text": text or "",
                 "id": sample_id,
+                "channel_layout": "channels_last",
             })
 
     print(f"  Loaded {len(samples)} samples")
@@ -225,6 +249,7 @@ def load_wav_dir_dataset(wav_dir: str, num_samples: int):
             "text": text_map.get(fname, ""),
             "id": sample_id,
             "dataset": dataset_map.get(fname, ""),
+            "channel_layout": "channels_last",
         })
 
     print(f"  Loaded {len(samples)} samples")
@@ -394,11 +419,12 @@ def main() -> None:
         ground_truth = sample["text"]
         sample_id = sample["id"]
         sample_dataset = sample.get("dataset", "")
+        channel_layout = sample.get("channel_layout")
 
-        # soundfile/numpy convention: mono is (T,), multi-channel is (T, C).
-        # Downmix channels before adding the batch dim.
-        if audio_array.ndim == 2:
-            audio_array = audio_array.mean(axis=1)
+        audio_array = _downmix_audio_array(
+            audio_array,
+            channel_layout=channel_layout,
+        )
         audio_tensor = torch.from_numpy(audio_array).float().unsqueeze(0)  # (1, T)
 
         duration_s = audio_tensor.shape[-1] / sr
