@@ -45,31 +45,41 @@ import time
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from audio_tokenization.utils.prepare_data.common import (
-    PREPARE_STATE_FILE,
+from audio_tokenization.utils.prepare_data.audio_ops import (
+    apply_audio_pipeline,
+    build_recording_from_audio_bytes,
+)
+from audio_tokenization.utils.prepare_data.cli import (
     add_audio_processing_args,
     add_external_metadata_args,
-    add_input_clip_id_parser_arg,
     add_parallelism_args,
     add_shar_output_args,
     add_text_tokenizer_args,
-    apply_audio_pipeline,
-    build_recording_from_audio_bytes,
+)
+from audio_tokenization.utils.prepare_data.constants import PREPARE_STATE_FILE
+from audio_tokenization.utils.prepare_data.identity import (
+    add_input_clip_id_parser_arg,
+    resolve_input_source_and_clip_num,
+    set_universal_cut_id,
+)
+from audio_tokenization.utils.prepare_data.metadata import (
+    load_external_metadata,
+    lookup_external_metadata,
+    normalize_optional_path,
+)
+from audio_tokenization.utils.prepare_data.runtime import (
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
-    load_external_metadata,
-    load_text_tokenizer,
-    lookup_external_metadata,
-    make_text_tokenize_fn,
-    normalize_optional_path,
-    resolve_input_source_and_clip_num,
     run_aggregate,
     run_pool_and_finalize,
-    set_universal_cut_id,
     validate_or_write_prepare_state,
     write_worker_result,
+)
+from audio_tokenization.utils.prepare_data.text_ops import (
+    load_text_tokenizer,
+    make_text_tokenize_fn,
 )
 from audio_tokenization.utils.clip_id_parsers import get_clip_id_parser
 from audio_tokenization.utils.prepare_data.preprocess.chunking import (

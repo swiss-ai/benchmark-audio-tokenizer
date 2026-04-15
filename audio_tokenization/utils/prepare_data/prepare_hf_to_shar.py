@@ -28,28 +28,40 @@ import logging
 import time
 from pathlib import Path
 
-from audio_tokenization.utils.prepare_data.common import (
-    add_audio_processing_args,
-    add_columnar_metadata_args,
-    add_external_metadata_args,
-    add_input_clip_id_parser_arg,
-    add_parallelism_args,
-    add_shar_output_args,
+from audio_tokenization.utils.prepare_data.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
+)
+from audio_tokenization.utils.prepare_data.cli import (
+    add_audio_processing_args,
+    add_external_metadata_args,
+    add_parallelism_args,
+    add_shar_output_args,
+)
+from audio_tokenization.utils.prepare_data.columnar import (
+    add_columnar_metadata_args,
+    extract_row_metadata,
+)
+from audio_tokenization.utils.prepare_data.identity import (
+    add_input_clip_id_parser_arg,
+    resolve_input_source_and_clip_num,
+    set_universal_cut_id,
+)
+from audio_tokenization.utils.prepare_data.metadata import (
+    load_external_metadata,
+    resolve_sample_text_and_custom,
+)
+from audio_tokenization.utils.prepare_data.runtime import (
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
-    extract_row_metadata,
     init_worker_process,
-    load_external_metadata,
+    run_pool_and_finalize,
+    write_worker_result,
+)
+from audio_tokenization.utils.prepare_data.text_ops import (
     load_text_tokenizer,
     make_text_tokenize_fn,
-    resolve_sample_text_and_custom,
-    resolve_input_source_and_clip_num,
-    run_pool_and_finalize,
-    set_universal_cut_id,
-    write_worker_result,
 )
 from audio_tokenization.utils.clip_id_parsers import get_clip_id_parser
 from audio_tokenization.utils.prepare_data.streaming import iter_arrow_rows

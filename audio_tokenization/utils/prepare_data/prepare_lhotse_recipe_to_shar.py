@@ -116,19 +116,22 @@ from multiprocessing import Process
 from pathlib import Path
 from typing import Optional
 
-from audio_tokenization.utils.prepare_data.common import (
+from audio_tokenization.utils.prepare_data.audio_ops import make_rms_filter_fn, to_mono
+from audio_tokenization.utils.prepare_data.constants import (
     PREPARE_STATE_FILE,
     SUCCESS_MARKER_FILE,
-    assign_universal_ids,
+)
+from audio_tokenization.utils.prepare_data.identity import assign_universal_ids
+from audio_tokenization.utils.prepare_data.metadata import normalize_optional_path
+from audio_tokenization.utils.prepare_data.runtime import (
     build_shar_index_from_parts,
-    load_text_tokenizer,
-    make_rms_filter_fn,
-    make_text_tokenize_fn,
     mark_partition_success,
-    normalize_optional_path,
     setup_partition_dir,
-    to_mono,
     validate_or_write_prepare_state,
+)
+from audio_tokenization.utils.prepare_data.text_ops import (
+    load_text_tokenizer,
+    make_text_tokenize_fn,
 )
 
 logging.basicConfig(

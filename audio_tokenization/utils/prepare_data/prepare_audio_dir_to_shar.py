@@ -30,7 +30,9 @@ import logging
 import time
 from pathlib import Path
 
-from audio_tokenization.utils.prepare_data.common import (
+from audio_tokenization.utils.prepare_data.audio_ops import to_mono
+from audio_tokenization.utils.prepare_data.identity import set_universal_cut_id
+from audio_tokenization.utils.prepare_data.runtime import (
     build_audio_index,
     check_worker_reuse,
     distribute_round_robin,
@@ -38,8 +40,6 @@ from audio_tokenization.utils.prepare_data.common import (
     init_worker_process,
     run_aggregate,
     run_pool_and_finalize,
-    set_universal_cut_id,
-    to_mono,
     write_worker_result,
 )
 from audio_tokenization.utils.prepare_data.preprocess.chunking import (
