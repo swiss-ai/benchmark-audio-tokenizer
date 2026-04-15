@@ -40,6 +40,7 @@ from audio_tokenization.utils.prepare_data.runtime import (
     init_worker_process,
     run_aggregate,
     run_pool_and_finalize,
+    validate_prepare_runtime,
     write_worker_result,
 )
 from audio_tokenization.utils.prepare_data.preprocess.chunking import (
@@ -314,6 +315,12 @@ def main(argv=None):
     resolved_jsonls = sorted(args.jsonl_files)
     if not resolved_jsonls:
         raise FileNotFoundError("No JSONL files provided via --jsonl-files")
+
+    validate_prepare_runtime(
+        resampling_backend=args.resampling_backend,
+        require_ffmpeg=False,
+        text_tokenizer_path=None,
+    )
 
     args.shar_dir.mkdir(parents=True, exist_ok=True)
 

@@ -74,6 +74,7 @@ from audio_tokenization.utils.prepare_data.runtime import (
     init_worker_process,
     run_aggregate,
     run_pool_and_finalize,
+    validate_prepare_runtime,
     validate_or_write_prepare_state,
     write_worker_result,
 )
@@ -608,6 +609,12 @@ def main(argv=None):
     resolved = sorted(set(p for pattern in args.wds_shards for p in glob.glob(pattern)))
     if not resolved:
         raise FileNotFoundError(f"No files match patterns: {args.wds_shards}")
+
+    validate_prepare_runtime(
+        resampling_backend=args.resampling_backend,
+        require_ffmpeg=True,
+        text_tokenizer_path=args.text_tokenizer,
+    )
 
     # Pre-filter shards that have no VAD file (avoids empty workers).
     if args.vad_segmentation and args.vad_per_shard_dir:

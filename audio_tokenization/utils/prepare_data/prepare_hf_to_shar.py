@@ -41,6 +41,7 @@ from audio_tokenization.utils.prepare_data.cli import (
 from audio_tokenization.utils.prepare_data.columnar import (
     add_columnar_metadata_args,
     extract_row_metadata,
+    validate_columnar_schema_roots,
 )
 from audio_tokenization.utils.prepare_data.identity import (
     add_input_clip_id_parser_arg,
@@ -57,6 +58,7 @@ from audio_tokenization.utils.prepare_data.runtime import (
     ensure_worker_assignment,
     init_worker_process,
     run_pool_and_finalize,
+    validate_prepare_runtime,
     write_worker_result,
 )
 from audio_tokenization.utils.prepare_data.text_ops import (
@@ -234,6 +236,33 @@ def _convert_worker(args_tuple):
 # ---------------------------------------------------------------------------
 
 
+def _preflight_prepare(args, resolved: list[str]) -> None:
+    import pyarrow.ipc as ipc
+
+    sample_path = resolved[0]
+    with open(sample_path, "rb") as f:
+        schema_names = ipc.open_stream(f).schema.names
+
+    validate_columnar_schema_roots(
+        available_roots=schema_names,
+        required_columns=(args.audio_column, args.id_column),
+        optional_columns=(
+            args.text_column,
+            args.language_column,
+            args.custom_columns,
+        ),
+        source_path=sample_path,
+        source_kind="Arrow",
+        logger=logger,
+    )
+
+    validate_prepare_runtime(
+        resampling_backend=args.resampling_backend,
+        require_ffmpeg=True,
+        text_tokenizer_path=args.text_tokenizer,
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Convert HF arrow shards → Lhotse Shar (parallel)",
@@ -277,6 +306,8 @@ def main(argv=None):
         parser.error("Either --arrow-files or --arrow-dir is required")
     if not resolved:
         raise FileNotFoundError("No arrow files resolved")
+
+    _preflight_prepare(args, resolved)
 
     args.shar_dir.mkdir(parents=True, exist_ok=True)
 

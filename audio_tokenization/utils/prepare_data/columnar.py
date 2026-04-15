@@ -116,3 +116,46 @@ def _projected_columns(*cols) -> list[str]:
         if not ancestors.intersection(requested_set):
             out.append(col)
     return out
+
+
+def required_column_roots(*columns) -> set[str]:
+    """Return required top-level roots for flat or dotted column specs."""
+    roots: set[str] = set()
+    for spec in columns:
+        if spec is None:
+            continue
+        items = spec if isinstance(spec, (list, tuple)) else [spec]
+        for col in items:
+            if col:
+                roots.add(str(col).split(".", 1)[0])
+    return roots
+
+
+def validate_columnar_schema_roots(
+    *,
+    available_roots,
+    required_columns,
+    optional_columns,
+    source_path: str,
+    source_kind: str,
+    logger,
+) -> None:
+    """Validate required roots and log optional missing roots for a columnar source."""
+    available = set(available_roots)
+    required = required_column_roots(*required_columns)
+    missing_required = sorted(required - available)
+    if missing_required:
+        raise RuntimeError(
+            f"{source_kind} preflight failed: required column roots are missing from "
+            f"{source_path}: {missing_required}. Available columns: {sorted(available)}"
+        )
+
+    optional = required_column_roots(*optional_columns)
+    missing_optional = sorted(optional - available)
+    if missing_optional:
+        logger.info(
+            "%s preflight: optional column roots missing from %s and will be treated as absent: %s",
+            source_kind,
+            source_path,
+            missing_optional,
+        )

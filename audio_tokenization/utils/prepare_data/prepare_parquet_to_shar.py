@@ -40,11 +40,12 @@ from audio_tokenization.utils.prepare_data.cli import (
 )
 from audio_tokenization.utils.prepare_data.columnar import (
     _get_field,
-    _projected_columns,
     add_columnar_metadata_args,
     extract_row_metadata,
+    _projected_columns,
+    validate_columnar_schema_roots,
 )
-from audio_tokenization.utils.prepare_data.constants import PREPARE_STATE_FILE
+from audio_tokenization.utils.prepare_data.constants import PREPARE_STATE_FILE, _MISSING
 from audio_tokenization.utils.prepare_data.identity import (
     add_input_clip_id_parser_arg,
     resolve_input_source_and_clip_num,
@@ -61,6 +62,7 @@ from audio_tokenization.utils.prepare_data.runtime import (
     ensure_worker_assignment,
     init_worker_process,
     run_pool_and_finalize,
+    validate_prepare_runtime,
     validate_or_write_prepare_state,
     write_worker_result,
 )
@@ -168,12 +170,17 @@ def _convert_worker(args_tuple):
                     fallback_id=fallback_id,
                 )
                 try:
-                    # Filter bad rows
                     duration = _get_field(row, duration_column) if duration_column else None
-                    if duration is not None and duration <= 0:
-                        skipped += 1
-                        runtime_counts["skipped_non_positive_duration"] += 1
-                        continue
+                    if duration is not _MISSING and duration is not None:
+                        if not isinstance(duration, (int, float)):
+                            raise TypeError(
+                                f"duration_column {duration_column!r} must be numeric or null; "
+                                f"got {type(duration).__name__}"
+                            )
+                        if duration <= 0:
+                            skipped += 1
+                            runtime_counts["skipped_non_positive_duration"] += 1
+                            continue
 
                     audio_struct = row[audio_column]
                     audio_bytes = audio_struct["bytes"] if isinstance(audio_struct, dict) else None
@@ -294,6 +301,29 @@ def _validate_or_write_prepare_state(args) -> None:
     )
     if wrote:
         logger.info(f"Wrote prepare state: {state_path}")
+def _preflight_prepare(args, resolved: list[str]) -> None:
+    import pyarrow.parquet as pq
+
+    sample_path = resolved[0]
+    validate_columnar_schema_roots(
+        available_roots=pq.ParquetFile(sample_path).schema_arrow.names,
+        required_columns=(args.audio_column, args.id_column),
+        optional_columns=(
+            args.text_column,
+            args.duration_column,
+            args.language_column,
+            args.custom_columns,
+        ),
+        source_path=sample_path,
+        source_kind="Parquet",
+        logger=logger,
+    )
+
+    validate_prepare_runtime(
+        resampling_backend=args.resampling_backend,
+        require_ffmpeg=True,
+        text_tokenizer_path=args.text_tokenizer,
+    )
 
 
 def main(argv=None):
@@ -335,6 +365,8 @@ def main(argv=None):
         raise FileNotFoundError(
             f"No files match {args.parquet_dir / args.parquet_glob}"
         )
+
+    _preflight_prepare(args, resolved)
 
     args.shar_dir.mkdir(parents=True, exist_ok=True)
     _validate_or_write_prepare_state(args)

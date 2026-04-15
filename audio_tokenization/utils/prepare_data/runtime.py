@@ -22,6 +22,28 @@ from audio_tokenization.utils.prepare_data.constants import (
 logger = logging.getLogger(__name__)
 
 
+def validate_prepare_runtime(
+    *,
+    resampling_backend: str | None = None,
+    require_ffmpeg: bool = False,
+    text_tokenizer_path: str | Path | None = None,
+) -> None:
+    """Fail fast on runtime prerequisites before worker startup."""
+    from audio_tokenization.utils.prepare_data.text_ops import load_text_tokenizer
+
+    init_worker_process(resampling_backend)
+
+    if text_tokenizer_path is not None:
+        load_text_tokenizer(text_tokenizer_path)
+
+    if require_ffmpeg and shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "ffmpeg is required for audio-bytes decode fallback but was not found on PATH. "
+            "Set PATH/LD_LIBRARY_PATH like the dataset SLURM script, or add a pinned ffmpeg "
+            "runtime before starting prepare_parquet_to_shar."
+        )
+
+
 def setup_partition_dir(
     part_dir: Path,
     *,
@@ -495,4 +517,3 @@ def run_aggregate(shar_root: Path) -> None:
     if agg_runtime:
         print(f"  Runtime counters: {dict(agg_runtime)}")
     print()
-

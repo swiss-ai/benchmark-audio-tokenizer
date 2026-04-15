@@ -127,6 +127,7 @@ from audio_tokenization.utils.prepare_data.runtime import (
     build_shar_index_from_parts,
     mark_partition_success,
     setup_partition_dir,
+    validate_prepare_runtime,
     validate_or_write_prepare_state,
 )
 from audio_tokenization.utils.prepare_data.text_ops import (
@@ -343,6 +344,13 @@ def main():
             parts.append(args.language)
         parts.append(args.split)
         args.shar_dir = args.shar_base_dir / f"{'_'.join(parts)}"
+
+    validate_prepare_runtime(
+        resampling_backend=None,
+        require_ffmpeg=False,
+        text_tokenizer_path=args.text_tokenizer,
+    )
+
     args.shar_dir.mkdir(parents=True, exist_ok=True)
     _validate_or_write_prepare_state(args)
 
