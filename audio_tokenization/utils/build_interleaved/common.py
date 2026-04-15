@@ -52,6 +52,9 @@ __all__ = [
     "_write_idx_file",
     "_merge_shards",
     "_partition_runs",
+    "list_interleave_cache_partitions",
+    "summarize_partition_stats",
+    "print_partition_stats",
     "load_parquets",
     "prepare_arrow_and_runs",
     "load_interleave_cache",
@@ -571,12 +574,87 @@ def _load_cache_layout(parquet_dir: Path) -> dict[str, object] | None:
         return json.load(f)
 
 
+def list_interleave_cache_partitions(cache_dir: Path) -> list[Path]:
+    """Return leaf cache directories to plan/build independently."""
+    layout = _load_cache_layout(cache_dir)
+    if not layout:
+        return [cache_dir]
+
+    if layout.get("version") != "v2":
+        return [cache_dir]
+
+    if any(p.is_dir() and p.name.startswith("rank_") for p in cache_dir.iterdir()):
+        return [cache_dir]
+
+    partition_dirs = sorted(
+        p for p in cache_dir.iterdir()
+        if p.is_dir()
+        and (p / "_CACHE_LAYOUT.json").exists()
+        and any(child.is_dir() and child.name.startswith("rank_") for child in p.iterdir())
+    )
+    if partition_dirs:
+        return partition_dirs
+    return [cache_dir]
+
+
+def summarize_partition_stats(
+    partition_stats: list[dict[str, int | str]],
+    top_k: int = 5,
+) -> dict[str, object]:
+    """Summarize per-partition build stats for logs/metadata."""
+    ordered = sorted(
+        partition_stats,
+        key=lambda s: (
+            int(s["clips"]),
+            int(s["runs"]),
+            int(s.get("audio_tokens", 0)) + int(s.get("text_tokens", 0)),
+        ),
+        reverse=True,
+    )
+    return {
+        "num_partitions": len(partition_stats),
+        "total_clips": int(sum(int(s["clips"]) for s in partition_stats)),
+        "total_runs": int(sum(int(s["runs"]) for s in partition_stats)),
+        "total_sources": int(sum(int(s["sources"]) for s in partition_stats)),
+        "total_audio_tokens": int(sum(int(s.get("audio_tokens", 0)) for s in partition_stats)),
+        "total_text_tokens": int(sum(int(s.get("text_tokens", 0)) for s in partition_stats)),
+        "top_partitions": ordered[:top_k],
+    }
+
+
+def print_partition_stats(partition_stats: list[dict[str, int | str]], top_k: int = 5) -> dict[str, object]:
+    """Print a concise partition summary and return the structured payload."""
+    summary = summarize_partition_stats(partition_stats, top_k=top_k)
+    if not partition_stats:
+        print("\nPartition summary: no partitions processed")
+        return summary
+
+    print(
+        f"\nPartition summary: {summary['num_partitions']} partitions, "
+        f"{summary['total_clips']:,} clips, {summary['total_runs']:,} runs, "
+        f"{summary['total_audio_tokens'] + summary['total_text_tokens']:,} payload tokens"
+    )
+    print(f"Top {min(top_k, len(partition_stats))} partitions by clip count:")
+    for stats in summary["top_partitions"]:
+        total_tokens = int(stats.get("audio_tokens", 0)) + int(stats.get("text_tokens", 0))
+        print(
+            f"  {stats['name']}: clips={int(stats['clips']):,}, runs={int(stats['runs']):,}, "
+            f"sources={int(stats['sources']):,}, tokens={total_tokens:,}, workers={int(stats['workers']):,}"
+        )
+    return summary
+
+
 def load_interleave_cache(parquet_dir: Path) -> tuple[pl.DataFrame, object]:
     """Load interleave cache metadata and return the matching cache reader."""
     layout = _load_cache_layout(parquet_dir)
     if layout:
         version = layout.get("version")
         if version == "v2":
+            if not any(p.is_dir() and p.name.startswith("rank_") for p in parquet_dir.iterdir()):
+                raise RuntimeError(
+                    f"{parquet_dir} is a partitioned v2 cache root. "
+                    "Pass a leaf partition directory or use list_interleave_cache_partitions()."
+                )
             reader = _V2InterleaveCacheReader(parquet_dir, layout)
             df = reader.load_metadata()
             print(f"\nFound {len(reader.chunks)} v2 cache chunks in {parquet_dir}")

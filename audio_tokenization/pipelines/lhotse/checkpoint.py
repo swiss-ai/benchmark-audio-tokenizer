@@ -163,7 +163,7 @@ def save_checkpoint(
     output_dir: str,
     rank: int,
     sampler_state: Dict[str, Any],
-    chunk_id: int,
+    writer_state: Any,
     stats: Dict[str, Any],
     world_size: int = 1,
 ) -> None:
@@ -172,13 +172,15 @@ def save_checkpoint(
     tmp_path = str(ckpt_path) + ".tmp"
     payload = {
         "sampler_state": sampler_state,
-        "chunk_id": chunk_id,
+        "writer_state": writer_state,
         "stats": stats,
         "world_size": world_size,
     }
+    if isinstance(writer_state, int):
+        payload["chunk_id"] = writer_state
     torch.save(payload, tmp_path)
     os.replace(tmp_path, str(ckpt_path))
-    logger.debug(f"[rank {rank}] Saved checkpoint chunk_id={chunk_id}")
+    logger.debug(f"[rank {rank}] Saved checkpoint writer_state={writer_state!r}")
 
 
 def load_checkpoint(output_dir: str, rank: int) -> Optional[Dict[str, Any]]:
@@ -278,5 +280,4 @@ class SimpleWandbLogger:
         import wandb
 
         wandb.finish()
-
 

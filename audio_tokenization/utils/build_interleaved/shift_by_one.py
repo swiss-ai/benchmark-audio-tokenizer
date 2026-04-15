@@ -46,11 +46,15 @@ from .common import (
     _detect_runs,
     _merge_shards,
     _partition_runs,
+    _write_idx_file,
     compute_ratio_adjustment,
     format_distribution,
     get_bin_path,
+    get_idx_path,
+    list_interleave_cache_partitions,
     load_interleave_cache,
     load_token_ids,
+    print_partition_stats,
     prepare_interleave_cache_and_runs,
     prepare_length_metadata,
 )
@@ -439,6 +443,18 @@ def _dry_run_shift(
     print(f"\nStats saved to {stats_path}")
 
 
+def _compute_per_run_stats_shift(run_lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    rl = run_lengths.astype(np.int64)
+    single = rl == 1
+    il_per_run = np.where(
+        single,
+        0,
+        np.maximum(1, rl // 2) + np.maximum(1, (rl - 1) // 2),
+    )
+    tr_per_run = np.where(single, 1, (rl % 2) + ((rl - 1) % 2))
+    return il_per_run, tr_per_run
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -467,13 +483,19 @@ def main() -> None:
     )
     dtype = DType.optimal_dtype(vocab_size)
 
-    df, cache_reader = load_interleave_cache(parquet_dir)
+    partition_dirs = list_interleave_cache_partitions(parquet_dir)
 
     if args.dry_run:
+        if len(partition_dirs) > 1:
+            raise RuntimeError(
+                "Dry-run on a partitioned v2 cache root is not supported yet. "
+                "Pass a leaf partition directory instead."
+            )
+        df, _cache_reader = load_interleave_cache(partition_dirs[0])
         _dry_run_shift(
             df, args.max_seq_len, bos_id, eos_id,
             stt_continue_id, stt_transcribe_id, tts_continue_id,
-            dtype, parquet_dir,
+            dtype, partition_dirs[0],
             transcribe_ratio=args.transcribe_ratio,
             seq_threshold=args.seq_threshold,
         )
@@ -482,26 +504,39 @@ def main() -> None:
     # Full build
     global _shared_cache, _shared_run_starts, _shared_run_lengths, _shared_transcribe_only_runs
 
-    cache, run_starts, run_lengths, n_clips, n_sources = (
-        prepare_interleave_cache_and_runs(df, cache_reader)
-    )
-    _shared_cache = cache
-    _shared_run_starts = run_starts
-    _shared_run_lengths = run_lengths
-
-    # Transcribe ratio — vectorized
-    transcribe_only_runs: set[int] = set()
+    transcribe_only_runs_by_partition: dict[Path, set[int]] = {}
+    runs_converted_to_transcribe = 0
     if args.transcribe_ratio is not None:
-        rl = run_lengths.astype(np.int64)
-        single = rl == 1
-        il_per_run = np.where(single, 0,
-            np.maximum(1, rl // 2) + np.maximum(1, (rl - 1) // 2))
-        tr_per_run = np.where(single, 1,
-            (rl % 2) + ((rl - 1) % 2))
-        transcribe_only_runs = compute_ratio_adjustment(
-            il_per_run, tr_per_run, run_lengths, args.transcribe_ratio,
+        all_il_per_run = []
+        all_tr_per_run = []
+        all_run_lengths = []
+        partition_run_counts = []
+        for partition_dir in partition_dirs:
+            df, _cache_reader = load_interleave_cache(partition_dir)
+            length_df = prepare_length_metadata(df)
+            _sorted_df, _run_starts, run_lengths = _detect_runs(length_df)
+            il_per_run, tr_per_run = _compute_per_run_stats_shift(run_lengths)
+            all_il_per_run.append(il_per_run)
+            all_tr_per_run.append(tr_per_run)
+            all_run_lengths.append(run_lengths.astype(np.int64))
+            partition_run_counts.append(len(run_lengths))
+        selected_global_runs = compute_ratio_adjustment(
+            np.concatenate(all_il_per_run) if all_il_per_run else np.array([], dtype=np.int64),
+            np.concatenate(all_tr_per_run) if all_tr_per_run else np.array([], dtype=np.int64),
+            np.concatenate(all_run_lengths) if all_run_lengths else np.array([], dtype=np.int64),
+            args.transcribe_ratio,
         )
-    _shared_transcribe_only_runs = transcribe_only_runs
+        runs_converted_to_transcribe = len(selected_global_runs)
+        offset = 0
+        for partition_dir, count in zip(partition_dirs, partition_run_counts):
+            local = {
+                run_idx - offset
+                for run_idx in selected_global_runs
+                if offset <= run_idx < offset + count
+            }
+            if local:
+                transcribe_only_runs_by_partition[partition_dir] = local
+            offset += count
 
     all_keys = OFFSET_KEYS + [TR_KEY]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -509,45 +544,138 @@ def main() -> None:
         (output_dir / "stage2").mkdir(parents=True, exist_ok=True)
         (output_dir / "lct").mkdir(parents=True, exist_ok=True)
 
-    n_runs = len(run_starts)
     num_workers = args.num_workers or max(1, multiprocessing.cpu_count() - 2)
-    run_ranges = _partition_runs(run_lengths, num_workers)
-
+    total_clips = 0
+    total_sources = 0
+    partition_stats = []
+    worker_results = []
     if args.tmp_dir:
         tmp_dir = Path(args.tmp_dir) / f"_shift_shards_{os.getpid()}"
     else:
         tmp_dir = output_dir / "_tmp_shards"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    worker_args = [
-        (wid, rng[0], rng[1], all_keys, args.max_seq_len,
-         bos_id, eos_id, stt_continue_id, stt_transcribe_id, tts_continue_id,
-         dtype, str(tmp_dir), args.seq_threshold)
-        for wid, rng in enumerate(run_ranges)
-    ]
-
     t0 = time.time()
-    ctx = multiprocessing.get_context("fork")
-    with ctx.Pool(num_workers) as pool:
-        worker_results = pool.starmap(_shift_run_chunk, worker_args)
-    print(f"\nWorkers finished in {time.time() - t0:.1f}s")
+    try:
+        for part_idx, partition_dir in enumerate(partition_dirs):
+            print(f"\nProcessing partition {part_idx + 1}/{len(partition_dirs)}: {partition_dir.name}")
+            df, cache_reader = load_interleave_cache(partition_dir)
+            cache, run_starts, run_lengths, n_clips, n_sources = (
+                prepare_interleave_cache_and_runs(df, cache_reader)
+            )
+            audio_token_total = int(cache.audio_lengths.sum())
+            text_token_total = int(cache.text_lengths.sum())
+            total_clips += n_clips
+            total_sources += n_sources
+            n_runs = len(run_starts)
+            _shared_cache = cache
+            _shared_run_starts = run_starts
+            _shared_run_lengths = run_lengths
+            _shared_transcribe_only_runs = transcribe_only_runs_by_partition.get(partition_dir, set())
 
-    if args.seq_threshold is not None:
-        merge_keys = [f"{b}/{k}" for b in ("stage2", "lct") for k in all_keys]
-    else:
-        merge_keys = all_keys
+            run_ranges = _partition_runs(run_lengths, num_workers)
+            partition_stats.append(
+                {
+                    "name": partition_dir.name,
+                    "clips": n_clips,
+                    "runs": n_runs,
+                    "sources": n_sources,
+                    "audio_tokens": audio_token_total,
+                    "text_tokens": text_token_total,
+                    "workers": len(run_ranges),
+                }
+            )
+            if not run_ranges:
+                _shared_cache = None
+                _shared_run_starts = None
+                _shared_run_lengths = None
+                _shared_transcribe_only_runs = set()
+                continue
 
-    t_merge = time.time()
-    counters = _merge_shards(worker_results, merge_keys, output_dir, dtype, tmp_dir)
-    print(f"Merged shards in {time.time() - t_merge:.1f}s")
+            part_tmp_dir = tmp_dir / f"part_{part_idx:04d}_{partition_dir.name}"
+            part_tmp_dir.mkdir(parents=True, exist_ok=True)
+            worker_args = [
+                (wid, rng[0], rng[1], all_keys, args.max_seq_len,
+                 bos_id, eos_id, stt_continue_id, stt_transcribe_id, tts_continue_id,
+                 dtype, str(part_tmp_dir), args.seq_threshold)
+                for wid, rng in enumerate(run_ranges)
+            ]
+            # Pool creation must stay inside the partition loop, after the
+            # current partition's globals are assigned. fork() captures these
+            # globals for worker read-only access.
+            ctx = multiprocessing.get_context("fork")
+            with ctx.Pool(len(run_ranges)) as pool:
+                worker_results.extend(pool.starmap(_shift_run_chunk, worker_args))
 
-    shutil.rmtree(tmp_dir)
+            _shared_cache = None
+            _shared_run_starts = None
+            _shared_run_lengths = None
+            _shared_transcribe_only_runs = set()
+            del cache, df, cache_reader
+        print(f"\nWorkers finished in {time.time() - t0:.1f}s")
 
-    _shared_cache = None
+        if args.seq_threshold is not None:
+            merge_keys = [f"{b}/{k}" for b in ("stage2", "lct") for k in all_keys]
+        else:
+            merge_keys = all_keys
 
+        if worker_results:
+            t_merge = time.time()
+            counters = _merge_shards(worker_results, merge_keys, output_dir, dtype, tmp_dir)
+            print(f"Merged shards in {time.time() - t_merge:.1f}s")
+        else:
+            counters = {}
+            for key in merge_keys:
+                open(get_bin_path(str(output_dir / key)), "wb").close()
+                _write_idx_file(
+                    get_idx_path(str(output_dir / key)),
+                    dtype,
+                    np.array([], dtype=np.int32),
+                    np.array([0], dtype=np.int64),
+                )
+                counters[key] = {"seqs": 0, "tokens": 0}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _shared_cache = None
+        _shared_run_starts = None
+        _shared_run_lengths = None
+        _shared_transcribe_only_runs = set()
+
+    partition_summary = print_partition_stats(partition_stats)
     for key in sorted(counters.keys()):
         c = counters[key]
         print(f"  {key}: {c['seqs']:,} sequences, {c['tokens']:,} tokens")
+
+    metadata = {
+        "mode": "shift_by_one",
+        "tokenizer_path": args.tokenizer_path,
+        "parquet_dir": str(parquet_dir),
+        "vocab_size": vocab_size,
+        "dtype": dtype.__name__,
+        "bos_id": bos_id,
+        "eos_id": eos_id,
+        "stt_continue_id": stt_continue_id,
+        "stt_transcribe_id": stt_transcribe_id,
+        "tts_continue_id": tts_continue_id,
+        "max_seq_len": args.max_seq_len,
+        "seq_threshold": args.seq_threshold,
+        "transcribe_ratio": args.transcribe_ratio,
+        "runs_converted_to_transcribe": runs_converted_to_transcribe,
+        "total_clips": total_clips,
+        "total_sources": total_sources,
+        "partition_summary": partition_summary,
+        "partition_stats": partition_stats,
+        "outputs": {
+            key: {"sequences": counters[key]["seqs"], "tokens": counters[key]["tokens"]}
+            for key in sorted(counters.keys())
+        },
+    }
+    metadata_path = output_dir / "metadata.json"
+    with open(metadata_path, "w") as f:
+        import json
+
+        json.dump(metadata, f, indent=2)
+    print(f"\nMetadata written to {metadata_path}")
 
 
 if __name__ == "__main__":

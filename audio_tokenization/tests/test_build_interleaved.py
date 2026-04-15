@@ -11,6 +11,7 @@ from audio_tokenization.utils.build_interleaved.common import (
     find_consecutive_runs,
     _detect_runs,
     compute_ratio_adjustment,
+    list_interleave_cache_partitions,
     load_parquets,
     load_interleave_cache,
     prepare_interleave_cache_and_runs,
@@ -368,7 +369,7 @@ class TestInterleaveCacheReaders:
     def test_load_interleave_cache_reads_v2_metadata_and_payload(self, tmp_path: Path):
         from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
 
-        writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, chunk_id=0)
+        writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
         writer.add_rows([
             {
                 "clip_id": "s1@000000",
@@ -397,7 +398,8 @@ class TestInterleaveCacheReaders:
         ])
         writer.finalize()
 
-        df, reader = load_interleave_cache(tmp_path)
+        partition_dir = list_interleave_cache_partitions(tmp_path)[0]
+        df, reader = load_interleave_cache(partition_dir)
         cache, starts, lengths, n_clips, n_sources = prepare_interleave_cache_and_runs(df, reader)
 
         assert reader.__class__.__name__ == "_V2InterleaveCacheReader"
@@ -420,7 +422,7 @@ class TestInterleaveCacheReaders:
         from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
         import audio_tokenization.utils.build_interleaved.common as bic
 
-        writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, chunk_id=0)
+        writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
         writer.add_rows([
             {
                 "clip_id": "s1@000000",
@@ -437,10 +439,14 @@ class TestInterleaveCacheReaders:
         ])
         writer.finalize()
 
+        partition_dir = list_interleave_cache_partitions(tmp_path)[0]
+        df, reader = load_interleave_cache(partition_dir)
         monkeypatch.setattr(bic.resource, "getrlimit", lambda *_args: (10, 10))
-        monkeypatch.setattr(bic.os, "listdir", lambda _path: ["fd0", "fd1", "fd2", "fd3", "fd4", "fd5", "fd6", "fd7", "fd8"])
-
-        df, reader = load_interleave_cache(tmp_path)
+        monkeypatch.setattr(
+            bic.os,
+            "listdir",
+            lambda _path: ["fd0", "fd1", "fd2", "fd3", "fd4", "fd5", "fd6", "fd7", "fd8"],
+        )
         with pytest.raises(RuntimeError, match="file descriptor budget"):
             prepare_interleave_cache_and_runs(df, reader)
 

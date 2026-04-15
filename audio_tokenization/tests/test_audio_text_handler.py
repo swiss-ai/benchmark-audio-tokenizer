@@ -4,6 +4,7 @@ import pytest
 
 from audio_tokenization.pipelines.lhotse.audio_text import (
     AudioTextHandler,
+    resolve_partition_value,
     resolve_interleaving_metadata,
 )
 
@@ -64,8 +65,12 @@ def test_audio_text_handler_selects_v2_writer(monkeypatch, tmp_path):
     created = {}
 
     class FakeWriter:
-        def __init__(self, output_dir, rank, chunk_id):
-            created["args"] = (output_dir, rank, chunk_id)
+        @staticmethod
+        def _normalize_partitioning(partitioning):
+            return partitioning or {"type": "hash", "field": "source_id", "num_buckets": 16}
+
+        def __init__(self, output_dir, rank, writer_state, partitioning):
+            created["args"] = (output_dir, rank, writer_state, partitioning)
 
     monkeypatch.setattr(
         "audio_tokenization.pipelines.shard_io.StructuredCacheChunkWriter",
@@ -79,7 +84,12 @@ def test_audio_text_handler_selects_v2_writer(monkeypatch, tmp_path):
     })
     handler._setup_writer_interleaved(str(tmp_path), 3, 11)
 
-    assert created["args"] == (str(tmp_path), 3, 11)
+    assert created["args"] == (
+        str(tmp_path),
+        3,
+        11,
+        {"type": "hash", "field": "source_id", "num_buckets": 16},
+    )
 
 
 def test_audio_text_handler_selects_v1_writer_by_default(monkeypatch, tmp_path):
@@ -101,3 +111,23 @@ def test_audio_text_handler_selects_v1_writer_by_default(monkeypatch, tmp_path):
     handler._setup_writer_interleaved(str(tmp_path), 1, 2)
 
     assert created["args"] == (str(tmp_path), 1, 2)
+
+
+def test_resolve_partition_value_prefers_custom_then_supervision():
+    supervision = SimpleNamespace(language="de", speaker="sup-spk")
+    cut = SimpleNamespace(
+        id="cut",
+        custom={"language": "fr"},
+        supervisions=[supervision],
+        speaker="cut-spk",
+    )
+
+    assert resolve_partition_value(cut, "language") == "fr"
+    assert resolve_partition_value(cut, "speaker") == "sup-spk"
+
+
+def test_resolve_partition_value_reads_supervision_field():
+    supervision = SimpleNamespace(language="it")
+    cut = SimpleNamespace(id="cut", custom={}, supervisions=[supervision])
+
+    assert resolve_partition_value(cut, "language") == "it"

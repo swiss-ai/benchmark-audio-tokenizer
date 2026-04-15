@@ -79,6 +79,13 @@ def _build_sampler_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return sampler_kwargs
 
 
+def _format_writer_state(writer_state: Any) -> str:
+    if isinstance(writer_state, dict):
+        items = ", ".join(f"{k}={v}" for k, v in sorted(writer_state.items()))
+        return "{" + items + "}"
+    return str(writer_state)
+
+
 def _normalize_batch(batch: dict, target_db: float, device: str = "cpu") -> dict:
     """Peak-normalize audio in a batch dict (works for all handler modes).
 
@@ -144,7 +151,7 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     #    recovery is typically fast.
     # ------------------------------------------------------------------
     resume = cfg.get("resume", False)
-    start_chunk_id = 0
+    start_writer_state: Any = 0
 
     if resume:
         ckpt = load_checkpoint(output_dir, rank)
@@ -159,7 +166,10 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
                 ckpt = None
         if ckpt is not None:
             sampler.load_state_dict(ckpt["sampler_state"])
-            start_chunk_id = ckpt["chunk_id"] + 1
+            if "writer_state" in ckpt:
+                start_writer_state = ckpt["writer_state"]
+            else:
+                start_writer_state = ckpt["chunk_id"] + 1
             prev = ckpt.get("stats", {})
             cumulative_stats.samples_processed = prev.get("samples_processed", 0)
             cumulative_stats.tokens_generated = prev.get("tokens_generated", 0)
@@ -168,7 +178,7 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
             cumulative_stats.samples_skipped = prev.get("samples_skipped", 0)
             cumulative_stats.rms_skipped = prev.get("rms_skipped", 0)
             logger.info(
-                f"[rank {rank}] Resumed from chunk {start_chunk_id}, "
+                f"[rank {rank}] Resumed from writer_state={_format_writer_state(start_writer_state)}, "
                 f"samples={cumulative_stats.samples_processed}"
             )
 
@@ -264,17 +274,17 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     # 7. Main loop -- tokenize batches, write output, checkpoint
     # ------------------------------------------------------------------
     checkpoint_interval = cfg.get("checkpoint_interval_batches", 500)
-    chunk_id = start_chunk_id
+    writer_state = start_writer_state
     batch_count = 0
 
-    handler.setup_writer(output_dir, rank, chunk_id, tokenizer)
+    handler.setup_writer(output_dir, rank, writer_state, tokenizer)
 
     stats = cumulative_stats
     total_audio_seconds = 0.0
 
     logger.info(
         f"[rank {rank}] Starting tokenization loop "
-        f"(chunk_id={chunk_id}, checkpoint_interval={checkpoint_interval})"
+        f"(writer_state={_format_writer_state(writer_state)}, checkpoint_interval={checkpoint_interval})"
     )
 
     consecutive_errors = 0
@@ -393,9 +403,9 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
 
             # Periodic checkpoint: finalize current chunk, save state, open next
             if batch_count % checkpoint_interval == 0 and handler.chunk_samples > 0:
-                done_chunk = handler.checkpoint_writer()
+                writer_state = handler.checkpoint_writer()
                 logger.info(
-                    f"[rank {rank}] Finalized chunk {done_chunk} "
+                    f"[rank {rank}] Checkpointed writer state {_format_writer_state(writer_state)} "
                     f"({stats.tokens_generated} total tokens)"
                 )
 
@@ -403,12 +413,10 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
                     output_dir,
                     rank,
                     sampler_state=sampler.state_dict(),
-                    chunk_id=done_chunk,
+                    writer_state=writer_state,
                     stats=stats.to_dict(),
                     world_size=world_size,
                 )
-
-                chunk_id = done_chunk + 1
 
             _batch_ready_time = _time.monotonic()
 
@@ -429,14 +437,14 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
         output_dir,
         rank,
         sampler_state=sampler.state_dict(),
-        chunk_id=chunk_id,
+        writer_state=handler.get_writer_state(),
         stats=stats.to_dict(),
         world_size=world_size,
     )
 
     result = stats.finalize()
     result["rank"] = rank
-    result["chunks_written"] = chunk_id - start_chunk_id + (1 if handler.chunk_samples > 0 else 0)
+    result["chunks_written"] = handler.chunks_written
 
     if wandb_logger is not None:
         wandb_logger.finish()

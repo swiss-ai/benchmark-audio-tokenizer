@@ -44,6 +44,24 @@ def resolve_interleaving_metadata(cut):
     )
 
 
+def resolve_partition_value(cut, field: str):
+    """Resolve a partition field from cut custom, supervision, or cut attr."""
+    custom = cut.custom or {}
+    if field in custom and custom[field] is not None:
+        return custom[field]
+    if cut.supervisions:
+        supervision = cut.supervisions[0]
+        if hasattr(supervision, field):
+            value = getattr(supervision, field)
+            if value is not None:
+                return value
+    if hasattr(cut, field):
+        value = getattr(cut, field)
+        if value is not None:
+            return value
+    raise ValueError(f"Unable to resolve partition field {field!r} for cut {cut.id!r}")
+
+
 class AudioTextHandler:
     """Handler for audio-text tokenization mode.
 
@@ -85,6 +103,12 @@ class AudioTextHandler:
                 f"Unsupported cache_layout_version: {self.cache_layout_version!r}. "
                 "Must be 'v1' or 'v2'."
             )
+        self.partitioning = cfg.get("partitioning")
+        if self.audio_text_format == "interleaved" and self.cache_layout_version == "v2":
+            from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
+
+            self.partitioning = StructuredCacheChunkWriter._normalize_partitioning(self.partitioning)
+        self.chunks_written = 0
 
     def create_dataset(self):
         from lhotse.dataset import K2SpeechRecognitionDataset
@@ -98,26 +122,31 @@ class AudioTextHandler:
     # Writer lifecycle
     # ------------------------------------------------------------------
 
-    def setup_writer(self, output_dir, rank, chunk_id, tokenizer):
+    def setup_writer(self, output_dir, rank, writer_state, tokenizer):
         if self.audio_text_format == "direct":
-            self._setup_writer_direct(output_dir, rank, chunk_id, tokenizer)
+            self._setup_writer_direct(output_dir, rank, writer_state, tokenizer)
         else:
-            self._setup_writer_interleaved(output_dir, rank, chunk_id)
+            self._setup_writer_interleaved(output_dir, rank, writer_state)
         self.chunk_samples = 0
 
-    def _setup_writer_direct(self, output_dir, rank, chunk_id, tokenizer):
+    def _setup_writer_direct(self, output_dir, rank, writer_state, tokenizer):
         self._output_dir = output_dir
         self._rank = rank
-        self._chunk_id = chunk_id
+        self._chunk_id = int(writer_state)
         self._vocab_size = len(tokenizer.omni_tokenizer)
         self._builder, self._tmp_bin, self._tmp_idx, self._bin, self._idx = \
-            open_chunk_writer(output_dir, rank, chunk_id, self._vocab_size)
+            open_chunk_writer(output_dir, rank, self._chunk_id, self._vocab_size)
 
-    def _setup_writer_interleaved(self, output_dir, rank, chunk_id):
+    def _setup_writer_interleaved(self, output_dir, rank, writer_state):
         if self.cache_layout_version == "v2":
             from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
 
-            self._writer = StructuredCacheChunkWriter(output_dir, rank, chunk_id)
+            self._writer = StructuredCacheChunkWriter(
+                output_dir,
+                rank,
+                writer_state=writer_state,
+                partitioning=self.partitioning,
+            )
             return
 
         from audio_tokenization.pipelines.shard_io import ParquetChunkWriter
@@ -127,7 +156,7 @@ class AudioTextHandler:
         for tmp in pdir.glob(f"rank_{rank:04d}_*.parquet.tmp"):
             logger.warning(f"[rank {rank}] Removing stale temp file: {tmp.name}")
             tmp.unlink()
-        self._writer = ParquetChunkWriter(output_dir, rank, chunk_id)
+        self._writer = ParquetChunkWriter(output_dir, rank, int(writer_state))
 
     # ------------------------------------------------------------------
     # Batch processing
@@ -223,6 +252,8 @@ class AudioTextHandler:
                 "audio_tokens": tokens,
                 "dataset": self.dataset_name,
             })
+            if self.cache_layout_version == "v2" and self.partitioning and self.partitioning["type"] == "field":
+                rows[-1]["_partition_value"] = resolve_partition_value(cut, self.partitioning["field"])
             batch_audio_tok += len(tokens)
             batch_text_tok += len(text_tokens)
 
@@ -240,7 +271,7 @@ class AudioTextHandler:
     # Checkpoint / finalize
     # ------------------------------------------------------------------
 
-    def checkpoint_writer(self) -> int:
+    def checkpoint_writer(self):
         if self.audio_text_format == "direct":
             return self._checkpoint_writer_direct()
         else:
@@ -251,14 +282,26 @@ class AudioTextHandler:
         done = self._chunk_id
         self._chunk_id += 1
         self.chunk_samples = 0
+        self.chunks_written += 1
         self._builder, self._tmp_bin, self._tmp_idx, self._bin, self._idx = \
             open_chunk_writer(self._output_dir, self._rank, self._chunk_id, self._vocab_size)
         return done
 
-    def _checkpoint_writer_interleaved(self) -> int:
+    def _checkpoint_writer_interleaved(self):
         done_id = self._writer.finalize()
         self.chunk_samples = 0
+        if self.cache_layout_version == "v2":
+            self.chunks_written += len(done_id)
+        else:
+            self.chunks_written += 1
         return done_id
+
+    def get_writer_state(self):
+        if self.audio_text_format == "direct":
+            return self._chunk_id
+        if self.cache_layout_version == "v2":
+            return self._writer.get_state()
+        return self._writer.chunk_id
 
     def finalize_writer(self):
         if self.audio_text_format == "direct":
@@ -269,6 +312,7 @@ class AudioTextHandler:
     def _finalize_writer_direct(self):
         if self.chunk_samples > 0:
             finalize_shard_writer(self._builder, self._tmp_bin, self._tmp_idx, self._bin, self._idx)
+            self.chunks_written += 1
         else:
             for p in (self._tmp_bin, self._tmp_idx):
                 try:
@@ -279,4 +323,8 @@ class AudioTextHandler:
 
     def _finalize_writer_interleaved(self):
         if self.chunk_samples > 0:
-            self._writer.finalize()
+            done = self._writer.finalize()
+            if self.cache_layout_version == "v2":
+                self.chunks_written += len(done)
+            else:
+                self.chunks_written += 1

@@ -16,8 +16,17 @@ def _read_int32_tokens(path: Path, offset: int, length: int) -> list[int]:
         return np.frombuffer(f.read(length * itemsize), dtype=np.int32).tolist()
 
 
+def _single_partition_dir(root: Path) -> Path:
+    partitions = sorted(
+        p for p in root.iterdir()
+        if p.is_dir() and (p / "_CACHE_LAYOUT.json").exists()
+    )
+    assert len(partitions) == 1
+    return partitions[0]
+
+
 def test_structured_cache_chunk_writer_writes_layout_and_offsets(tmp_path):
-    writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, chunk_id=0)
+    writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
     writer.add_rows([
         {
             "clip_id": "a@000000",
@@ -46,13 +55,16 @@ def test_structured_cache_chunk_writer_writes_layout_and_offsets(tmp_path):
     ])
 
     done = writer.finalize()
-    assert done == 0
+    assert list(done.values()) == [0]
 
     layout = json.loads((tmp_path / "_CACHE_LAYOUT.json").read_text())
     assert layout["version"] == "v2"
     assert layout["commit_marker"] == "clips.parquet"
+    assert layout["partitioned"] is True
+    assert layout["partitioning"] == {"type": "hash", "field": "source_id", "num_buckets": 16}
 
-    rank_dir = tmp_path / "rank_0000"
+    partition_dir = _single_partition_dir(tmp_path)
+    rank_dir = partition_dir / "rank_0000"
     clips_path = rank_dir / "clips.000000.parquet"
     audio_path = rank_dir / "audio_tokens.000000.bin"
     text_path = rank_dir / "text_tokens.000000.bin"
@@ -79,13 +91,14 @@ def test_structured_cache_chunk_writer_writes_layout_and_offsets(tmp_path):
 
 
 def test_structured_cache_chunk_writer_removes_orphan_bins_without_commit_marker(tmp_path):
-    rank_dir = tmp_path / "rank_0003"
+    rank_dir = tmp_path / "bucket_0000" / "rank_0003"
     rank_dir.mkdir(parents=True)
     (rank_dir / "audio_tokens.000000.bin").write_bytes(b"orphan-audio")
     (rank_dir / "text_tokens.000000.bin").write_bytes(b"orphan-text")
     (rank_dir / "clips.000001.parquet.tmp").write_text("stale")
+    (rank_dir.parent / "_CACHE_LAYOUT.json").write_text(json.dumps({"version": "v2"}))
 
-    writer = StructuredCacheChunkWriter(str(tmp_path), rank=3, chunk_id=0)
+    writer = StructuredCacheChunkWriter(str(tmp_path), rank=3, writer_state=0)
 
     assert not (rank_dir / "audio_tokens.000000.bin").exists()
     assert not (rank_dir / "text_tokens.000000.bin").exists()
@@ -94,7 +107,7 @@ def test_structured_cache_chunk_writer_removes_orphan_bins_without_commit_marker
 
 
 def test_structured_cache_chunk_writer_raises_on_missing_bins_for_committed_parquet(tmp_path):
-    rank_dir = tmp_path / "rank_0001"
+    rank_dir = tmp_path / "bucket_0000" / "rank_0001"
     rank_dir.mkdir(parents=True)
     table = pa.table(
         {
@@ -114,9 +127,10 @@ def test_structured_cache_chunk_writer_raises_on_missing_bins_for_committed_parq
         schema=StructuredCacheChunkWriter._get_schema(),
     )
     pq.write_table(table, rank_dir / "clips.000000.parquet")
+    (rank_dir.parent / "_CACHE_LAYOUT.json").write_text(json.dumps({"version": "v2"}))
 
     with pytest.raises(RuntimeError, match="exists without both token bins"):
-        StructuredCacheChunkWriter(str(tmp_path), rank=1, chunk_id=0)
+        StructuredCacheChunkWriter(str(tmp_path), rank=1, writer_state={"bucket_0000": 0})
 
 
 def test_structured_cache_chunk_writer_raises_on_layout_version_mismatch(tmp_path):
@@ -125,4 +139,46 @@ def test_structured_cache_chunk_writer_raises_on_layout_version_mismatch(tmp_pat
     )
 
     with pytest.raises(RuntimeError, match="layout mismatch"):
-        StructuredCacheChunkWriter(str(tmp_path), rank=0, chunk_id=0)
+        StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
+
+
+def test_structured_cache_chunk_writer_resumes_per_partition_chunk_ids(tmp_path):
+    writer = StructuredCacheChunkWriter(
+        str(tmp_path),
+        rank=0,
+        writer_state={"language=fr": 3},
+        partitioning={"type": "field", "field": "language"},
+    )
+    writer.add_rows([
+        {
+            "clip_id": "fr@000000",
+            "source_id": "fr",
+            "clip_num": 0,
+            "clip_start": 0.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "bonjour",
+            "text_tokens": [1],
+            "audio_tokens": [10],
+            "dataset": "ds",
+            "_partition_value": "fr",
+        },
+        {
+            "clip_id": "de@000000",
+            "source_id": "de",
+            "clip_num": 0,
+            "clip_start": 0.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "hallo",
+            "text_tokens": [2],
+            "audio_tokens": [11],
+            "dataset": "ds",
+            "_partition_value": "de",
+        },
+    ])
+
+    done = writer.finalize()
+
+    assert done == {"language=de": 0, "language=fr": 3}
+    assert writer.get_state() == {"language=de": 1, "language=fr": 4}

@@ -20,18 +20,19 @@ class AudioOnlyHandler:
 
     def __init__(self, cfg):
         self.chunk_samples = 0
+        self.chunks_written = 0
 
     def create_dataset(self):
         from lhotse.dataset import UnsupervisedWaveformDataset
         return UnsupervisedWaveformDataset(collate=True)
 
-    def setup_writer(self, output_dir, rank, chunk_id, tokenizer):
+    def setup_writer(self, output_dir, rank, writer_state, tokenizer):
         self._output_dir = output_dir
         self._rank = rank
-        self._chunk_id = chunk_id
+        self._chunk_id = int(writer_state)
         self._vocab_size = len(tokenizer.omni_tokenizer)
         self._builder, self._tmp_bin, self._tmp_idx, self._bin, self._idx = \
-            open_chunk_writer(output_dir, rank, chunk_id, self._vocab_size)
+            open_chunk_writer(output_dir, rank, self._chunk_id, self._vocab_size)
         self.chunk_samples = 0
 
     def process_batch(self, batch, tokenizer, stats, target_sr, device):
@@ -75,13 +76,18 @@ class AudioOnlyHandler:
         done = self._chunk_id
         self._chunk_id += 1
         self.chunk_samples = 0
+        self.chunks_written += 1
         self._builder, self._tmp_bin, self._tmp_idx, self._bin, self._idx = \
             open_chunk_writer(self._output_dir, self._rank, self._chunk_id, self._vocab_size)
         return done
 
+    def get_writer_state(self) -> int:
+        return self._chunk_id
+
     def finalize_writer(self):
         if self.chunk_samples > 0:
             finalize_shard_writer(self._builder, self._tmp_bin, self._tmp_idx, self._bin, self._idx)
+            self.chunks_written += 1
         else:
             for p in (self._tmp_bin, self._tmp_idx):
                 try:

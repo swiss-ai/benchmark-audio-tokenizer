@@ -1,9 +1,12 @@
 from pathlib import Path
 
+import json
 import numpy as np
+import sys
 
 from audio_tokenization.utils.build_interleaved import shift_by_one as sbo
 from audio_tokenization.utils.build_interleaved.common import (
+    list_interleave_cache_partitions,
     load_interleave_cache,
     prepare_interleave_cache_and_runs,
 )
@@ -175,7 +178,7 @@ def test_shift_run_chunk_routes_by_seq_threshold(tmp_path: Path) -> None:
 
 
 def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
-    writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, chunk_id=0)
+    writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
     writer.add_rows([
         {
             "clip_id": "s1@000000",
@@ -216,7 +219,8 @@ def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
     ])
     writer.finalize()
 
-    df, reader = load_interleave_cache(tmp_path)
+    partition_dir = list_interleave_cache_partitions(tmp_path)[0]
+    df, reader = load_interleave_cache(partition_dir)
     cache, starts, lengths, _n_clips, _n_sources = prepare_interleave_cache_and_runs(df, reader)
 
     sbo._shared_cache = cache
@@ -251,3 +255,91 @@ def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
     assert result["offset_0"]["seqs"] == 1
     assert result["offset_1"]["seqs"] == 1
     assert result["transcribe"]["seqs"] == 1
+
+
+def test_shift_main_builds_from_partitioned_root(monkeypatch, tmp_path: Path) -> None:
+    writer = StructuredCacheChunkWriter(
+        str(tmp_path),
+        rank=0,
+        writer_state=0,
+        partitioning={"type": "field", "field": "language"},
+    )
+    writer.add_rows([
+        {
+            "clip_id": "en@000000",
+            "source_id": "en",
+            "clip_num": 0,
+            "clip_start": 0.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "a",
+            "text_tokens": [20],
+            "audio_tokens": [10],
+            "dataset": "ds",
+            "_partition_value": "en",
+        },
+        {
+            "clip_id": "en@000001",
+            "source_id": "en",
+            "clip_num": 1,
+            "clip_start": 1.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "b",
+            "text_tokens": [21],
+            "audio_tokens": [11],
+            "dataset": "ds",
+            "_partition_value": "en",
+        },
+        {
+            "clip_id": "fr@000000",
+            "source_id": "fr",
+            "clip_num": 0,
+            "clip_start": 0.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "c",
+            "text_tokens": [22],
+            "audio_tokens": [12],
+            "dataset": "ds",
+            "_partition_value": "fr",
+        },
+        {
+            "clip_id": "fr@000001",
+            "source_id": "fr",
+            "clip_num": 1,
+            "clip_start": 1.0,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "d",
+            "text_tokens": [23],
+            "audio_tokens": [13],
+            "dataset": "ds",
+            "_partition_value": "fr",
+        },
+    ])
+    writer.finalize()
+
+    monkeypatch.setattr(sbo, "load_token_ids", lambda _path: (1, 2, 99, 98, 97, 256))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "shift_by_one.py",
+            "--parquet-dir", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--tokenizer-path", "ignored",
+            "--max-seq-len", "100",
+            "--num-workers", "1",
+        ],
+    )
+
+    sbo.main()
+
+    assert (tmp_path / "out" / "offset_0.bin").exists()
+    assert (tmp_path / "out" / "offset_0.idx").exists()
+    assert (tmp_path / "out" / "transcribe.bin").exists()
+    assert (tmp_path / "out" / "transcribe.idx").exists()
+    metadata = json.loads((tmp_path / "out" / "metadata.json").read_text())
+    assert metadata["partition_summary"]["num_partitions"] == 2
+    assert metadata["partition_summary"]["total_clips"] == 4
