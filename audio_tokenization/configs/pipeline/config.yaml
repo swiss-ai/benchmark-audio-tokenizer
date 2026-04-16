@@ -1,0 +1,6 @@
+defaults:
+  - dataset: infore2
+  - _self_
+
+stage: prepare
+resume: false

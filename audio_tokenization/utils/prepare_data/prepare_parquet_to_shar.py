@@ -326,7 +326,7 @@ def _preflight_prepare(args, resolved: list[str]) -> None:
     )
 
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert HF parquet shards → Lhotse Shar (parallel)",
     )
@@ -357,8 +357,10 @@ def main(argv=None):
     add_input_clip_id_parser_arg(parser)
     add_parallelism_args(parser, include_mp_start_method=True)
 
-    args = parser.parse_args(argv)
+    return parser
 
+
+def run(args):
     # Resolve parquet files
     resolved = sorted(str(p) for p in args.parquet_dir.glob(args.parquet_glob))
     if not resolved:
@@ -429,6 +431,12 @@ def main(argv=None):
         num_workers,
         mp_start_method=mp_start_method,
     )
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run(args)
 
 
 if __name__ == "__main__":
