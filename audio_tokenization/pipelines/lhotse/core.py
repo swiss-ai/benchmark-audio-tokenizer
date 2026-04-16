@@ -47,7 +47,7 @@ def _normalize_batch(batch: dict, target_db: float, device: str = "cpu") -> dict
     Moves audio to *device* before normalizing for GPU-accelerated peak
     computation.  Matches WavTokenizer training: SOX ``norm`` to *target_db* dBFS.
     """
-    from audio_tokenization.utils.prepare_data.common import normalize_batch_peak
+    from audio_tokenization.prepare.common import normalize_batch_peak
 
     if "audio" in batch:
         batch["audio"] = normalize_batch_peak(batch["audio"].to(device, non_blocking=True), target_db)

@@ -6,13 +6,13 @@ import numpy as np
 import polars as pl
 import pytest
 
-from audio_tokenization.utils.build_interleaved.common import (
+from audio_tokenization.interleave.common import (
     find_consecutive_runs,
     _detect_runs,
     compute_ratio_adjustment,
     load_parquets,
 )
-from audio_tokenization.utils.build_interleaved.pattern import (
+from audio_tokenization.interleave.pattern import (
     build_sequence,
     derive_sub_patterns,
     group_patterns_by_size,

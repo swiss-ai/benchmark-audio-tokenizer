@@ -4,8 +4,8 @@ import tarfile
 import types
 from collections import Counter
 
-import audio_tokenization.utils.prepare_data.prepare_wds_to_shar as prepare_wds_to_shar
-from audio_tokenization.utils.prepare_data.prepare_wds_to_shar import (
+import audio_tokenization.prepare.prepare_wds_to_shar as prepare_wds_to_shar
+from audio_tokenization.prepare.prepare_wds_to_shar import (
     SidecarMetadataProvider,
     TarScanResult,
     _convert_worker,

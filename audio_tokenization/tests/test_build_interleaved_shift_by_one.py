@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-from audio_tokenization.utils.build_interleaved import shift_by_one as sbo
+from audio_tokenization.interleave import shift_by_one as sbo
 
 
 def test_shift_by_one_mock_symbols_cover_multiple_interleavings() -> None:

@@ -44,7 +44,7 @@ export LD_LIBRARY_PATH=/users/xyixuan/.local/ffmpeg/lib:${LD_LIBRARY_PATH:-}
 ulimit -n 65536
 uv pip install --python /opt/venv/bin/python polars
 
-python -m audio_tokenization.utils.prepare_data.prepare_parquet_to_shar \
+python -m audio_tokenization.prepare.prepare_parquet_to_shar \
     --parquet-dir "${PARQUET_ROOT}/${SHARD_ID}" \
     --parquet-glob '*.parquet' \
     --shar-dir "${NODE_SHAR_DIR}" \
@@ -75,7 +75,7 @@ if [ "${RANK}" -eq "$((WORLD - 1))" ]; then
         --output=/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/logs/libriheavy_aggregate_%j.out \
         --error=/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/logs/libriheavy_aggregate_%j.err \
         --wrap="export PYTHONPATH=${REPO}:/iopsstor/scratch/cscs/xyixuan/dev/lhotse:\${PYTHONPATH:-}; \
-                python -m audio_tokenization.utils.prepare_data.prepare_wds_to_shar \
+                python -m audio_tokenization.prepare.prepare_wds_to_shar \
                     --aggregate ${SHAR_ROOT} \
                     --text-tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json"
     echo "Aggregate job submitted"

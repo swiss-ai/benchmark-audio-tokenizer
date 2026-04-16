@@ -2,7 +2,7 @@ import sys
 import types
 
 import pytest
-from audio_tokenization.utils.prepare_data import (
+from audio_tokenization.prepare import (
     prepare_hf_to_shar,
     prepare_parquet_to_shar,
 )
@@ -513,3 +513,48 @@ def test_prepare_parquet_worker_nested_audio_path_with_basename_parser(monkeypat
         "clip_start": 0.0,
         "legacy_cut_id": "radio_program/foo_042.wav",
     }
+
+
+def test_prepare_parquet_worker_missing_optional_duration_column(monkeypatch, tmp_path):
+    """Missing optional duration columns should behave like absent metadata."""
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "audio": [{"bytes": b"infore2-bytes", "path": "books/chapter_022.wav"}],
+                "transcription": ["xin chao"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        (
+            0,
+            ["dataset.parquet"],
+            str(tmp_path / "shar"),
+            None,
+            100,
+            "flac",
+            "audio.path",
+            "audio",
+            "transcription",
+            "duration",         # column is configured but absent in the row
+            None,
+            "vi",
+            None,
+            None,
+            None,
+            None,
+            "trailing_number_basename",
+            8,
+        )
+    )
+
+    assert result["written"] == 1
+    assert result["errors"] == 0
+    assert helper_calls[0]["recording_id"] == "books/chapter_022.wav"
+    assert written_cuts[0].id == "chapter@000022"

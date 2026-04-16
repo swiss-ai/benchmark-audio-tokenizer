@@ -46,7 +46,7 @@ uv pip install --python /opt/venv/bin/python polars
 
 export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 
-python -m audio_tokenization.utils.build_interleaved_indexed \
+python -m audio_tokenization.interleave_indexed \
     --parquet-dir "${PARQUET_DIR}" \
     --output-dir "${OUTPUT_DIR}" \
     --tokenizer-path "${TOKENIZER}" \

@@ -95,7 +95,7 @@ Audio-text datasets (e.g. Emilia, WenetSpeech) are already segmented with transc
 > **Dry run:** Sweep VAD parameters and estimate hours/tokens per configuration with [`vad_sweep.py`](./utils/prepare_data/stats/vad_sweep.py) — no files written.
 >
 > ```bash
-> python -m audio_tokenization.utils.prepare_data.stats.vad_sweep \
+> python -m audio_tokenization.prepare.stats.vad_sweep \
 >     --vad-dir /path/to/vad_results \
 >     --min-chunk-sweep 1,5,10,20,30 \
 >     --token-rate 40 --num-workers 32
@@ -403,21 +403,21 @@ python -m audio_tokenization.tokenize \
     mode=audio_text audio_text_format=interleaved num_gpus=4
 
 # Stage 2: Compose patterns (cheap, CPU-only — re-run as many times as you want)
-python -m audio_tokenization.utils.build_interleaved_indexed \
+python -m audio_tokenization.interleave_indexed \
     --parquet-dir /path/to/parquets \
     --output-dir /path/to/output \
     --tokenizer-path /path/to/omni_tokenizer \
     --patterns ATAT TATA
 
 # Try different patterns — no re-tokenization needed
-python -m audio_tokenization.utils.build_interleaved_indexed \
+python -m audio_tokenization.interleave_indexed \
     --parquet-dir /path/to/parquets \
     --output-dir /path/to/output_v2 \
     --tokenizer-path /path/to/omni_tokenizer \
     --patterns ATATAT TATATA AAT
 
 # Dry run — preview statistics only
-python -m audio_tokenization.utils.build_interleaved_indexed \
+python -m audio_tokenization.interleave_indexed \
     --parquet-dir /path/to/parquets \
     --output-dir /tmp/dry \
     --tokenizer-path /path/to/omni_tokenizer \
