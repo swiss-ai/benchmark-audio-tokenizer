@@ -415,6 +415,18 @@ def main():
 
         # Merge all part-* into a single index
         build_shar_index(args.shar_dir, args.shar_index_filename, args.num_workers)
+
+        from audio_tokenization.utils.prepare_data.validate_shar import (
+            validate_shar_directory,
+        )
+        counts = validate_shar_directory(
+            args.shar_dir, index_filename=args.shar_index_filename
+        )
+        logger.info(
+            "Validated SHAR: %d cuts across %d shards",
+            sum(counts.values()), len(counts),
+        )
+
         mark_partition_success(args.shar_dir, success_marker_name=PART_SUCCESS_MARKER)
 
         # Aggregate worker stats

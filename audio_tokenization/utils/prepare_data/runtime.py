@@ -458,6 +458,17 @@ def run_pool_and_finalize(
     logger.info(f"Wrote prepare summary: {summary_path}")
 
     build_shar_index(Path(shar_dir), num_workers=num_workers)
+
+    from audio_tokenization.utils.prepare_data.validate_shar import (
+        validate_shar_directory,
+    )
+    counts = validate_shar_directory(Path(shar_dir))
+    logger.info(
+        "Validated SHAR: %d cuts across %d shards", sum(counts.values()), len(counts)
+    )
+    for shard_name, n in counts.items():
+        logger.debug("  %s: %d cuts", shard_name, n)
+
     mark_partition_success(Path(shar_dir), success_marker_name=SUCCESS_MARKER_FILE)
     logger.info("All done!")
     return results
