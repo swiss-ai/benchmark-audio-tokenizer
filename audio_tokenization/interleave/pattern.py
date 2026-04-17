@@ -59,24 +59,25 @@ from audio_tokenization.interleave.common import (
     TR_KEY,
     DType,
     IndexedDatasetBuilder,
-    _detect_runs,
     _merge_shards,
     _partition_runs,
     _write_idx_file,
     compute_ratio_adjustment,
     get_bin_path,
     get_idx_path,
-    load_parquets,
+    list_interleave_cache_partitions,
+    load_interleave_cache,
     load_token_ids,
-    prepare_arrow_and_runs,
+    print_partition_stats,
+    prepare_interleave_cache_and_runs,
+    prepare_length_metadata,
 )
 
 # ---------------------------------------------------------------------------
 # Module-level globals for fork-based sharing (set before Pool creation)
 # ---------------------------------------------------------------------------
 
-_shared_audio_arrow = None
-_shared_text_arrow = None
+_shared_cache = None
 _shared_run_starts = None
 _shared_run_lengths = None
 _shared_transcribe_only_runs: set[int] = set()
@@ -189,12 +190,11 @@ def _process_run_chunk(
 ) -> dict[str, dict]:
     """Process a contiguous range of runs; write shard .bin + sidecar .npy.
 
-    Reads Arrow / run arrays from module-level globals (inherited via fork COW).
+    Reads prepared cache / run arrays from module-level globals (inherited via fork COW).
     Returns lightweight counters + shard path info — no large lists cross the
     pickle boundary.
     """
-    audio_arrow = _shared_audio_arrow
-    text_arrow = _shared_text_arrow
+    cache = _shared_cache
     run_starts = _shared_run_starts
     run_lengths_arr = _shared_run_lengths
     transcribe_only_runs = _shared_transcribe_only_runs
@@ -213,8 +213,8 @@ def _process_run_chunk(
         rs = int(run_starts[r])
         rl = int(run_lengths_arr[r])
 
-        run_audio: list[list[int]] = audio_arrow[rs : rs + rl].to_pylist()
-        run_text: list[list[int]] = text_arrow[rs : rs + rl].to_pylist()
+        run_audio = cache.audio.slice(rs, rl).to_pylist()
+        run_text = cache.text.slice(rs, rl).to_pylist()
 
         # Ratio-adjusted: convert entire run to individual transcribe seqs
         if r in transcribe_only_runs:
@@ -375,14 +375,9 @@ def _dry_run(
 
     Saves a ``dry_run_stats.txt`` to *parquet_dir* for later reference.
     """
-    import polars as pl
-
     # 1. Compute list lengths, drop heavy list columns -----------------
     print("Computing token lengths (dropping raw tokens) ...")
-    df = df.with_columns(
-        df["audio_tokens"].list.len().cast(pl.UInt64).alias("_alen"),
-        df["text_tokens"].list.len().cast(pl.UInt64).alias("_tlen"),
-    ).select(["source_id", "clip_num", "_alen", "_tlen"])
+    df = prepare_length_metadata(df)
 
     # 2. Vectorized run detection --------------------------------------
     print("Detecting consecutive runs ...")
@@ -750,10 +745,7 @@ def main() -> None:
     dtype = DType.optimal_dtype(vocab_size)
     print(f"  dtype={dtype.__name__}")
 
-    # ------------------------------------------------------------------
-    # 2. Load all parquets
-    # ------------------------------------------------------------------
-    df = load_parquets(parquet_dir)
+    partition_dirs = list_interleave_cache_partitions(parquet_dir)
 
     # ------------------------------------------------------------------
     # 3. Patterns + cascade sub-patterns
@@ -768,41 +760,65 @@ def main() -> None:
     print(f"Min window (remainder threshold): {min_window}")
 
     if dry_run:
+        if len(partition_dirs) > 1:
+            raise RuntimeError(
+                "Dry-run on a partitioned v2 cache root is not supported yet. "
+                "Pass a leaf partition directory instead."
+            )
+        df, _cache_reader = load_interleave_cache(partition_dirs[0])
         _dry_run(
             df, args.patterns, patterns_by_size, min_window,
             sub_patterns_by_size, bos_id, eos_id, stt_continue_id,
-            stt_transcribe_id, tts_continue_id, dtype, parquet_dir,
+            stt_transcribe_id, tts_continue_id, dtype, partition_dirs[0],
             transcribe_ratio=transcribe_ratio,
         )
         return
 
     # ------------------------------------------------------------------
-    # 4. Prepare Arrow arrays + run detection
+    # 4. Transcribe-ratio adjustment (global across partitions)
     # ------------------------------------------------------------------
-    audio_arrow, text_arrow, run_starts, run_lengths, n_clips, n_sources = (
-        prepare_arrow_and_runs(df)
-    )
-    del df
-    n_runs = len(run_starts)
-
-    # ------------------------------------------------------------------
-    # 4b. Transcribe-ratio adjustment (if requested)
-    # ------------------------------------------------------------------
-    transcribe_only_runs: set[int] = set()
+    transcribe_only_runs_by_partition: dict[Path, set[int]] = {}
+    runs_converted_to_transcribe = 0
     if transcribe_ratio is not None:
         print(f"\nComputing per-run stats for --transcribe-ratio {transcribe_ratio} ...")
         t_pre = time.time()
-        il_per_run, tr_per_run = _compute_per_run_stats_pattern(
-            run_lengths, patterns_by_size, min_window,
+        all_il_per_run = []
+        all_tr_per_run = []
+        all_run_lengths = []
+        partition_run_counts = []
+        for partition_dir in partition_dirs:
+            df, _cache_reader = load_interleave_cache(partition_dir)
+            length_df = prepare_length_metadata(df)
+            _sorted_df, _run_starts, run_lengths = _detect_runs(length_df)
+            il_per_run, tr_per_run = _compute_per_run_stats_pattern(
+                run_lengths, patterns_by_size, min_window,
+            )
+            all_il_per_run.append(il_per_run)
+            all_tr_per_run.append(tr_per_run)
+            all_run_lengths.append(run_lengths.astype(np.int64))
+            partition_run_counts.append(len(run_lengths))
+        selected_global_runs = compute_ratio_adjustment(
+            np.concatenate(all_il_per_run) if all_il_per_run else np.array([], dtype=np.int64),
+            np.concatenate(all_tr_per_run) if all_tr_per_run else np.array([], dtype=np.int64),
+            np.concatenate(all_run_lengths) if all_run_lengths else np.array([], dtype=np.int64),
+            transcribe_ratio,
         )
         print(f"  Pre-pass done in {time.time() - t_pre:.1f}s")
-        transcribe_only_runs = compute_ratio_adjustment(
-            il_per_run, tr_per_run, run_lengths, transcribe_ratio,
-        )
-        if transcribe_only_runs:
-            print(f"  Converting {len(transcribe_only_runs):,} runs to transcribe-only")
+        runs_converted_to_transcribe = len(selected_global_runs)
+        if selected_global_runs:
+            print(f"  Converting {len(selected_global_runs):,} runs to transcribe-only")
         else:
             print("  Natural ratio already meets target — no adjustment needed")
+        offset = 0
+        for partition_dir, count in zip(partition_dirs, partition_run_counts):
+            local = {
+                run_idx - offset
+                for run_idx in selected_global_runs
+                if offset <= run_idx < offset + count
+            }
+            if local:
+                transcribe_only_runs_by_partition[partition_dir] = local
+            offset += count
 
     # ------------------------------------------------------------------
     # 5. Collect all pattern keys
@@ -821,75 +837,115 @@ def main() -> None:
     print(f"\nUsing {num_workers} worker(s)")
 
     # ------------------------------------------------------------------
-    # 7. Build indexed datasets (always via fork workers)
+    # 7. Build indexed datasets partition-by-partition
     # ------------------------------------------------------------------
-    global _shared_audio_arrow, _shared_text_arrow
+    global _shared_cache
     global _shared_run_starts, _shared_run_lengths
     global _shared_transcribe_only_runs
-    _shared_audio_arrow = audio_arrow
-    _shared_text_arrow = text_arrow
-    _shared_run_starts = run_starts
-    _shared_run_lengths = run_lengths
-    _shared_transcribe_only_runs = transcribe_only_runs
+    tmp_dir = output_dir / "_tmp_shards"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    run_ranges = _partition_runs(run_lengths, num_workers)
-    actual_workers = len(run_ranges)
-    print(f"  Partitioned {n_runs:,} runs into {actual_workers} chunks")
-
-    if actual_workers == 0:
-        # Empty input — write empty bin/idx for every key
-        counters: dict[str, dict[str, int]] = {}
-        for key in all_keys:
-            open(get_bin_path(str(output_dir / key)), "wb").close()
-            _write_idx_file(
-                get_idx_path(str(output_dir / key)),
-                dtype,
-                np.array([], dtype=np.int32),
-                np.array([0], dtype=np.int64),
-            )
-            counters[key] = {"seqs": 0, "tokens": 0}
-    else:
-        tmp_dir = output_dir / "_tmp_shards"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-
-        worker_args = [
-            (
-                wid,
-                rng[0],
-                rng[1],
-                all_keys,
-                patterns_by_size,
-                sub_patterns_by_size,
-                min_window,
-                bos_id,
-                eos_id,
-                stt_continue_id,
-                stt_transcribe_id,
-                tts_continue_id,
-                dtype,
-                str(tmp_dir),
-            )
-            for wid, rng in enumerate(run_ranges)
-        ]
-
+    total_clips = 0
+    total_sources = 0
+    partition_stats = []
+    worker_results = []
+    try:
         t0 = time.time()
-        ctx = multiprocessing.get_context("fork")
-        with ctx.Pool(actual_workers) as pool:
-            worker_results = pool.starmap(_process_run_chunk, worker_args)
+        for part_idx, partition_dir in enumerate(partition_dirs):
+            print(f"\nProcessing partition {part_idx + 1}/{len(partition_dirs)}: {partition_dir.name}")
+            df, cache_reader = load_interleave_cache(partition_dir)
+            cache, run_starts, run_lengths, n_clips, n_sources = (
+                prepare_interleave_cache_and_runs(df, cache_reader)
+            )
+            audio_token_total = int(cache.audio_lengths.sum())
+            text_token_total = int(cache.text_lengths.sum())
+            total_clips += n_clips
+            total_sources += n_sources
+            n_runs = len(run_starts)
+            _shared_cache = cache
+            _shared_run_starts = run_starts
+            _shared_run_lengths = run_lengths
+            _shared_transcribe_only_runs = transcribe_only_runs_by_partition.get(partition_dir, set())
+
+            run_ranges = _partition_runs(run_lengths, num_workers)
+            actual_workers = len(run_ranges)
+            print(f"  Partitioned {n_runs:,} runs into {actual_workers} chunks")
+            partition_stats.append(
+                {
+                    "name": partition_dir.name,
+                    "clips": n_clips,
+                    "runs": n_runs,
+                    "sources": n_sources,
+                    "audio_tokens": audio_token_total,
+                    "text_tokens": text_token_total,
+                    "workers": actual_workers,
+                }
+            )
+            if actual_workers == 0:
+                _shared_cache = None
+                _shared_run_starts = None
+                _shared_run_lengths = None
+                _shared_transcribe_only_runs = set()
+                continue
+
+            part_tmp_dir = tmp_dir / f"part_{part_idx:04d}_{partition_dir.name}"
+            part_tmp_dir.mkdir(parents=True, exist_ok=True)
+            worker_args = [
+                (
+                    wid,
+                    rng[0],
+                    rng[1],
+                    all_keys,
+                    patterns_by_size,
+                    sub_patterns_by_size,
+                    min_window,
+                    bos_id,
+                    eos_id,
+                    stt_continue_id,
+                    stt_transcribe_id,
+                    tts_continue_id,
+                    dtype,
+                    str(part_tmp_dir),
+                )
+                for wid, rng in enumerate(run_ranges)
+            ]
+
+            # Pool creation must stay inside the partition loop, after the
+            # current partition's globals are assigned. fork() captures these
+            # globals for worker read-only access.
+            ctx = multiprocessing.get_context("fork")
+            with ctx.Pool(actual_workers) as pool:
+                worker_results.extend(pool.starmap(_process_run_chunk, worker_args))
+
+            _shared_cache = None
+            _shared_run_starts = None
+            _shared_run_lengths = None
+            _shared_transcribe_only_runs = set()
+            del cache, df, cache_reader
         elapsed = time.time() - t0
         print(f"\nWorkers finished in {elapsed:.1f}s")
 
-        t_merge = time.time()
-        counters = _merge_shards(worker_results, all_keys, output_dir, dtype, tmp_dir)
-        print(f"Merged shards in {time.time() - t_merge:.1f}s")
-
-        shutil.rmtree(tmp_dir)
-
-    _shared_audio_arrow = None
-    _shared_text_arrow = None
-    _shared_run_starts = None
-    _shared_run_lengths = None
-    _shared_transcribe_only_runs = set()
+        if worker_results:
+            t_merge = time.time()
+            counters = _merge_shards(worker_results, all_keys, output_dir, dtype, tmp_dir)
+            print(f"Merged shards in {time.time() - t_merge:.1f}s")
+        else:
+            counters = {}
+            for key in all_keys:
+                open(get_bin_path(str(output_dir / key)), "wb").close()
+                _write_idx_file(
+                    get_idx_path(str(output_dir / key)),
+                    dtype,
+                    np.array([], dtype=np.int32),
+                    np.array([0], dtype=np.int64),
+                )
+                counters[key] = {"seqs": 0, "tokens": 0}
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _shared_cache = None
+        _shared_run_starts = None
+        _shared_run_lengths = None
+        _shared_transcribe_only_runs = set()
 
     # ------------------------------------------------------------------
     # 8. Write metadata
@@ -906,11 +962,13 @@ def main() -> None:
         "tts_continue_id": tts_continue_id,
         "min_window_size": min_window,
         "transcribe_ratio": transcribe_ratio,
-        "runs_converted_to_transcribe": len(transcribe_only_runs),
-        "total_clips": n_clips,
-        "total_sources": n_sources,
+        "runs_converted_to_transcribe": runs_converted_to_transcribe,
+        "total_clips": total_clips,
+        "total_sources": total_sources,
         "patterns": {},
     }
+    metadata["partition_summary"] = print_partition_stats(partition_stats)
+    metadata["partition_stats"] = partition_stats
     if sub_patterns_by_size:
         metadata["cascade_sub_patterns"] = {
             str(k): v for k, v in sub_patterns_by_size.items()

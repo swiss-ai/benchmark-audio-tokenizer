@@ -66,6 +66,7 @@ class _FakeArrowReader:
 class _FakeParquetFile:
     def __init__(self, rows):
         self._rows = rows
+        self.schema_arrow = types.SimpleNamespace(names=list(rows[0].keys()) if rows else [])
 
     def iter_batches(self, *, columns=None, batch_size=None, use_threads=False):
         assert use_threads is False
@@ -558,3 +559,148 @@ def test_prepare_parquet_worker_missing_optional_duration_column(monkeypatch, tm
     assert result["errors"] == 0
     assert helper_calls[0]["recording_id"] == "books/chapter_022.wav"
     assert written_cuts[0].id == "chapter@000022"
+
+
+def test_prepare_parquet_worker_non_numeric_duration_counts_as_error(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "audio": [{"bytes": b"infore2-bytes", "path": "books/chapter_022.wav"}],
+                "transcription": ["xin chao"],
+                "duration": ["1.5"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        (
+            0,
+            ["dataset.parquet"],
+            str(tmp_path / "shar"),
+            None,
+            100,
+            "flac",
+            "audio.path",
+            "audio",
+            "transcription",
+            "duration",
+            None,
+            "vi",
+            None,
+            None,
+            None,
+            None,
+            "trailing_number_basename",
+            8,
+        )
+    )
+
+    assert result["written"] == 0
+    assert result["errors"] == 1
+    assert result["worker_stats"]["runtime_counts"]["processing_errors"] == 1
+    assert helper_calls == []
+    assert written_cuts == []
+
+
+def test_prepare_parquet_preflight_checks_runtime_and_logs_missing_optional_columns(
+    monkeypatch, caplog, tmp_path
+):
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "audio": [{"bytes": b"parquet-bytes", "path": "books/chapter_022.wav"}],
+                "transcription": ["xin chao"],
+            }
+        ),
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        prepare_parquet_to_shar,
+        "validate_prepare_runtime",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    args = types.SimpleNamespace(
+        audio_column="audio",
+        id_column="audio.path",
+        text_column="transcription",
+        duration_column="duration",
+        language_column=None,
+        custom_columns=None,
+        resampling_backend="soxr",
+        text_tokenizer=str(tmp_path / "tokenizer.json"),
+    )
+
+    with caplog.at_level("INFO"):
+        prepare_parquet_to_shar._preflight_prepare(args, ["dataset.parquet"])
+
+    assert calls == [
+        {
+            "resampling_backend": "soxr",
+            "require_ffmpeg": True,
+            "text_tokenizer_path": str(tmp_path / "tokenizer.json"),
+        }
+    ]
+    assert "optional column roots missing" in caplog.text
+    assert "duration" in caplog.text
+
+
+def test_prepare_parquet_preflight_raises_for_missing_required_audio_column(monkeypatch):
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["row-1"],
+                "text": ["hello"],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        prepare_parquet_to_shar,
+        "validate_prepare_runtime",
+        lambda **kwargs: None,
+    )
+
+    args = types.SimpleNamespace(
+        audio_column="audio",
+        id_column="id",
+        text_column="text",
+        duration_column=None,
+        language_column=None,
+        custom_columns=None,
+        resampling_backend="soxr",
+        text_tokenizer=None,
+    )
+
+    with pytest.raises(RuntimeError, match="required column roots are missing"):
+        prepare_parquet_to_shar._preflight_prepare(args, ["dataset.parquet"])
+
+
+def test_validate_prepare_runtime_requires_ffmpeg(monkeypatch):
+    from audio_tokenization.prepare import runtime
+
+    init_calls = []
+    tok_calls = []
+    monkeypatch.setattr(runtime, "init_worker_process", lambda backend: init_calls.append(backend))
+    monkeypatch.setattr(runtime.shutil, "which", lambda name: None if name == "ffmpeg" else "/bin/true")
+    monkeypatch.setattr(
+        "audio_tokenization.prepare.text_ops.load_text_tokenizer",
+        lambda path: tok_calls.append(path),
+    )
+
+    with pytest.raises(RuntimeError, match="ffmpeg is required"):
+        runtime.validate_prepare_runtime(
+            resampling_backend="soxr",
+            require_ffmpeg=True,
+            text_tokenizer_path="/tmp/tokenizer.json",
+        )
+
+    assert init_calls == ["soxr"]
+    assert tok_calls == ["/tmp/tokenizer.json"]

@@ -30,7 +30,9 @@ import logging
 import time
 from pathlib import Path
 
-from audio_tokenization.prepare.common import (
+from audio_tokenization.prepare.audio_ops import to_mono
+from audio_tokenization.prepare.identity import set_universal_cut_id
+from audio_tokenization.prepare.runtime import (
     build_audio_index,
     check_worker_reuse,
     distribute_round_robin,
@@ -38,8 +40,7 @@ from audio_tokenization.prepare.common import (
     init_worker_process,
     run_aggregate,
     run_pool_and_finalize,
-    set_universal_cut_id,
-    to_mono,
+    validate_prepare_runtime,
     write_worker_result,
 )
 from audio_tokenization.prepare.preprocess.chunking import (
@@ -314,6 +315,12 @@ def main(argv=None):
     resolved_jsonls = sorted(args.jsonl_files)
     if not resolved_jsonls:
         raise FileNotFoundError("No JSONL files provided via --jsonl-files")
+
+    validate_prepare_runtime(
+        resampling_backend=args.resampling_backend,
+        require_ffmpeg=False,
+        text_tokenizer_path=None,
+    )
 
     args.shar_dir.mkdir(parents=True, exist_ok=True)
 

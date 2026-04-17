@@ -116,19 +116,23 @@ from multiprocessing import Process
 from pathlib import Path
 from typing import Optional
 
-from audio_tokenization.prepare.common import (
+from audio_tokenization.prepare.audio_ops import make_rms_filter_fn, to_mono
+from audio_tokenization.prepare.constants import (
     PREPARE_STATE_FILE,
     SUCCESS_MARKER_FILE,
-    assign_universal_ids,
+)
+from audio_tokenization.prepare.identity import assign_universal_ids
+from audio_tokenization.prepare.metadata import normalize_optional_path
+from audio_tokenization.prepare.runtime import (
     build_shar_index_from_parts,
-    load_text_tokenizer,
-    make_rms_filter_fn,
-    make_text_tokenize_fn,
     mark_partition_success,
-    normalize_optional_path,
     setup_partition_dir,
-    to_mono,
+    validate_prepare_runtime,
     validate_or_write_prepare_state,
+)
+from audio_tokenization.prepare.text_ops import (
+    load_text_tokenizer,
+    make_text_tokenize_fn,
 )
 
 logging.basicConfig(
@@ -340,6 +344,13 @@ def main():
             parts.append(args.language)
         parts.append(args.split)
         args.shar_dir = args.shar_base_dir / f"{'_'.join(parts)}"
+
+    validate_prepare_runtime(
+        resampling_backend=None,
+        require_ffmpeg=False,
+        text_tokenizer_path=args.text_tokenizer,
+    )
+
     args.shar_dir.mkdir(parents=True, exist_ok=True)
     _validate_or_write_prepare_state(args)
 

@@ -28,33 +28,47 @@ import logging
 import time
 from pathlib import Path
 
-from audio_tokenization.prepare.common import (
-    _get_field,
-    _projected_columns,
-    PREPARE_STATE_FILE,
-    add_audio_processing_args,
-    add_columnar_metadata_args,
-    add_external_metadata_args,
-    add_input_clip_id_parser_arg,
-    add_parallelism_args,
-    add_shar_output_args,
+from audio_tokenization.config.schema import build_parquet_prepare_fingerprint
+from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
+)
+from audio_tokenization.prepare.cli import (
+    add_audio_processing_args,
+    add_external_metadata_args,
+    add_parallelism_args,
+    add_shar_output_args,
+)
+from audio_tokenization.prepare.columnar import (
+    _get_field,
+    add_columnar_metadata_args,
+    extract_row_metadata,
+    _projected_columns,
+    validate_columnar_schema_roots,
+)
+from audio_tokenization.prepare.constants import PREPARE_STATE_FILE, _MISSING
+from audio_tokenization.prepare.identity import (
+    add_input_clip_id_parser_arg,
+    resolve_input_source_and_clip_num,
+    set_universal_cut_id,
+)
+from audio_tokenization.prepare.metadata import (
+    load_external_metadata,
+    resolve_sample_text_and_custom,
+)
+from audio_tokenization.prepare.runtime import (
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
-    extract_row_metadata,
     init_worker_process,
-    load_external_metadata,
-    load_text_tokenizer,
-    make_text_tokenize_fn,
-    normalize_optional_path,
-    resolve_sample_text_and_custom,
-    resolve_input_source_and_clip_num,
     run_pool_and_finalize,
-    set_universal_cut_id,
+    validate_prepare_runtime,
     validate_or_write_prepare_state,
     write_worker_result,
+)
+from audio_tokenization.prepare.text_ops import (
+    load_text_tokenizer,
+    make_text_tokenize_fn,
 )
 from audio_tokenization.utils.clip_id_parsers import get_clip_id_parser
 from audio_tokenization.prepare.streaming import iter_parquet_rows
@@ -157,10 +171,16 @@ def _convert_worker(args_tuple):
                 )
                 try:
                     duration = _get_field(row, duration_column) if duration_column else None
-                    if isinstance(duration, (int, float)) and duration <= 0:
-                        skipped += 1
-                        runtime_counts["skipped_non_positive_duration"] += 1
-                        continue
+                    if duration is not _MISSING and duration is not None:
+                        if not isinstance(duration, (int, float)):
+                            raise TypeError(
+                                f"duration_column {duration_column!r} must be numeric or null; "
+                                f"got {type(duration).__name__}"
+                            )
+                        if duration <= 0:
+                            skipped += 1
+                            runtime_counts["skipped_non_positive_duration"] += 1
+                            continue
 
                     audio_struct = row[audio_column]
                     audio_bytes = audio_struct["bytes"] if isinstance(audio_struct, dict) else None
@@ -250,40 +270,45 @@ def _convert_worker(args_tuple):
 
 def _validate_or_write_prepare_state(args) -> None:
     state_path = args.shar_dir / PREPARE_STATE_FILE
-    expected = {
-        "parquet_dir": str(Path(args.parquet_dir).resolve()),
-        "text_tokenizer": normalize_optional_path(args.text_tokenizer),
-        "input_clip_id_parser": args.input_clip_id_parser,
-        "external_metadata": normalize_optional_path(args.external_metadata),
-        "id_field": args.id_field,
-        "text_field": args.text_field,
-        "custom_fields": sorted(args.custom_fields) if args.custom_fields else None,
-    }
+    expected = build_parquet_prepare_fingerprint(args)
     wrote = validate_or_write_prepare_state(
         state_path,
         expected=expected,
-        invariant_keys=(
-            "parquet_dir",
-            "text_tokenizer",
-            "input_clip_id_parser",
-            "external_metadata",
-            "id_field",
-            "text_field",
-            "custom_fields",
-        ),
+        invariant_keys=tuple(expected.keys()),
         guidance=(
-            "Use the same --parquet-dir, --text-tokenizer, "
-            "--input-clip-id-parser, --external-metadata, --id-field, "
-            "--text-field, and --custom-fields to resume this output "
-            "directory, or "
-            f"remove {args.shar_dir} and restart from scratch."
+            "The run's configuration has drifted from a previous run against the "
+            "same --shar-dir. Either re-issue the original arguments to resume, "
+            f"or remove {args.shar_dir} and restart from scratch."
         ),
     )
     if wrote:
         logger.info(f"Wrote prepare state: {state_path}")
+def _preflight_prepare(args, resolved: list[str]) -> None:
+    import pyarrow.parquet as pq
+
+    sample_path = resolved[0]
+    validate_columnar_schema_roots(
+        available_roots=pq.ParquetFile(sample_path).schema_arrow.names,
+        required_columns=(args.audio_column, args.id_column),
+        optional_columns=(
+            args.text_column,
+            args.duration_column,
+            args.language_column,
+            args.custom_columns,
+        ),
+        source_path=sample_path,
+        source_kind="Parquet",
+        logger=logger,
+    )
+
+    validate_prepare_runtime(
+        resampling_backend=args.resampling_backend,
+        require_ffmpeg=True,
+        text_tokenizer_path=args.text_tokenizer,
+    )
 
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert HF parquet shards → Lhotse Shar (parallel)",
     )
@@ -314,14 +339,18 @@ def main(argv=None):
     add_input_clip_id_parser_arg(parser)
     add_parallelism_args(parser, include_mp_start_method=True)
 
-    args = parser.parse_args(argv)
+    return parser
 
+
+def run(args):
     # Resolve parquet files
     resolved = sorted(str(p) for p in args.parquet_dir.glob(args.parquet_glob))
     if not resolved:
         raise FileNotFoundError(
             f"No files match {args.parquet_dir / args.parquet_glob}"
         )
+
+    _preflight_prepare(args, resolved)
 
     args.shar_dir.mkdir(parents=True, exist_ok=True)
     _validate_or_write_prepare_state(args)
@@ -384,6 +413,12 @@ def main(argv=None):
         num_workers,
         mp_start_method=mp_start_method,
     )
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return run(args)
 
 
 if __name__ == "__main__":

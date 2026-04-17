@@ -228,25 +228,22 @@ def test_validate_cli_exits_nonzero_on_corruption(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "module",
-    [
-        "audio_tokenization.prepare.postprocess.patch_universal_ids",
-        "audio_tokenization.prepare.postprocess.add_captions_to_shar",
-    ],
-)
+# Only patch_universal_ids is tombstoned on this branch. add_captions_to_shar
+# carries its own boundary check (_assert_id_stability_for_symlinked_recordings)
+# that rejects the unsafe rewrite path while still allowing the safe
+# stable-IDs use case, so it stays runnable.
+_TOMBSTONED_MODULES = [
+    "audio_tokenization.prepare.postprocess.patch_universal_ids",
+]
+
+
+@pytest.mark.parametrize("module", _TOMBSTONED_MODULES)
 def test_tombstone_imports_cleanly(module):
     """Importing must succeed so sibling tooling and test discovery don't break."""
     __import__(module)
 
 
-@pytest.mark.parametrize(
-    "module",
-    [
-        "audio_tokenization.prepare.postprocess.patch_universal_ids",
-        "audio_tokenization.prepare.postprocess.add_captions_to_shar",
-    ],
-)
+@pytest.mark.parametrize("module", _TOMBSTONED_MODULES)
 def test_tombstone_execution_exits_nonzero(module):
     result = _run_module(module)
     assert result.returncode != 0

@@ -1,0 +1,36 @@
+name: aozora_hurigana
+
+prepare:
+  family: parquet
+  input:
+    parquet_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/ndl___aozora_hurigana_speech_v2/parquet
+    parquet_glob: train-*.parquet
+  output:
+    shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/aozora_hurigana_train
+    shard_size: 5000
+    shar_format: flac
+    target_sr: 24000
+    text_tokenizer: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json
+    resampling_backend: soxr
+  metadata:
+    audio_column: audio
+    text_column: transcription
+    duration_column: duration
+    id_column: sample_id
+    language: ja
+    input_clip_id_parser: trailing_number
+    custom_columns:
+      - author
+      - work
+      - rendition
+      - line_num
+
+products:
+  asr_direct:
+    enabled: true
+    output_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/aozora_hurigana_asr_direct
+  interleave:
+    enabled: true
+    cache_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/interleave_cache/aozora_hurigana_v2
+    output_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/aozora_hurigana_interleaved
+    strategy: shift_by_one

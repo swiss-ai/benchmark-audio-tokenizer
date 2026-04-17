@@ -1,0 +1,31 @@
+name: infore2
+
+prepare:
+  family: parquet
+  input:
+    parquet_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/doof-ferb___infore2_audiobooks/data
+    parquet_glob: train-*.parquet
+  output:
+    shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/infore2_audiobooks_train_fixed_ids_v4
+    shard_size: 5000
+    shar_format: flac
+    target_sr: 24000
+    text_tokenizer: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json
+    resampling_backend: soxr
+  metadata:
+    audio_column: audio
+    text_column: transcription
+    duration_column: duration
+    id_column: audio.path
+    language: vi
+    input_clip_id_parser: trailing_number_basename
+
+products:
+  asr_direct:
+    enabled: true
+    output_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/infore2_asr_direct
+  interleave:
+    enabled: true
+    cache_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/interleave_cache/infore2_v2
+    output_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/infore2_interleaved
+    strategy: shift_by_one
