@@ -44,6 +44,12 @@ sys.path.insert(0, _repo_root)
 
 from src.audio_tokenizers.implementations.wavtokenizer import WavTokenizer40
 
+from audio_tokenization.contracts import (
+    InferenceRun,
+    PredictionRecord,
+    write_inference_run,
+)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -250,6 +256,7 @@ def load_wav_dir_dataset(wav_dir: str, num_samples: int):
             "id": sample_id,
             "dataset": dataset_map.get(fname, ""),
             "channel_layout": "channels_last",
+            "audio_path": os.path.abspath(path),
         })
 
     print(f"  Loaded {len(samples)} samples")
@@ -268,7 +275,8 @@ def main() -> None:
         "--tokenizer-path", type=str, default=None,
         help="Path to the tokenizer (defaults to --model-path).",
     )
-    # Input: one of these three
+    # Input: one of these four. --manifest runs multiple datasets with a
+    # single model load; the other three keep the single-dataset CLI mode.
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument(
         "--audio-dir", type=str,
@@ -282,6 +290,20 @@ def main() -> None:
         "--wav-dir", type=str,
         help="Path to directory with audio files (wav/mp3/flac). "
              "Optionally include metadata.tsv (filename<TAB>text) for ground truth.",
+    )
+    input_group.add_argument(
+        "--manifest", type=str,
+        help="Path to a JSON manifest listing multiple datasets to run "
+             "sequentially on a single model load. See docstring for format.",
+    )
+    parser.add_argument(
+        "--output-root", type=str, default=None,
+        help="Root directory for manifest-mode outputs (per-dataset subdirs "
+             "created under it). Overridable per-entry in the manifest.",
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="In manifest mode, skip datasets whose output file already exists.",
     )
     parser.add_argument(
         "--task", type=str, choices=["transcribe", "continue", "translate"],
@@ -360,33 +382,7 @@ def main() -> None:
     print("  WavTokenizer ready")
 
     # ------------------------------------------------------------------
-    # 4. Load audio samples
-    # ------------------------------------------------------------------
-    data_source = args.audio_dir or args.parquet_dir or args.wav_dir
-    print(f"\nLoading audio from {data_source} ...")
-    if args.audio_dir:
-        samples = load_arrow_dataset(args.audio_dir, args.audio_column, args.num_samples)
-    elif args.parquet_dir:
-        samples = load_parquet_dataset(args.parquet_dir, args.audio_column, args.num_samples)
-    else:
-        samples = load_wav_dir_dataset(args.wav_dir, args.num_samples)
-
-    # ------------------------------------------------------------------
-    # 5. Determine output directory and file path
-    # ------------------------------------------------------------------
-    dataset_name = args.dataset_name or os.path.basename(data_source.rstrip("/"))
-    model_name = os.path.basename(args.model_path.rstrip("/"))
-    output_dir = os.path.join("results/inference", dataset_name)
-    os.makedirs(output_dir, exist_ok=True)
-
-    if args.output_file:
-        output_file = args.output_file
-    else:
-        output_file = os.path.join(output_dir, f"{model_name}_{args.task}.json")
-
-    # ------------------------------------------------------------------
-    # 6. Stop token IDs — stop at EOS or audio_start (to avoid generating
-    #    useless audio tokens after a switch/continue response)
+    # 4. Stop token IDs + vLLM sampling params (shared across datasets)
     # ------------------------------------------------------------------
     stop_token_ids = [eos_id, special_ids["audio_start"]]
     vllm_sampling_params = None
@@ -401,9 +397,145 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------
-    # 7. Inference loop
+    # 5. Build list of dataset specs (from CLI or manifest)
     # ------------------------------------------------------------------
-    print(f"\nTask: {args.task}")
+    dataset_specs = _build_dataset_specs(args)
+
+    # ------------------------------------------------------------------
+    # 6. Run each dataset with the same model/tokenizer instances
+    # ------------------------------------------------------------------
+    _resamplers: dict[int, torchaudio.transforms.Resample] = {}
+    model_name = os.path.basename(args.model_path.rstrip("/"))
+
+    for idx, spec in enumerate(dataset_specs):
+        print(f"\n{'#' * 70}")
+        print(f"# Dataset {idx + 1}/{len(dataset_specs)}: {spec.get('name') or spec['path']}")
+        print(f"{'#' * 70}")
+        try:
+            _run_dataset(
+                spec=spec,
+                args=args,
+                model=model,
+                tokenizer=tokenizer,
+                wav_tokenizer=wav_tokenizer,
+                bos_id=bos_id,
+                special_ids=special_ids,
+                stop_token_ids=stop_token_ids,
+                vllm_sampling_params=vllm_sampling_params,
+                model_name=model_name,
+                resamplers=_resamplers,
+            )
+        except Exception as e:
+            # In manifest mode, continue on per-dataset failures so one bad
+            # locale doesn't tank the whole 22-run batch.
+            if args.manifest:
+                print(f"[ERROR] Dataset {spec.get('name')} failed: {e}")
+                continue
+            raise
+
+    print("\nAll datasets done.")
+
+
+def _build_dataset_specs(args) -> list[dict]:
+    """Return a list of dataset specs from either the manifest or CLI args.
+
+    Manifest JSON schema:
+        {
+          "output_root": "...",           # default output root
+          "num_samples": 50,              # default
+          "task": "transcribe",           # default
+          "audio_column": "audio",        # default
+          "datasets": [
+            {"name": "fleurs_en_us", "kind": "arrow",   "path": "..."},
+            {"name": "spc_r_test",   "kind": "parquet", "path": "..."},
+            {"name": "mydir",        "kind": "wav",     "path": "...",
+             "num_samples": 20, "task": "translate", "output_file": "..."}
+          ]
+        }
+    """
+    if args.manifest:
+        with open(args.manifest) as f:
+            manifest = json.load(f)
+        defaults = {
+            "num_samples": manifest.get("num_samples", args.num_samples),
+            "task": manifest.get("task", args.task),
+            "audio_column": manifest.get("audio_column", args.audio_column),
+            "output_root": manifest.get("output_root", args.output_root),
+        }
+        specs = []
+        for entry in manifest["datasets"]:
+            merged = {**defaults, **entry}
+            if "kind" not in merged or "path" not in merged:
+                raise ValueError(f"Manifest entry missing kind/path: {entry}")
+            specs.append(merged)
+        return specs
+
+    # Single-dataset CLI mode
+    if args.audio_dir:
+        kind, path = "arrow", args.audio_dir
+    elif args.parquet_dir:
+        kind, path = "parquet", args.parquet_dir
+    else:
+        kind, path = "wav", args.wav_dir
+    return [{
+        "name": args.dataset_name,
+        "kind": kind,
+        "path": path,
+        "num_samples": args.num_samples,
+        "task": args.task,
+        "audio_column": args.audio_column,
+        "output_file": args.output_file,
+        "output_root": args.output_root,
+    }]
+
+
+def _run_dataset(
+    *,
+    spec: dict,
+    args,
+    model,
+    tokenizer,
+    wav_tokenizer,
+    bos_id: int,
+    special_ids: dict[str, int],
+    stop_token_ids: list[int],
+    vllm_sampling_params,
+    model_name: str,
+    resamplers: dict,
+) -> None:
+    """Load one dataset, run inference, and save results to JSON."""
+    kind = spec["kind"]
+    path = spec["path"]
+    num_samples = spec.get("num_samples", args.num_samples)
+    task = spec.get("task", args.task)
+    audio_column = spec.get("audio_column", args.audio_column)
+    dataset_name = spec.get("name") or os.path.basename(path.rstrip("/"))
+
+    # Resolve output file
+    output_file = spec.get("output_file")
+    if not output_file:
+        output_root = spec.get("output_root") or "results/inference"
+        output_dir = os.path.join(output_root, dataset_name)
+        output_file = os.path.join(output_dir, f"{model_name}_{task}.json")
+    else:
+        output_dir = os.path.dirname(output_file)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if args.skip_existing and os.path.exists(output_file):
+        print(f"  SKIP (output exists): {output_file}")
+        return
+
+    print(f"\nLoading audio from {path} (kind={kind}) ...")
+    if kind == "arrow":
+        samples = load_arrow_dataset(path, audio_column, num_samples)
+    elif kind == "parquet":
+        samples = load_parquet_dataset(path, audio_column, num_samples)
+    elif kind == "wav":
+        samples = load_wav_dir_dataset(path, num_samples)
+    else:
+        raise ValueError(f"Unknown dataset kind: {kind!r}")
+
+    print(f"\nTask: {task}")
     print(f"Max new tokens: {args.max_new_tokens}")
     print(f"Temperature: {args.temperature}")
     print(f"Output dir: {output_dir}")
@@ -411,8 +543,6 @@ def main() -> None:
     print("=" * 70)
 
     results = []
-    _resamplers: dict[int, torchaudio.transforms.Resample] = {}
-
     for i, sample in enumerate(samples):
         audio_array = sample["audio_array"]
         sr = sample["sr"]
@@ -421,47 +551,40 @@ def main() -> None:
         sample_dataset = sample.get("dataset", "")
         channel_layout = sample.get("channel_layout")
 
-        audio_array = _downmix_audio_array(
-            audio_array,
-            channel_layout=channel_layout,
-        )
-        audio_tensor = torch.from_numpy(audio_array).float().unsqueeze(0)  # (1, T)
+        audio_array = _downmix_audio_array(audio_array, channel_layout=channel_layout)
+        audio_tensor = torch.from_numpy(audio_array).float().unsqueeze(0)
 
         duration_s = audio_tensor.shape[-1] / sr
 
-        # Export wav file into the output directory (skip if already exists
-        # or if loading from wav-dir where files are already on disk)
-        if not args.wav_dir:
+        if kind == "wav":
+            audio_uri = sample.get("audio_path") or ""
+        else:
             wav_name = f"sample_{i}.wav"
             if isinstance(sample_id, str) and sample_id != str(i):
                 wav_name = f"{sample_id}.wav"
             wav_path = os.path.join(output_dir, wav_name)
             if not os.path.exists(wav_path):
                 sf.write(wav_path, audio_array, sr)
+            audio_uri = os.path.abspath(wav_path)
 
-        # Resample to 24 kHz for WavTokenizer (cache resampler per sample rate)
         if sr != 24000:
-            if sr not in _resamplers:
-                _resamplers[sr] = torchaudio.transforms.Resample(sr, 24000)
-            audio_24k = _resamplers[sr](audio_tensor)
+            if sr not in resamplers:
+                resamplers[sr] = torchaudio.transforms.Resample(sr, 24000)
+            audio_24k = resamplers[sr](audio_tensor)
         else:
             audio_24k = audio_tensor
 
-        # Peak normalize to -3 dBFS (matches tokenization pipeline)
         if not args.no_normalize:
             peak = audio_24k.abs().max().clamp(min=1e-10)
             target_peak = 10 ** (-3.0 / 20.0)
             audio_24k = audio_24k * (target_peak / peak)
 
-        # Encode with WavTokenizer
         with torch.no_grad():
-            codes = wav_tokenizer.encode_audio(audio_24k)  # (1, N)
-        codes = codes.squeeze(0).cpu()  # (N,)
+            codes = wav_tokenizer.encode_audio(audio_24k)
+        codes = codes.squeeze(0).cpu()
 
-        # Build prompt
-        prompt_ids = build_prompt(codes, args.task, bos_id, special_ids)
+        prompt_ids = build_prompt(codes, task, bos_id, special_ids)
 
-        # Generate
         t_gen = time.time()
         if args.backend == "transformers":
             prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=model.device)
@@ -493,11 +616,8 @@ def main() -> None:
         gen_time = time.time() - t_gen
 
         n_new = len(generated_ids) - len(prompt_ids)
-
-        # Decode text portion of output
         text_output = decode_output(generated_ids, tokenizer, len(prompt_ids))
 
-        # Count audio tokens in output
         new_ids = generated_ids[len(prompt_ids):]
         n_audio_out = sum(
             1 for tid in new_ids
@@ -505,56 +625,46 @@ def main() -> None:
         )
         n_text_out = n_new - n_audio_out
 
-        # Name the model output based on the task
-        output_label = {"transcribe": "transcription", "continue": "continuation", "translate": "translation"}[args.task]
-
-        result = {
-            "sample_idx": i,
-            "sample_id": str(sample_id),
-            "duration_s": round(duration_s, 2),
-            "audio_codes": len(codes),
-            "prompt_tokens": len(prompt_ids),
-            "generated_tokens": n_new,
-            "text_tokens": n_text_out,
-            "audio_tokens_out": n_audio_out,
-            "gen_time_s": round(gen_time, 2),
-            output_label: text_output,
-            "ground_truth": ground_truth,
-        }
-        if sample_dataset:
-            result["dataset"] = sample_dataset
-        results.append(result)
+        record = PredictionRecord(
+            sample_idx=i,
+            sample_id=str(sample_id),
+            duration_s=round(duration_s, 2),
+            audio_uri=audio_uri or None,
+            reference_text=ground_truth,
+            prediction_text=text_output,
+            audio_codes=len(codes),
+            prompt_tokens=len(prompt_ids),
+            generated_tokens=n_new,
+            text_tokens=n_text_out,
+            audio_tokens_out=n_audio_out,
+            gen_time_s=round(gen_time, 2),
+            dataset=sample_dataset or None,
+        )
+        results.append(record)
 
         print(f"\n--- Sample {i} (id={sample_id}) ---")
         print(f"  Duration: {duration_s:.2f}s | Audio codes: {len(codes)} | Prompt tokens: {len(prompt_ids)}")
         print(f"  Generated: {n_new} tokens ({n_text_out} text, {n_audio_out} audio) in {gen_time:.2f}s")
         if ground_truth:
             print(f"  Ground Truth: {ground_truth[:200]}")
-        print(f"  {output_label.title()}: {text_output}")
+        print(f"  Prediction ({task}): {text_output}")
         print()
 
-    # ------------------------------------------------------------------
-    # 8. Save results
-    # ------------------------------------------------------------------
-    output_data = {
-        "model_path": args.model_path,
-        "data_source": data_source,
-        "dataset_name": dataset_name,
-        "task": args.task,
-        "backend": args.backend,
-        "num_samples": len(samples),
-        "max_new_tokens": args.max_new_tokens,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "results": results,
-    }
-    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-    with open(output_file, "w") as f:
-        json.dump(output_data, f, indent=2, ensure_ascii=False)
+    run = InferenceRun(
+        task=task,
+        model_path=args.model_path,
+        dataset_name=dataset_name,
+        data_source=path,
+        backend=args.backend,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        records=results,
+    )
+    write_inference_run(output_file, run)
 
     print("=" * 70)
     print(f"Results saved to {output_file}")
-    print("Done.")
 
 
 if __name__ == "__main__":
