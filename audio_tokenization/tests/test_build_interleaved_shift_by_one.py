@@ -4,8 +4,8 @@ import json
 import numpy as np
 import sys
 
-from audio_tokenization.utils.build_interleaved import shift_by_one as sbo
-from audio_tokenization.utils.build_interleaved.common import (
+from audio_tokenization.interleave import shift_by_one as sbo
+from audio_tokenization.interleave.common import (
     list_interleave_cache_partitions,
     load_interleave_cache,
     prepare_interleave_cache_and_runs,

@@ -5,7 +5,7 @@ import gzip
 
 import pytest
 
-from audio_tokenization.utils.prepare_data import common
+from audio_tokenization.prepare import common
 
 
 def test_build_recording_from_audio_bytes_uses_raw_bytes(monkeypatch):

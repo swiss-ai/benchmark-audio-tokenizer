@@ -1,8 +1,8 @@
 """Lhotse data loading: load prepared Shar for tokenization.
 
 Data preparation (HF/WDS -> Shar) is handled by standalone scripts:
-    - audio_tokenization.utils.prepare_data.prepare_hf_to_shar
-    - audio_tokenization.utils.prepare_data.prepare_wds_to_shar
+    - audio_tokenization.prepare.prepare_hf_to_shar
+    - audio_tokenization.prepare.prepare_wds_to_shar
 
 This module only loads pre-built Shar and applies runtime filters.
 """

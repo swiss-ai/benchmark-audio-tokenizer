@@ -2,7 +2,7 @@ import sys
 import types
 
 import pytest
-from audio_tokenization.utils.prepare_data import (
+from audio_tokenization.prepare import (
     prepare_hf_to_shar,
     prepare_parquet_to_shar,
 )
@@ -684,14 +684,14 @@ def test_prepare_parquet_preflight_raises_for_missing_required_audio_column(monk
 
 
 def test_validate_prepare_runtime_requires_ffmpeg(monkeypatch):
-    from audio_tokenization.utils.prepare_data import runtime
+    from audio_tokenization.prepare import runtime
 
     init_calls = []
     tok_calls = []
     monkeypatch.setattr(runtime, "init_worker_process", lambda backend: init_calls.append(backend))
     monkeypatch.setattr(runtime.shutil, "which", lambda name: None if name == "ffmpeg" else "/bin/true")
     monkeypatch.setattr(
-        "audio_tokenization.utils.prepare_data.text_ops.load_text_tokenizer",
+        "audio_tokenization.prepare.text_ops.load_text_tokenizer",
         lambda path: tok_calls.append(path),
     )
 

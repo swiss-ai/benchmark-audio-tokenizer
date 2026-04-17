@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from omegaconf import DictConfig, OmegaConf
 
-from audio_tokenization.utils.prepare_data.metadata import normalize_optional_path
+from audio_tokenization.prepare.metadata import normalize_optional_path
 
 
 SUPPORTED_PREPARE_FAMILIES = {

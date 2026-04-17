@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 
 from audio_tokenization.config.schema import DatasetSpec
-from audio_tokenization.utils.prepare_data import prepare_parquet_to_shar
+from audio_tokenization.prepare import prepare_parquet_to_shar
 
 
 def _id_column_to_cli_list(value: str | list[str] | None) -> list[str] | None:

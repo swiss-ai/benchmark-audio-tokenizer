@@ -10,12 +10,12 @@ from audio_tokenization.config.schema import (
     build_parquet_prepare_fingerprint,
 )
 from audio_tokenization.stages import prepare as prepare_stage
-from audio_tokenization.utils.prepare_data import prepare_parquet_to_shar
-from audio_tokenization.utils.prepare_data.constants import (
+from audio_tokenization.prepare import prepare_parquet_to_shar
+from audio_tokenization.prepare.constants import (
     CURRENT_PREPARE_STATE_VERSION,
     PREPARE_STATE_FILE,
 )
-from audio_tokenization.utils.prepare_data.runtime import (
+from audio_tokenization.prepare.runtime import (
     read_prepare_state,
     validate_or_write_prepare_state,
 )

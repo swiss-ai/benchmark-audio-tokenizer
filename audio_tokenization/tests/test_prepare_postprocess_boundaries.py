@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from audio_tokenization.utils.prepare_data.postprocess import add_captions_to_shar
+from audio_tokenization.prepare.postprocess import add_captions_to_shar
 
 
 def test_add_captions_rejects_id_rewrite_when_recordings_are_symlinked(tmp_path):

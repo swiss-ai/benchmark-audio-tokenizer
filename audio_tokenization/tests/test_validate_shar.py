@@ -79,7 +79,7 @@ def _write_cuts(cuts_path: Path, cuts: list[dict]) -> None:
 
 
 def test_validate_passes_on_clean_shar(tmp_path):
-    from audio_tokenization.utils.prepare_data.validate_shar import (
+    from audio_tokenization.prepare.validate_shar import (
         validate_shar_directory,
     )
 
@@ -92,7 +92,7 @@ def test_validate_passes_on_clean_shar(tmp_path):
 
 
 def test_validate_raises_on_id_mismatch(tmp_path):
-    from audio_tokenization.utils.prepare_data.validate_shar import (
+    from audio_tokenization.prepare.validate_shar import (
         SharValidationError,
         validate_shar_directory,
     )
@@ -117,7 +117,7 @@ def test_validate_raises_on_id_mismatch(tmp_path):
 
 
 def test_validate_raises_on_dropped_cut(tmp_path):
-    from audio_tokenization.utils.prepare_data.validate_shar import (
+    from audio_tokenization.prepare.validate_shar import (
         SharValidationError,
         validate_shar_directory,
     )
@@ -138,7 +138,7 @@ def test_validate_raises_on_dropped_cut(tmp_path):
 def test_count_jsonl_entries_handles_gzipped(tmp_path):
     """Regression for P2: jsonl sidecar fields (.jsonl.gz) must be counted
     via gzip-aware reader, not sent through tarfile.open."""
-    from audio_tokenization.utils.prepare_data.validate_shar import (
+    from audio_tokenization.prepare.validate_shar import (
         _count_jsonl_entries,
     )
     p = tmp_path / "captions.000000.jsonl.gz"
@@ -148,7 +148,7 @@ def test_count_jsonl_entries_handles_gzipped(tmp_path):
 
 
 def test_count_jsonl_entries_handles_plain(tmp_path):
-    from audio_tokenization.utils.prepare_data.validate_shar import (
+    from audio_tokenization.prepare.validate_shar import (
         _count_jsonl_entries,
     )
     p = tmp_path / "captions.000000.jsonl"
@@ -157,7 +157,7 @@ def test_count_jsonl_entries_handles_plain(tmp_path):
 
 
 def test_validate_raises_on_missing_index(tmp_path):
-    from audio_tokenization.utils.prepare_data.validate_shar import (
+    from audio_tokenization.prepare.validate_shar import (
         validate_shar_directory,
     )
 
@@ -183,7 +183,7 @@ def _run_module(module: str, *extra: str) -> subprocess.CompletedProcess:
 def test_validate_cli_prints_per_shard_counts(tmp_path):
     shar = _write_test_shar(tmp_path, num_cuts=2)
     result = _run_module(
-        "audio_tokenization.utils.prepare_data.validate_shar",
+        "audio_tokenization.prepare.validate_shar",
         "--shar-dir", str(shar),
     )
     assert result.returncode == 0, result.stderr
@@ -199,7 +199,7 @@ def test_validate_cli_accepts_custom_index_filename(tmp_path):
     (shar / "shar_index.json").rename(shar / "custom_index.json")
 
     result = _run_module(
-        "audio_tokenization.utils.prepare_data.validate_shar",
+        "audio_tokenization.prepare.validate_shar",
         "--shar-dir", str(shar),
         "--index-filename", "custom_index.json",
     )
@@ -215,7 +215,7 @@ def test_validate_cli_exits_nonzero_on_corruption(tmp_path):
     _write_cuts(cuts_path, cuts)
 
     result = _run_module(
-        "audio_tokenization.utils.prepare_data.validate_shar",
+        "audio_tokenization.prepare.validate_shar",
         "--shar-dir", str(shar),
     )
     assert result.returncode == 1
@@ -233,7 +233,7 @@ def test_validate_cli_exits_nonzero_on_corruption(tmp_path):
 # that rejects the unsafe rewrite path while still allowing the safe
 # stable-IDs use case, so it stays runnable.
 _TOMBSTONED_MODULES = [
-    "audio_tokenization.utils.prepare_data.postprocess.patch_universal_ids",
+    "audio_tokenization.prepare.postprocess.patch_universal_ids",
 ]
 
 

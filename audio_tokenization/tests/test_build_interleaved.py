@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from audio_tokenization.utils.build_interleaved.common import (
+from audio_tokenization.interleave.common import (
     find_consecutive_runs,
     _detect_runs,
     compute_ratio_adjustment,
@@ -17,7 +17,7 @@ from audio_tokenization.utils.build_interleaved.common import (
     prepare_interleave_cache_and_runs,
     prepare_length_metadata,
 )
-from audio_tokenization.utils.build_interleaved.pattern import (
+from audio_tokenization.interleave.pattern import (
     build_sequence,
     derive_sub_patterns,
     group_patterns_by_size,
@@ -420,7 +420,7 @@ class TestInterleaveCacheReaders:
 
     def test_v2_reader_raises_when_fd_budget_is_too_low(self, tmp_path: Path, monkeypatch):
         from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
-        import audio_tokenization.utils.build_interleaved.common as bic
+        import audio_tokenization.interleave.common as bic
 
         writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
         writer.add_rows([
