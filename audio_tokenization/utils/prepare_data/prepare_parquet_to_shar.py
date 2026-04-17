@@ -28,6 +28,7 @@ import logging
 import time
 from pathlib import Path
 
+from audio_tokenization.config.schema import build_parquet_prepare_fingerprint
 from audio_tokenization.utils.prepare_data.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
@@ -53,7 +54,6 @@ from audio_tokenization.utils.prepare_data.identity import (
 )
 from audio_tokenization.utils.prepare_data.metadata import (
     load_external_metadata,
-    normalize_optional_path,
     resolve_sample_text_and_custom,
 )
 from audio_tokenization.utils.prepare_data.runtime import (
@@ -270,33 +270,15 @@ def _convert_worker(args_tuple):
 
 def _validate_or_write_prepare_state(args) -> None:
     state_path = args.shar_dir / PREPARE_STATE_FILE
-    expected = {
-        "parquet_dir": str(Path(args.parquet_dir).resolve()),
-        "text_tokenizer": normalize_optional_path(args.text_tokenizer),
-        "input_clip_id_parser": args.input_clip_id_parser,
-        "external_metadata": normalize_optional_path(args.external_metadata),
-        "id_field": args.id_field,
-        "text_field": args.text_field,
-        "custom_fields": sorted(args.custom_fields) if args.custom_fields else None,
-    }
+    expected = build_parquet_prepare_fingerprint(args)
     wrote = validate_or_write_prepare_state(
         state_path,
         expected=expected,
-        invariant_keys=(
-            "parquet_dir",
-            "text_tokenizer",
-            "input_clip_id_parser",
-            "external_metadata",
-            "id_field",
-            "text_field",
-            "custom_fields",
-        ),
+        invariant_keys=tuple(expected.keys()),
         guidance=(
-            "Use the same --parquet-dir, --text-tokenizer, "
-            "--input-clip-id-parser, --external-metadata, --id-field, "
-            "--text-field, and --custom-fields to resume this output "
-            "directory, or "
-            f"remove {args.shar_dir} and restart from scratch."
+            "The run's configuration has drifted from a previous run against the "
+            "same --shar-dir. Either re-issue the original arguments to resume, "
+            f"or remove {args.shar_dir} and restart from scratch."
         ),
     )
     if wrote:

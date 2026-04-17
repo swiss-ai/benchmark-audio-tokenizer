@@ -3,30 +3,22 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 from audio_tokenization.config.schema import DatasetSpec
 from audio_tokenization.utils.prepare_data import prepare_parquet_to_shar
-from audio_tokenization.utils.prepare_data.constants import PREPARE_STATE_FILE
 
 
-def _validate_existing_prepare_state(shar_dir: Path) -> None:
-    state_path = shar_dir / PREPARE_STATE_FILE
-    if not state_path.is_file():
-        return
-
-    payload = json.loads(state_path.read_text())
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Invalid prepare state format: {state_path}")
-
-    version = payload.get("version")
-    if version != 1:
-        raise RuntimeError(
-            f"Unsupported legacy prepare state at {state_path}. "
-            "Remove the output directory or migrate the state file before using the "
-            "config-driven prepare entrypoint."
-        )
+def _id_column_to_cli_list(value: str | list[str] | None) -> list[str] | None:
+    # argparse stores --id-column as a list (nargs="*"); preserve that shape
+    # so list-vs-str distinctions reach the fingerprint untouched.
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return list(value) or None
+    raise TypeError(f"Unsupported id_column shape: {type(value).__name__}")
 
 
 def build_prepare_namespace(spec: DatasetSpec) -> argparse.Namespace:
@@ -48,7 +40,7 @@ def build_prepare_namespace(spec: DatasetSpec) -> argparse.Namespace:
         resampling_backend=prepare.output.resampling_backend,
         mp_start_method=prepare.output.mp_start_method,
         read_batch_size=prepare.output.read_batch_size,
-        id_column=[prepare.metadata.id_column] if prepare.metadata.id_column else None,
+        id_column=_id_column_to_cli_list(prepare.metadata.id_column),
         audio_column=prepare.metadata.audio_column,
         text_column=prepare.metadata.text_column,
         duration_column=prepare.metadata.duration_column,
@@ -69,7 +61,6 @@ def run_prepare(spec: DatasetSpec):
         return {"skipped": True, "reason": "prepare.disabled"}
 
     args = build_prepare_namespace(spec)
-    _validate_existing_prepare_state(args.shar_dir)
 
     if spec.prepare.family == "parquet":
         return prepare_parquet_to_shar.run(args)

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from audio_tokenization.utils.prepare_data.constants import (
+    CURRENT_PREPARE_STATE_VERSION,
     PREPARE_SUMMARY_FILE,
     SUCCESS_MARKER_FILE,
     WORKER_ASSIGNMENT_FILE,
@@ -77,6 +78,87 @@ def mark_partition_success(
     (part_dir / success_marker_name).write_text("ok\n")
 
 
+def _migrate_prepare_state_v0_to_v1(payload: dict) -> dict:
+    upgraded = dict(payload)
+    upgraded["version"] = 1
+    return upgraded
+
+
+_PREPARE_STATE_MIGRATIONS = {
+    (0, 1): _migrate_prepare_state_v0_to_v1,
+}
+
+
+def _atomic_write_state_json(state_path: Path, payload: dict) -> None:
+    """Write ``payload`` to ``state_path`` atomically, with fsync for durability.
+
+    Why fsync: cscs Lustre scratch can leave a zero-byte file after node
+    failure if the data isn't flushed before the metadata rename. Losing the
+    state file silently downgrades the next run to "first run" and re-prepares
+    the entire dataset.
+    """
+    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
+    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    with open(tmp_path, "w") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, state_path)
+
+
+def read_prepare_state(state_path: Path) -> dict:
+    """Read a prepare state file, auto-upgrading v0 (unversioned) in place.
+
+    Raises:
+        FileNotFoundError: if ``state_path`` does not exist.
+        RuntimeError: if the file has an unknown future version, a payload
+            that isn't a dict, or a missing migration step.
+    """
+    if not state_path.is_file():
+        raise FileNotFoundError(state_path)
+
+    payload = json.loads(state_path.read_text())
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid prepare state format: {state_path}")
+
+    version = payload.get("version", 0)
+    if not isinstance(version, int):
+        raise RuntimeError(
+            f"Invalid prepare state at {state_path}: 'version' must be an int, "
+            f"got {type(version).__name__}"
+        )
+
+    if version > CURRENT_PREPARE_STATE_VERSION:
+        raise RuntimeError(
+            f"Prepare state at {state_path} is version {version}, but this code "
+            f"only knows how to read up to version {CURRENT_PREPARE_STATE_VERSION}. "
+            "Upgrade audio_tokenization to a newer release, or delete the state "
+            "file to start a fresh prepare run."
+        )
+
+    upgraded = False
+    while version < CURRENT_PREPARE_STATE_VERSION:
+        step = (version, version + 1)
+        migrate = _PREPARE_STATE_MIGRATIONS.get(step)
+        if migrate is None:
+            raise RuntimeError(
+                f"Missing prepare-state migration for {step}; this is a bug. "
+                f"State file: {state_path}"
+            )
+        payload = migrate(payload)
+        version += 1
+        upgraded = True
+
+    if upgraded:
+        _atomic_write_state_json(state_path, payload)
+        logger.info(
+            "Upgraded %s to prepare-state v%d (in place).",
+            state_path.name, CURRENT_PREPARE_STATE_VERSION,
+        )
+
+    return payload
+
+
 def validate_or_write_prepare_state(
     state_path: Path,
     *,
@@ -84,14 +166,23 @@ def validate_or_write_prepare_state(
     invariant_keys: Sequence[str],
     guidance: str,
 ) -> bool:
-    """Persist first-run state or assert resume invariants on later runs."""
+    """Persist first-run state or assert resume invariants on later runs.
+
+    Backfill: if a key in ``invariant_keys`` is missing from the on-disk
+    payload (e.g. expanded invariant set on a v0 file), the current value is
+    accepted and persisted; subsequent runs then enforce strict equality.
+    Returns ``True`` on first write, ``False`` on validated resume.
+    """
     if state_path.is_file():
-        payload = json.loads(state_path.read_text())
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"Invalid prepare state format: {state_path}")
+        payload = read_prepare_state(state_path)
+        backfilled: list[str] = []
 
         for key in invariant_keys:
-            prev = payload.get(key)
+            if key not in payload:
+                payload[key] = expected.get(key)
+                backfilled.append(key)
+                continue
+            prev = payload[key]
             cur = expected.get(key)
             if prev != cur:
                 raise AssertionError(
@@ -102,9 +193,17 @@ def validate_or_write_prepare_state(
                     f"Current value: {cur!r}\n"
                     f"{guidance}"
                 )
+
+        if backfilled:
+            _atomic_write_state_json(state_path, payload)
+            logger.info(
+                "Backfilled prepare-state keys on first resume: %s",
+                sorted(backfilled),
+            )
         return False
 
-    state_path.write_text(json.dumps(dict(expected), indent=2) + "\n")
+    versioned = {"version": CURRENT_PREPARE_STATE_VERSION, **dict(expected)}
+    _atomic_write_state_json(state_path, versioned)
     return True
 
 
