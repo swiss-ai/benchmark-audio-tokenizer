@@ -158,7 +158,16 @@ def load_arrow_dataset(audio_dir: str, audio_column: str, num_samples: int):
         else:
             continue
 
-        text = row.get("text", "")
+        # FLEURS ships two schemas: some locales expose text/raw_text,
+        # others transcription/raw_transcription. Prefer the raw variant
+        # (keeps casing and punctuation) and fall back across keys.
+        text = (
+            row.get("raw_transcription")
+            or row.get("transcription")
+            or row.get("raw_text")
+            or row.get("text")
+            or ""
+        )
         sample_id = row.get("sample_id", row.get("id", i))
         samples.append({
             "audio_array": audio_array,
@@ -172,41 +181,62 @@ def load_arrow_dataset(audio_dir: str, audio_column: str, num_samples: int):
 
 def load_parquet_dataset(parquet_dir: str, audio_column: str, num_samples: int):
     """Load samples from parquet files with FLAC audio bytes."""
-    import polars as pl
+    import pyarrow.parquet as pq
+
+    from audio_tokenization.prepare.streaming import iter_parquet_rows
 
     files = sorted(glob(os.path.join(parquet_dir, "shard_*.parquet")))
     if not files:
         files = sorted(glob(os.path.join(parquet_dir, "*.parquet")))
     print(f"  Found {len(files)} parquet files")
+    if not files:
+        print("  Loaded 0 samples")
+        return []
 
     samples = []
+    n_skipped = 0
+    # Stream rows so a skip-heavy prefix can't starve us out of later valid
+    # rows in the same file.
     for f in files:
         if len(samples) >= num_samples:
             break
-        remaining = num_samples - len(samples)
-        df = pl.read_parquet(f, n_rows=remaining)
-
-        for row_idx in range(len(df)):
-            audio_struct = df[audio_column][row_idx]
+        # Compute the projection per file. Some corpora have mixed optional
+        # schemas across shards, e.g. early shards missing text/id while later
+        # shards include them.
+        schema_names = set(pq.ParquetFile(f).schema_arrow.names)
+        if audio_column not in schema_names:
+            raise KeyError(
+                f"Required audio column {audio_column!r} missing from parquet shard {f}"
+            )
+        columns = [c for c in (audio_column, "text", "id") if c in schema_names]
+        for row in iter_parquet_rows(f, columns=columns, batch_size=256):
+            if len(samples) >= num_samples:
+                break
+            audio_struct = row[audio_column]
             audio_bytes = audio_struct["bytes"]
             sr_parquet = audio_struct["sampling_rate"]
 
-            # Decode FLAC bytes to numpy array
-            audio_array, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+            if not audio_bytes:
+                n_skipped += 1
+                continue
+            try:
+                audio_array, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+            except Exception:
+                n_skipped += 1
+                continue
             if sr != sr_parquet:
                 sr = sr_parquet  # trust parquet metadata
-
-            text = df["text"][row_idx] if "text" in df.columns else ""
-            sample_id = df["id"][row_idx] if "id" in df.columns else row_idx
 
             samples.append({
                 "audio_array": audio_array,
                 "sr": sr,
-                "text": text or "",
-                "id": sample_id,
+                "text": row.get("text") or "",
+                "id": row.get("id", len(samples)),
                 "channel_layout": "channels_last",
             })
 
+    if n_skipped:
+        print(f"  Skipped {n_skipped} rows with empty/undecodable audio")
     print(f"  Loaded {len(samples)} samples")
     return samples
 

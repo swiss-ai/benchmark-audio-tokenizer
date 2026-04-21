@@ -28,7 +28,7 @@ import logging
 import time
 from pathlib import Path
 
-from audio_tokenization.config.schema import build_parquet_prepare_fingerprint
+from audio_tokenization.config.schema import PrepareSpec
 from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
@@ -46,7 +46,7 @@ from audio_tokenization.prepare.columnar import (
     _projected_columns,
     validate_columnar_schema_roots,
 )
-from audio_tokenization.prepare.constants import PREPARE_STATE_FILE, _MISSING
+from audio_tokenization.prepare.constants import _MISSING
 from audio_tokenization.prepare.identity import (
     add_input_clip_id_parser_arg,
     resolve_input_source_and_clip_num,
@@ -63,7 +63,7 @@ from audio_tokenization.prepare.runtime import (
     init_worker_process,
     run_pool_and_finalize,
     validate_prepare_runtime,
-    validate_or_write_prepare_state,
+    write_prepare_state_for_spec,
     write_worker_result,
 )
 from audio_tokenization.prepare.text_ops import (
@@ -268,33 +268,20 @@ def _convert_worker(args_tuple):
 # ---------------------------------------------------------------------------
 
 
-def _validate_or_write_prepare_state(args) -> None:
-    state_path = args.shar_dir / PREPARE_STATE_FILE
-    expected = build_parquet_prepare_fingerprint(args)
-    wrote = validate_or_write_prepare_state(
-        state_path,
-        expected=expected,
-        invariant_keys=tuple(expected.keys()),
-        guidance=(
-            "The run's configuration has drifted from a previous run against the "
-            "same --shar-dir. Either re-issue the original arguments to resume, "
-            f"or remove {args.shar_dir} and restart from scratch."
-        ),
-    )
-    if wrote:
-        logger.info(f"Wrote prepare state: {state_path}")
-def _preflight_prepare(args, resolved: list[str]) -> None:
+def _preflight_prepare(spec: PrepareSpec, resolved: list[str]) -> None:
     import pyarrow.parquet as pq
 
+    m = spec.metadata
+    o = spec.output
     sample_path = resolved[0]
     validate_columnar_schema_roots(
         available_roots=pq.ParquetFile(sample_path).schema_arrow.names,
-        required_columns=(args.audio_column, args.id_column),
+        required_columns=(m.audio_column, m.id_column),
         optional_columns=(
-            args.text_column,
-            args.duration_column,
-            args.language_column,
-            args.custom_columns,
+            m.text_column,
+            m.duration_column,
+            m.language_column,
+            m.custom_columns,
         ),
         source_path=sample_path,
         source_kind="Parquet",
@@ -302,9 +289,9 @@ def _preflight_prepare(args, resolved: list[str]) -> None:
     )
 
     validate_prepare_runtime(
-        resampling_backend=args.resampling_backend,
+        resampling_backend=o.resampling_backend,
         require_ffmpeg=True,
-        text_tokenizer_path=args.text_tokenizer,
+        text_tokenizer_path=o.text_tokenizer,
     )
 
 
@@ -342,65 +329,72 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(args):
-    # Resolve parquet files
-    resolved = sorted(str(p) for p in args.parquet_dir.glob(args.parquet_glob))
+def run(spec: PrepareSpec):
+    """Execute parquet prepare for a typed PrepareSpec.
+
+    The legacy ``main(argv)`` path also feeds this; it parses argv, then
+    routes the values through ``PrepareSpec`` so both Hydra and CLI runs
+    converge on one execution path.
+    """
+    i, o, m = spec.input, spec.output, spec.metadata
+    parquet_dir = Path(i.parquet_dir)
+    shar_dir = Path(o.shar_dir)
+
+    resolved = sorted(str(p) for p in parquet_dir.glob(i.parquet_glob))
     if not resolved:
-        raise FileNotFoundError(
-            f"No files match {args.parquet_dir / args.parquet_glob}"
-        )
+        raise FileNotFoundError(f"No files match {parquet_dir / i.parquet_glob}")
 
-    _preflight_prepare(args, resolved)
+    _preflight_prepare(spec, resolved)
 
-    args.shar_dir.mkdir(parents=True, exist_ok=True)
-    _validate_or_write_prepare_state(args)
+    shar_dir.mkdir(parents=True, exist_ok=True)
+    write_prepare_state_for_spec(spec)
 
     num_workers = ensure_worker_assignment(
-        args.shar_dir, resolved, args.num_workers, _ITEMS_KEY, "parquet files",
+        shar_dir, resolved, o.num_workers, _ITEMS_KEY, "parquet files",
     )
 
     logger.info(f"Found {len(resolved)} parquet files, using {num_workers} workers")
-    logger.info(f"Output: {args.shar_dir}")
+    logger.info(f"Output: {shar_dir}")
 
-    # Distribute parquet files across workers (round-robin)
     worker_parquets = distribute_round_robin(resolved, num_workers)
 
-    # Load text tokenizer before forking (shared via COW across workers)
-    text_tokenizer = load_text_tokenizer(args.text_tokenizer)
+    # Load text tokenizer before forking (shared via COW across workers).
+    text_tokenizer = load_text_tokenizer(o.text_tokenizer)
+
     global _EXTERNAL_METADATA
-    if args.external_metadata:
+    if m.external_metadata:
         _EXTERNAL_METADATA = load_external_metadata(
-            args.external_metadata,
-            tuple(args.custom_fields) if args.custom_fields else None,
-            id_field=args.id_field,
-            text_field=args.text_field,
+            m.external_metadata,
+            tuple(m.custom_fields) if m.custom_fields else None,
+            id_field=m.id_field,
+            text_field=m.text_field,
         )
         mp_start_method = "fork"
         logger.info("Using fork start method for COW sharing of external metadata")
     else:
         _EXTERNAL_METADATA = None
-        mp_start_method = args.mp_start_method
+        mp_start_method = o.mp_start_method
 
     worker_args = [
         (
             wid,
             parquets,
-            str(args.shar_dir),
-            args.target_sr,
-            args.shard_size,
-            args.shar_format,
-            args.id_column,
-            args.audio_column,
-            args.text_column,
-            args.duration_column,
-            args.language_column,
-            args.language,
-            args.custom_columns,
-            args.text_tokenize_custom_columns,
+            str(shar_dir),
+            o.target_sr,
+            o.shard_size,
+            o.shar_format,
+            m.id_column,
+            m.audio_column,
+            m.text_column,
+            m.duration_column,
+            m.language_column,
+            m.language,
+            m.custom_columns or None,
+            m.text_tokenize_custom_columns or None,
             text_tokenizer,
-            args.resampling_backend,
-            args.input_clip_id_parser,
-            args.read_batch_size,
+            o.resampling_backend,
+            m.input_clip_id_parser,
+            o.read_batch_size,
         )
         for wid, parquets in enumerate(worker_parquets)
         if parquets
@@ -409,16 +403,58 @@ def run(args):
     run_pool_and_finalize(
         _convert_worker,
         worker_args,
-        args.shar_dir,
+        shar_dir,
         num_workers,
         mp_start_method=mp_start_method,
     )
 
 
+def _args_to_spec(args) -> PrepareSpec:
+    """Translate flat argparse Namespace → typed PrepareSpec.
+
+    The legacy CLI is now a thin frontend: argv → Namespace (via
+    build_parser) → PrepareSpec → run(spec). This keeps the per-family
+    flat↔nested mapping co-located with the CLI it serves, and lets the
+    schema do all validation regardless of caller.
+    """
+    return PrepareSpec.from_mapping({
+        "family": "parquet",
+        "input": {
+            "parquet_dir": str(args.parquet_dir),
+            "parquet_glob": args.parquet_glob,
+        },
+        "output": {
+            "shar_dir": str(args.shar_dir),
+            "shard_size": args.shard_size,
+            "shar_format": args.shar_format,
+            "target_sr": args.target_sr,
+            "text_tokenizer": args.text_tokenizer,
+            "num_workers": args.num_workers,
+            "resampling_backend": args.resampling_backend,
+            "mp_start_method": args.mp_start_method,
+            "read_batch_size": args.read_batch_size,
+        },
+        "metadata": {
+            "audio_column": args.audio_column,
+            "text_column": args.text_column,
+            "duration_column": args.duration_column,
+            "id_column": args.id_column,
+            "language_column": args.language_column,
+            "language": args.language,
+            "custom_columns": args.custom_columns or [],
+            "text_tokenize_custom_columns": args.text_tokenize_custom_columns or [],
+            "external_metadata": args.external_metadata,
+            "custom_fields": args.custom_fields or [],
+            "id_field": args.id_field,
+            "text_field": args.text_field,
+            "input_clip_id_parser": args.input_clip_id_parser,
+        },
+    })
+
+
 def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    return run(args)
+    args = build_parser().parse_args(argv)
+    return run(_args_to_spec(args))
 
 
 if __name__ == "__main__":

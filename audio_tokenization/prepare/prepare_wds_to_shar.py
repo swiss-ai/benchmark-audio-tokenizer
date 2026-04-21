@@ -56,7 +56,6 @@ from audio_tokenization.prepare.cli import (
     add_shar_output_args,
     add_text_tokenizer_args,
 )
-from audio_tokenization.prepare.constants import PREPARE_STATE_FILE
 from audio_tokenization.prepare.identity import (
     add_input_clip_id_parser_arg,
     resolve_input_source_and_clip_num,
@@ -65,17 +64,15 @@ from audio_tokenization.prepare.identity import (
 from audio_tokenization.prepare.metadata import (
     load_external_metadata,
     lookup_external_metadata,
-    normalize_optional_path,
 )
 from audio_tokenization.prepare.runtime import (
     check_worker_reuse,
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
-    run_aggregate,
     run_pool_and_finalize,
     validate_prepare_runtime,
-    validate_or_write_prepare_state,
+    write_prepare_state_for_spec,
     write_worker_result,
 )
 from audio_tokenization.prepare.text_ops import (
@@ -521,41 +518,7 @@ def _convert_worker(args_tuple):
 _ITEMS_KEY = "resolved_shards"
 
 
-def _validate_or_write_prepare_state(args) -> None:
-    state_path = args.shar_dir / PREPARE_STATE_FILE
-    expected = {
-        "text_tokenizer": normalize_optional_path(args.text_tokenizer),
-        "text_field": args.text_field,
-        "custom_fields": sorted(args.custom_fields) if args.custom_fields else None,
-        "external_metadata": normalize_optional_path(args.external_metadata),
-        "id_field": args.id_field,
-        "input_clip_id_parser": args.input_clip_id_parser,
-        "language": args.language,
-    }
-    wrote = validate_or_write_prepare_state(
-        state_path,
-        expected=expected,
-        invariant_keys=(
-            "text_tokenizer",
-            "text_field",
-            "custom_fields",
-            "external_metadata",
-            "id_field",
-            "input_clip_id_parser",
-            "language",
-        ),
-        guidance=(
-            "Use the same --text-tokenizer, --text-field, --custom-fields, "
-            "--external-metadata, --id-field, --language, and "
-            "--input-clip-id-parser to resume, or "
-            f"remove {args.shar_dir} and restart from scratch."
-        ),
-    )
-    if wrote:
-        logger.info(f"Wrote prepare state: {state_path}")
-
-
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert standard WDS → Lhotse Shar (parallel)",
     )
@@ -590,94 +553,85 @@ def main(argv=None):
                         help="Drop atomic speech segments longer than this "
                              "(default: same as --vad-max-chunk-sec)")
 
-    parser.add_argument("--aggregate", type=Path, default=None, metavar="SHAR_ROOT",
-                        help="Aggregate stats from completed multi-node runs and exit. "
-                             "Reads prepare_summary.json from all node_*/ dirs under SHAR_ROOT.")
+    return parser
 
-    args = parser.parse_args(argv)
 
-    # ---- Aggregate mode: read summaries and exit ----
-    if args.aggregate is not None:
-        run_aggregate(args.aggregate)
-        return
+def run(spec):
+    """Execute WDS prepare for a typed PrepareSpec."""
+    i, o, m = spec.input, spec.output, spec.metadata
+    shar_dir = Path(o.shar_dir)
 
-    if not args.wds_shards:
-        parser.error("--wds-shards is required (unless using --aggregate)")
-    if args.shar_dir is None:
-        parser.error("--shar-dir is required (unless using --aggregate)")
+    if not i.wds_shards:
+        raise ValueError("prepare.input.wds_shards is required")
 
-    resolved = sorted(set(p for pattern in args.wds_shards for p in glob.glob(pattern)))
+    resolved = sorted(set(p for pattern in i.wds_shards for p in glob.glob(pattern)))
     if not resolved:
-        raise FileNotFoundError(f"No files match patterns: {args.wds_shards}")
+        raise FileNotFoundError(f"No files match patterns: {i.wds_shards}")
 
     validate_prepare_runtime(
-        resampling_backend=args.resampling_backend,
+        resampling_backend=o.resampling_backend,
         require_ffmpeg=True,
-        text_tokenizer_path=args.text_tokenizer,
+        text_tokenizer_path=o.text_tokenizer,
     )
 
-    # Pre-filter shards that have no VAD file (avoids empty workers).
-    if args.vad_segmentation and args.vad_per_shard_dir:
+    vad_per_shard_dir = Path(i.vad_per_shard_dir) if i.vad_per_shard_dir else None
+    if i.vad_segmentation and vad_per_shard_dir:
         before = len(resolved)
         resolved = [
             p for p in resolved
-            if vad_per_shard_file(args.vad_per_shard_dir, shard_name_from_tar_path(p)).is_file()
+            if vad_per_shard_file(vad_per_shard_dir, shard_name_from_tar_path(p)).is_file()
         ]
         skipped_shards = before - len(resolved)
         if skipped_shards:
             logger.info(f"Skipped {skipped_shards} shards with no VAD file ({len(resolved)} remaining)")
         if not resolved:
-            logger.info(
-                "All shards were skipped (no matching VAD files) — nothing to do."
-            )
+            logger.info("All shards were skipped (no matching VAD files) — nothing to do.")
             return
 
-    args.shar_dir.mkdir(parents=True, exist_ok=True)
-    _validate_or_write_prepare_state(args)
-
-    num_workers = ensure_worker_assignment(
-        args.shar_dir, resolved, args.num_workers, _ITEMS_KEY, "WDS shards",
-    )
-
-    logger.info(f"Found {len(resolved)} WDS shards, using {num_workers} workers")
-    logger.info(f"Output: {args.shar_dir}")
-
-    # Distribute tar shards across workers (round-robin)
-    worker_shards = distribute_round_robin(resolved, num_workers)
-
-    if args.vad_segmentation:
-        if args.vad_per_shard_dir is None:
-            raise ValueError("--vad-per-shard-dir is required with --vad-segmentation")
-        if not args.vad_per_shard_dir.is_dir():
-            raise NotADirectoryError(f"VAD per-shard directory not found: {args.vad_per_shard_dir}")
-        if args.vad_max_chunk_sec <= 0:
-            raise ValueError("--vad-max-chunk-sec must be > 0")
-        if args.vad_min_chunk_sec < 0:
-            raise ValueError("--vad-min-chunk-sec must be >= 0")
-        if args.vad_min_chunk_sec > args.vad_max_chunk_sec:
-            raise ValueError("--vad-min-chunk-sec must be <= --vad-max-chunk-sec")
-        if args.vad_sample_rate <= 0:
-            raise ValueError("--vad-sample-rate must be > 0")
-        if args.vad_max_merge_gap_sec < 0:
-            raise ValueError("--vad-max-merge-gap-sec must be >= 0")
-        if args.input_clip_id_parser is not None:
+    if i.vad_segmentation:
+        if vad_per_shard_dir is None:
+            raise ValueError("vad_per_shard_dir is required with vad_segmentation")
+        if not vad_per_shard_dir.is_dir():
+            raise NotADirectoryError(f"VAD per-shard directory not found: {vad_per_shard_dir}")
+        if i.vad_max_chunk_sec <= 0:
+            raise ValueError("vad_max_chunk_sec must be > 0")
+        if i.vad_min_chunk_sec < 0:
+            raise ValueError("vad_min_chunk_sec must be >= 0")
+        if i.vad_min_chunk_sec > i.vad_max_chunk_sec:
+            raise ValueError("vad_min_chunk_sec must be <= vad_max_chunk_sec")
+        if i.vad_sample_rate <= 0:
+            raise ValueError("vad_sample_rate must be > 0")
+        if i.vad_max_merge_gap_sec < 0:
+            raise ValueError("vad_max_merge_gap_sec must be >= 0")
+        if m.input_clip_id_parser is not None:
             raise ValueError(
-                "--input-clip-id-parser cannot be combined with "
-                "--vad-segmentation; input IDs already encode clip numbering."
+                "input_clip_id_parser cannot be combined with vad_segmentation; "
+                "input IDs already encode clip numbering."
             )
-        logger.info(f"VAD segmenting enabled: per_shard_dir={args.vad_per_shard_dir}")
+        logger.info(f"VAD segmenting enabled: per_shard_dir={vad_per_shard_dir}")
     else:
         logger.info("VAD segmenting disabled; writing full recordings")
 
-    # Load external metadata before forking (COW-shared via fork).
+    shar_dir.mkdir(parents=True, exist_ok=True)
+    write_prepare_state_for_spec(spec)
+
+    num_workers = ensure_worker_assignment(
+        shar_dir, resolved, o.num_workers, _ITEMS_KEY, "WDS shards",
+    )
+
+    logger.info(f"Found {len(resolved)} WDS shards, using {num_workers} workers")
+    logger.info(f"Output: {shar_dir}")
+
+    worker_shards = distribute_round_robin(resolved, num_workers)
+
     global _METADATA_PROVIDER
-    if args.external_metadata:
+    if m.external_metadata:
         _METADATA_PROVIDER = ExternalMetadataProvider(
             metadata=load_external_metadata(
-                args.external_metadata,
-                tuple(args.custom_fields) if args.custom_fields else None,
-                id_field=args.id_field,
-                text_field=args.text_field,
+                m.external_metadata,
+                tuple(m.custom_fields) if m.custom_fields else None,
+                id_field=m.id_field,
+                text_field=m.text_field,
             )
         )
         mp_start_method = "fork"
@@ -686,38 +640,78 @@ def main(argv=None):
         _METADATA_PROVIDER = None
         mp_start_method = "forkserver"
 
-    # Load text tokenizer before forking (shared via COW across workers)
-    text_tokenizer = load_text_tokenizer(args.text_tokenizer)
+    text_tokenizer = load_text_tokenizer(o.text_tokenizer)
 
     worker_args = [
         (
             wid,
             shards,
-            str(args.shar_dir),
-            args.target_sr,
-            args.shard_size,
-            args.shar_format,
-            args.min_sr,
-            args.text_field,
-            tuple(args.custom_fields) if args.custom_fields else None,
-            not args.no_mono_downmix,
-            str(args.vad_per_shard_dir) if args.vad_segmentation else None,
-            args.vad_max_chunk_sec,
-            args.vad_min_chunk_sec,
-            args.vad_sample_rate,
-            args.vad_max_merge_gap_sec,
-            args.vad_max_duration_sec,
+            str(shar_dir),
+            o.target_sr,
+            o.shard_size,
+            o.shar_format,
+            i.min_sr,
+            m.text_field,
+            tuple(m.custom_fields) if m.custom_fields else None,
+            not i.no_mono_downmix,
+            str(vad_per_shard_dir) if i.vad_segmentation else None,
+            i.vad_max_chunk_sec,
+            i.vad_min_chunk_sec,
+            i.vad_sample_rate,
+            i.vad_max_merge_gap_sec,
+            i.vad_max_duration_sec,
             text_tokenizer,
-            args.resampling_backend,
-            args.input_clip_id_parser,
-            args.language,
+            o.resampling_backend,
+            m.input_clip_id_parser,
+            m.language,
         )
         for wid, shards in enumerate(worker_shards)
         if shards
     ]
 
-    run_pool_and_finalize(_convert_worker, worker_args, args.shar_dir, num_workers,
+    run_pool_and_finalize(_convert_worker, worker_args, shar_dir, num_workers,
                           mp_start_method=mp_start_method)
+
+
+def _args_to_spec(args):
+    from audio_tokenization.config.schema import PrepareSpec
+
+    return PrepareSpec.from_mapping({
+        "family": "wds",
+        "input": {
+            "wds_shards": args.wds_shards or [],
+            "min_sr": args.min_sr,
+            "no_mono_downmix": args.no_mono_downmix,
+            "vad_segmentation": args.vad_segmentation,
+            "vad_per_shard_dir": str(args.vad_per_shard_dir) if args.vad_per_shard_dir else None,
+            "vad_max_chunk_sec": args.vad_max_chunk_sec,
+            "vad_min_chunk_sec": args.vad_min_chunk_sec,
+            "vad_sample_rate": args.vad_sample_rate,
+            "vad_max_merge_gap_sec": args.vad_max_merge_gap_sec,
+            "vad_max_duration_sec": args.vad_max_duration_sec,
+        },
+        "output": {
+            "shar_dir": str(args.shar_dir) if args.shar_dir else None,
+            "shard_size": args.shard_size,
+            "shar_format": args.shar_format,
+            "target_sr": args.target_sr,
+            "text_tokenizer": args.text_tokenizer,
+            "num_workers": args.num_workers,
+            "resampling_backend": args.resampling_backend,
+        },
+        "metadata": {
+            "external_metadata": args.external_metadata,
+            "custom_fields": args.custom_fields or [],
+            "id_field": args.id_field,
+            "text_field": args.text_field,
+            "language": args.language,
+            "input_clip_id_parser": args.input_clip_id_parser,
+        },
+    })
+
+
+def main(argv=None):
+    return run(_args_to_spec(build_parser().parse_args(argv)))
 
 
 if __name__ == "__main__":

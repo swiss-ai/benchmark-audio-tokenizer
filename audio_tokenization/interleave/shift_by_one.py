@@ -459,7 +459,7 @@ def _compute_per_run_stats_shift(run_lengths: np.ndarray) -> tuple[np.ndarray, n
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Convert interleaved parquet tokens to Megatron indexed datasets (shift-by-one mode)."
     )
@@ -473,7 +473,7 @@ def main() -> None:
     parser.add_argument("--transcribe-ratio", type=float, default=None)
     parser.add_argument("--tmp-dir", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     parquet_dir = Path(args.parquet_dir)
     output_dir = Path(args.output_dir)

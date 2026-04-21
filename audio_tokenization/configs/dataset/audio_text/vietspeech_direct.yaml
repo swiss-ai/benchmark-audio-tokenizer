@@ -1,0 +1,7 @@
+dataset_name: vietspeech
+output_name: vietspeech
+
+shar_dir:
+  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/vietspeech_train
+
+num_buckets: 80

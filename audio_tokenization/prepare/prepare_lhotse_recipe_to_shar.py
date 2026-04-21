@@ -117,18 +117,14 @@ from pathlib import Path
 from typing import Optional
 
 from audio_tokenization.prepare.audio_ops import make_rms_filter_fn, to_mono
-from audio_tokenization.prepare.constants import (
-    PREPARE_STATE_FILE,
-    SUCCESS_MARKER_FILE,
-)
+from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.identity import assign_universal_ids
-from audio_tokenization.prepare.metadata import normalize_optional_path
 from audio_tokenization.prepare.runtime import (
     build_shar_index_from_parts,
     mark_partition_success,
     setup_partition_dir,
     validate_prepare_runtime,
-    validate_or_write_prepare_state,
+    write_prepare_state_for_spec,
 )
 from audio_tokenization.prepare.text_ops import (
     load_text_tokenizer,
@@ -176,12 +172,22 @@ def extract_manifests(manifests: dict, split: str, language: Optional[str] = Non
 # Worker
 # ---------------------------------------------------------------------------
 
-def convert_worker(rank: int, my_cuts: list, args,
-                   text_tokenizer=None, stats_dir: Path | None = None):
+def convert_worker(
+    rank: int,
+    my_cuts: list,
+    *,
+    shar_dir: Path,
+    shar_format: str,
+    shar_shard_size: int,
+    min_sample_rate: int | None,
+    target_sample_rate: int | None,
+    text_tokenizer=None,
+    stats_dir: Path | None = None,
+):
     """Convert one partition of cuts to Shar format."""
     from lhotse import CutSet
 
-    output_dir = args.shar_dir / f"part-{rank:05d}"
+    output_dir = shar_dir / f"part-{rank:05d}"
     if setup_partition_dir(
         output_dir,
         success_marker_name=PART_SUCCESS_MARKER,
@@ -201,14 +207,14 @@ def convert_worker(rank: int, my_cuts: list, args,
     cuts = CutSet.from_cuts(my_cuts)
     cuts = cuts.map(to_mono)
 
-    if args.min_sample_rate:
-        cuts = cuts.filter(lambda c: c.sampling_rate >= args.min_sample_rate)
+    if min_sample_rate:
+        cuts = cuts.filter(lambda c: c.sampling_rate >= min_sample_rate)
 
     if text_tokenizer is not None:
         cuts = cuts.map(make_text_tokenize_fn(text_tokenizer))
 
-    if args.target_sample_rate:
-        cuts = cuts.resample(args.target_sample_rate)
+    if target_sample_rate:
+        cuts = cuts.resample(target_sample_rate)
 
     compute_rms, keep_loud = make_rms_filter_fn()
     cuts = cuts.map(compute_rms).filter(keep_loud)
@@ -226,8 +232,8 @@ def convert_worker(rank: int, my_cuts: list, args,
 
     cuts.to_shar(
         output_dir=str(output_dir),
-        fields={"recording": args.shar_format},
-        shard_size=args.shar_shard_size,
+        fields={"recording": shar_format},
+        shard_size=shar_shard_size,
         num_jobs=1,
         verbose=(rank == 0),
     )
@@ -257,32 +263,7 @@ def build_shar_index(shar_root: Path, index_filename: str, world_size: int):
 # CLI
 # ---------------------------------------------------------------------------
 
-def _validate_or_write_prepare_state(args) -> None:
-    state_path = args.shar_dir / PREPARE_STATE_FILE
-    expected = {
-        "recipe": args.recipe,
-        "corpus_dir": str(args.corpus_dir),
-        "split": args.split,
-        "language": args.language,
-        "recipe_kwargs": args.recipe_kwargs,
-        "text_tokenizer": normalize_optional_path(args.text_tokenizer),
-        "num_workers": int(args.num_workers),
-    }
-    wrote = validate_or_write_prepare_state(
-        state_path,
-        expected=expected,
-        invariant_keys=("recipe", "corpus_dir", "split", "language", "recipe_kwargs", "text_tokenizer", "num_workers"),
-        guidance=(
-            "Use the same --recipe, --corpus_dir, --split, --language, --recipe_kwargs, "
-            f"--text_tokenizer, and --num_workers to resume, or remove {args.shar_dir} "
-            "and restart from scratch."
-        ),
-    )
-    if wrote:
-        logger.info(f"Wrote prepare state: {state_path}")
-
-
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CPU-only parallel Lhotse recipe → Shar conversion",
     )
@@ -332,45 +313,49 @@ def main():
     # Parallelism
     parser.add_argument("--num_workers", type=int, default=64)
 
-    args = parser.parse_args()
-    extra_kwargs = json.loads(args.recipe_kwargs)
+    return parser
 
-    if args.shar_output_dir is not None:
-        args.shar_dir = args.shar_output_dir
-    else:
-        # Derive output directory: commonvoice_zh-CN_other
-        parts = [args.recipe]
-        if args.language:
-            parts.append(args.language)
-        parts.append(args.split)
-        args.shar_dir = args.shar_base_dir / f"{'_'.join(parts)}"
+
+def run(spec):
+    """Execute lhotse_recipe prepare for a typed PrepareSpec."""
+    num_workers = spec.output.num_workers if spec.output.num_workers is not None else 64
+    if spec.output.num_workers is None:
+        spec = spec.model_copy(
+            update={
+                "output": spec.output.model_copy(update={"num_workers": num_workers}),
+            }
+        )
+    i, o, m = spec.input, spec.output, spec.metadata
+    shar_dir = Path(o.shar_dir)
+
+    extra_kwargs = json.loads(i.recipe_kwargs)
 
     validate_prepare_runtime(
         resampling_backend=None,
         require_ffmpeg=False,
-        text_tokenizer_path=args.text_tokenizer,
+        text_tokenizer_path=o.text_tokenizer,
     )
 
-    args.shar_dir.mkdir(parents=True, exist_ok=True)
-    _validate_or_write_prepare_state(args)
+    shar_dir.mkdir(parents=True, exist_ok=True)
+    write_prepare_state_for_spec(spec)
 
     # Step 1: Run Lhotse recipe to build manifests
-    logger.info(f"Running lhotse recipe: prepare_{args.recipe}")
-    recipe_fn = get_recipe_fn(args.recipe)
+    logger.info(f"Running lhotse recipe: prepare_{i.recipe}")
+    recipe_fn = get_recipe_fn(i.recipe)
 
-    manifest_dir = args.shar_dir / "_manifests"
+    manifest_dir = shar_dir / "_manifests"
     manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    recipe_kwargs = {"corpus_dir": args.corpus_dir, "output_dir": manifest_dir, **extra_kwargs}
-    recipe_kwargs.setdefault("num_jobs", args.num_workers)
-    recipe_kwargs.setdefault("splits", [args.split])
-    if args.language:
-        recipe_kwargs.setdefault("languages", [args.language])
+    recipe_kwargs = {"corpus_dir": Path(i.corpus_dir), "output_dir": manifest_dir, **extra_kwargs}
+    recipe_kwargs.setdefault("num_jobs", num_workers)
+    recipe_kwargs.setdefault("splits", [i.split])
+    if m.language:
+        recipe_kwargs.setdefault("languages", [m.language])
 
     manifests = recipe_fn(**recipe_kwargs)
 
     # Step 2: Extract the right split and build CutSet
-    split_manifests = extract_manifests(manifests, args.split, args.language)
+    split_manifests = extract_manifests(manifests, i.split, m.language)
 
     from lhotse import CutSet
     cuts = CutSet.from_manifests(
@@ -378,7 +363,7 @@ def main():
         supervisions=split_manifests.get("supervisions"),
     )
 
-    if args.trim_to_supervisions:
+    if i.trim_to_supervisions:
         cuts = cuts.trim_to_supervisions(keep_overlapping=False)
         logger.info("Trimming cuts to supervision boundaries (one per supervision)")
 
@@ -389,47 +374,50 @@ def main():
 
     cuts_list = list(cuts)
     cuts_list = assign_universal_ids(cuts_list, store_clip_start=True)
-    logger.info(f"Built CutSet with {len(cuts_list)} cuts from {args.recipe}/{args.split}")
-    logger.info(f"Converting to Shar → {args.shar_dir}")
-    logger.info(f"Using {args.num_workers} parallel workers")
+    logger.info(f"Built CutSet with {len(cuts_list)} cuts from {i.recipe}/{i.split}")
+    logger.info(f"Converting to Shar → {shar_dir}")
+    logger.info(f"Using {num_workers} parallel workers")
 
-    # Load text tokenizer before forking (shared via COW across workers)
-    text_tokenizer = load_text_tokenizer(args.text_tokenizer)
+    text_tokenizer = load_text_tokenizer(o.text_tokenizer)
 
-    # Step 3: Spawn workers (stats written to a temp dir, cleaned up automatically)
     with tempfile.TemporaryDirectory(prefix="shar_stats_") as stats_dir:
         stats_dir = Path(stats_dir)
         procs = [
-            Process(target=convert_worker,
-                    args=(i, cuts_list[i::args.num_workers], args, text_tokenizer, stats_dir))
-            for i in range(args.num_workers)
+            Process(
+                target=convert_worker,
+                args=(rank, cuts_list[rank::num_workers]),
+                kwargs=dict(
+                    shar_dir=shar_dir,
+                    shar_format=o.shar_format,
+                    shar_shard_size=o.shard_size,
+                    min_sample_rate=i.min_sample_rate,
+                    target_sample_rate=o.target_sr,
+                    text_tokenizer=text_tokenizer,
+                    stats_dir=stats_dir,
+                ),
+            )
+            for rank in range(num_workers)
         ]
         for p in procs:
             p.start()
         for p in procs:
             p.join()
 
-        failed = [i for i, p in enumerate(procs) if p.exitcode != 0]
+        failed = [rank for rank, p in enumerate(procs) if p.exitcode != 0]
         if failed:
             raise RuntimeError(f"Workers {failed} failed")
 
-        # Merge all part-* into a single index
-        build_shar_index(args.shar_dir, args.shar_index_filename, args.num_workers)
+        build_shar_index(shar_dir, i.shar_index_filename, num_workers)
 
-        from audio_tokenization.prepare.validate_shar import (
-            validate_shar_directory,
-        )
-        counts = validate_shar_directory(
-            args.shar_dir, index_filename=args.shar_index_filename
-        )
+        from audio_tokenization.prepare.validate_shar import validate_shar_directory
+        counts = validate_shar_directory(shar_dir, index_filename=i.shar_index_filename)
         logger.info(
             "Validated SHAR: %d cuts across %d shards",
             sum(counts.values()), len(counts),
         )
 
-        mark_partition_success(args.shar_dir, success_marker_name=PART_SUCCESS_MARKER)
+        mark_partition_success(shar_dir, success_marker_name=PART_SUCCESS_MARKER)
 
-        # Aggregate worker stats
         total = {"num_cuts": 0, "total_duration": 0.0, "num_text_tokens": 0}
         for stats_path in sorted(stats_dir.glob("*.json")):
             ws = json.loads(stats_path.read_text())
@@ -444,9 +432,54 @@ def main():
             avg_tok = total["num_text_tokens"] / n
             summary += f", {total['num_text_tokens']:,} text tokens (avg {avg_tok:.1f}/cut)"
         logger.info(summary)
-    # TemporaryDirectory cleaned up here
 
     logger.info("All done!")
+
+
+def _args_to_spec(args):
+    """Translate flat argparse Namespace → typed PrepareSpec.
+
+    The legacy CLI's ``--shar_output_dir`` / ``--shar_base_dir`` derivation
+    happens here so the typed runner can assume a concrete ``shar_dir``.
+    """
+    from audio_tokenization.config.schema import PrepareSpec
+
+    if args.shar_output_dir is not None:
+        shar_dir = args.shar_output_dir
+    else:
+        parts = [args.recipe]
+        if args.language:
+            parts.append(args.language)
+        parts.append(args.split)
+        shar_dir = args.shar_base_dir / "_".join(parts)
+
+    return PrepareSpec.from_mapping({
+        "family": "lhotse_recipe",
+        "input": {
+            "recipe": args.recipe,
+            "corpus_dir": str(args.corpus_dir),
+            "split": args.split,
+            "recipe_kwargs": args.recipe_kwargs,
+            "min_sample_rate": args.min_sample_rate,
+            "trim_to_supervisions": args.trim_to_supervisions,
+            "shar_index_filename": args.shar_index_filename,
+        },
+        "output": {
+            "shar_dir": str(shar_dir),
+            "shard_size": args.shar_shard_size,
+            "shar_format": args.shar_format,
+            "target_sr": args.target_sample_rate,
+            "text_tokenizer": args.text_tokenizer,
+            "num_workers": args.num_workers,
+        },
+        "metadata": {
+            "language": args.language,
+        },
+    })
+
+
+def main(argv=None):
+    return run(_args_to_spec(build_parser().parse_args(argv)))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+convert:
+  family: parquet
+  input:
+    parquet_glob: "*.parquet"
+  metadata:
+    audio_column: audio
+    duration_column: duration

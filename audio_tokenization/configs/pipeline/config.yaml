@@ -1,6 +1,10 @@
 defaults:
+  - stage: convert
+  - runtime: default
   - dataset: infore2
   - _self_
 
-stage: prepare
-resume: false
+# Root pipeline config is intentionally thin:
+# - `stage/*` selects which stage(s) run
+# - `runtime/*` carries operational knobs such as resume/debug
+# - `dataset/*` is the canonical typed dataset spec

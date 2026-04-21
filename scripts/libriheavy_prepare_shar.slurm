@@ -75,8 +75,7 @@ if [ "${RANK}" -eq "$((WORLD - 1))" ]; then
         --output=/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/logs/libriheavy_aggregate_%j.out \
         --error=/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/logs/libriheavy_aggregate_%j.err \
         --wrap="export PYTHONPATH=${REPO}:/iopsstor/scratch/cscs/xyixuan/dev/lhotse:\${PYTHONPATH:-}; \
-                python -m audio_tokenization.prepare.prepare_wds_to_shar \
-                    --aggregate ${SHAR_ROOT} \
-                    --text-tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json"
+                python -m audio_tokenization.aggregate_prepare \
+                    --shar-root ${SHAR_ROOT}"
     echo "Aggregate job submitted"
 fi

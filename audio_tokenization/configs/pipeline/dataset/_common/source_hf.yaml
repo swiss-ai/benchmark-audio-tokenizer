@@ -1,0 +1,7 @@
+convert:
+  family: hf
+  input:
+    # exactly one of arrow_dir / arrow_files is required.
+    arrow_dir: null
+    arrow_glob: "*.arrow"
+    arrow_files: null

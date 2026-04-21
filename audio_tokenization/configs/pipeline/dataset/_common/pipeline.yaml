@@ -1,0 +1,43 @@
+# Cross-cutting defaults shared by every dataset.
+# Per-family / per-task mixins (source_*, tokenize_*, materialize_*) overlay
+# narrower defaults on top of these. Per-dataset YAML overrides anything that
+# differs.
+
+convert:
+  enabled: true
+  output:
+    shard_size: 5000
+    shar_format: flac
+    target_sr: 24000
+    text_tokenizer: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json
+    num_workers: null            # null → workers = #input shards
+    resampling_backend: soxr
+    mp_start_method: forkserver
+    read_batch_size: 256
+  metadata:
+    audio_column: audio
+    text_column: null
+    duration_column: null
+    id_column: null
+    language_column: null
+    language: null
+    custom_columns: []
+    text_tokenize_custom_columns: []
+    input_clip_id_parser: null
+    external_metadata: null
+    custom_fields: []
+    id_field: id
+    text_field: text
+
+materialize:
+  interleave:
+    enabled: false
+    strategy: shift_by_one
+    cache_dir: null
+    output_dir: null
+    tokenizer_path: null
+    max_seq_len: 262144
+    seq_threshold: null
+    transcribe_ratio: null
+    num_workers: null
+    tmp_dir: null

@@ -38,9 +38,9 @@ from audio_tokenization.prepare.runtime import (
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
-    run_aggregate,
     run_pool_and_finalize,
     validate_prepare_runtime,
+    write_prepare_state_for_spec,
     write_worker_result,
 )
 from audio_tokenization.prepare.preprocess.chunking import (
@@ -241,7 +241,7 @@ def _convert_worker(args_tuple):
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert audio dir + VAD JSONL -> Lhotse Shar (parallel)",
     )
@@ -292,96 +292,114 @@ def main(argv=None):
     parser.add_argument("--num-workers", type=int, default=None,
                         help="Number of parallel workers (default: one per JSONL file)")
 
-    parser.add_argument("--aggregate", type=Path, default=None, metavar="SHAR_ROOT",
-                        help="Aggregate stats from completed multi-node runs and exit.")
+    return parser
 
-    args = parser.parse_args(argv)
 
-    # ---- Aggregate mode ----
-    if args.aggregate is not None:
-        run_aggregate(args.aggregate)
-        return
+def run(spec):
+    """Execute audio_dir prepare for a typed PrepareSpec."""
+    i, o = spec.input, spec.output
+    audio_root = Path(i.audio_root)
+    shar_dir = Path(o.shar_dir)
 
-    if args.audio_root is None:
-        parser.error("--audio-root is required (unless using --aggregate)")
-    if not args.jsonl_files:
-        parser.error("--jsonl-files is required (unless using --aggregate)")
-    if args.shar_dir is None:
-        parser.error("--shar-dir is required (unless using --aggregate)")
+    if not audio_root.is_dir():
+        raise NotADirectoryError(f"Audio root not found: {audio_root}")
 
-    if not args.audio_root.is_dir():
-        raise NotADirectoryError(f"Audio root not found: {args.audio_root}")
-
-    resolved_jsonls = sorted(args.jsonl_files)
+    resolved_jsonls = sorted(i.jsonl_files)
     if not resolved_jsonls:
-        raise FileNotFoundError("No JSONL files provided via --jsonl-files")
+        raise FileNotFoundError("No JSONL files provided")
 
     validate_prepare_runtime(
-        resampling_backend=args.resampling_backend,
+        resampling_backend=o.resampling_backend,
         require_ffmpeg=False,
         text_tokenizer_path=None,
     )
 
-    args.shar_dir.mkdir(parents=True, exist_ok=True)
+    if i.vad_max_chunk_sec <= 0:
+        raise ValueError("vad_max_chunk_sec must be > 0")
+    if i.vad_min_chunk_sec < 0:
+        raise ValueError("vad_min_chunk_sec must be >= 0")
+    if i.vad_min_chunk_sec > i.vad_max_chunk_sec:
+        raise ValueError("vad_min_chunk_sec must be <= vad_max_chunk_sec")
+    if i.vad_sample_rate <= 0:
+        raise ValueError("vad_sample_rate must be > 0")
+    if i.vad_max_merge_gap_sec < 0:
+        raise ValueError("vad_max_merge_gap_sec must be >= 0")
+
+    logger.info(f"Building audio index from {audio_root} (*{i.audio_ext}) ...")
+    t_idx = time.time()
+    audio_index = build_audio_index(audio_root, f"**/*{i.audio_ext}")
+    logger.info(f"Indexed {len(audio_index):,} audio files in {time.time() - t_idx:.1f}s")
+    if not audio_index:
+        raise FileNotFoundError(f"No *{i.audio_ext} files found under {audio_root}")
+
+    shar_dir.mkdir(parents=True, exist_ok=True)
+    write_prepare_state_for_spec(spec)
 
     num_workers = ensure_worker_assignment(
-        args.shar_dir, resolved_jsonls, args.num_workers, _ITEMS_KEY, "JSONL files",
+        shar_dir, resolved_jsonls, o.num_workers, _ITEMS_KEY, "JSONL files",
     )
 
     logger.info(f"Found {len(resolved_jsonls)} JSONL files, using {num_workers} workers")
-    logger.info(f"Output: {args.shar_dir}")
+    logger.info(f"Output: {shar_dir}")
 
-    # Build audio index (stem -> full path)
-    logger.info(f"Building audio index from {args.audio_root} (*{args.audio_ext}) ...")
-    t_idx = time.time()
-    audio_index = build_audio_index(args.audio_root, f"**/*{args.audio_ext}")
-    logger.info(
-        f"Indexed {len(audio_index):,} audio files in {time.time() - t_idx:.1f}s"
-    )
-    if not audio_index:
-        raise FileNotFoundError(
-            f"No *{args.audio_ext} files found under {args.audio_root}"
-        )
-
-    # Distribute JSONL files across workers (round-robin)
     worker_jsonls = distribute_round_robin(resolved_jsonls, num_workers)
-
-    # Validate VAD params
-    if args.vad_max_chunk_sec <= 0:
-        raise ValueError("--vad-max-chunk-sec must be > 0")
-    if args.vad_min_chunk_sec < 0:
-        raise ValueError("--vad-min-chunk-sec must be >= 0")
-    if args.vad_min_chunk_sec > args.vad_max_chunk_sec:
-        raise ValueError("--vad-min-chunk-sec must be <= --vad-max-chunk-sec")
-    if args.vad_sample_rate <= 0:
-        raise ValueError("--vad-sample-rate must be > 0")
-    if args.vad_max_merge_gap_sec < 0:
-        raise ValueError("--vad-max-merge-gap-sec must be >= 0")
 
     worker_args = [
         (
             wid,
             jsonls,
             audio_index,
-            str(args.shar_dir),
-            args.target_sr,
-            args.shard_size,
-            args.shar_format,
-            args.min_sr,
-            not args.no_mono_downmix,
-            args.vad_max_chunk_sec,
-            args.vad_min_chunk_sec,
-            args.vad_sample_rate,
-            args.vad_max_merge_gap_sec,
-            args.vad_max_duration_sec,
-            args.audio_ext,
-            args.resampling_backend,
+            str(shar_dir),
+            o.target_sr,
+            o.shard_size,
+            o.shar_format,
+            i.min_sr,
+            not i.no_mono_downmix,
+            i.vad_max_chunk_sec,
+            i.vad_min_chunk_sec,
+            i.vad_sample_rate,
+            i.vad_max_merge_gap_sec,
+            i.vad_max_duration_sec,
+            i.audio_ext,
+            o.resampling_backend,
         )
         for wid, jsonls in enumerate(worker_jsonls)
         if jsonls
     ]
 
-    run_pool_and_finalize(_convert_worker, worker_args, args.shar_dir, num_workers)
+    run_pool_and_finalize(_convert_worker, worker_args, shar_dir, num_workers)
+
+
+def _args_to_spec(args):
+    from audio_tokenization.config.schema import PrepareSpec
+
+    return PrepareSpec.from_mapping({
+        "family": "audio_dir",
+        "input": {
+            "audio_root": str(args.audio_root) if args.audio_root else None,
+            "jsonl_files": args.jsonl_files or [],
+            "audio_ext": args.audio_ext,
+            "min_sr": args.min_sr,
+            "no_mono_downmix": args.no_mono_downmix,
+            "vad_max_chunk_sec": args.vad_max_chunk_sec,
+            "vad_min_chunk_sec": args.vad_min_chunk_sec,
+            "vad_sample_rate": args.vad_sample_rate,
+            "vad_max_merge_gap_sec": args.vad_max_merge_gap_sec,
+            "vad_max_duration_sec": args.vad_max_duration_sec,
+        },
+        "output": {
+            "shar_dir": str(args.shar_dir) if args.shar_dir else None,
+            "shard_size": args.shard_size,
+            "shar_format": args.shar_format,
+            "target_sr": args.target_sr,
+            "num_workers": args.num_workers,
+            "resampling_backend": args.resampling_backend,
+        },
+    })
+
+
+def main(argv=None):
+    return run(_args_to_spec(build_parser().parse_args(argv)))
 
 
 if __name__ == "__main__":

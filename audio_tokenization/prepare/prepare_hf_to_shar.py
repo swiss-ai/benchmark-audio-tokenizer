@@ -59,6 +59,7 @@ from audio_tokenization.prepare.runtime import (
     init_worker_process,
     run_pool_and_finalize,
     validate_prepare_runtime,
+    write_prepare_state_for_spec,
     write_worker_result,
 )
 from audio_tokenization.prepare.text_ops import (
@@ -236,20 +237,21 @@ def _convert_worker(args_tuple):
 # ---------------------------------------------------------------------------
 
 
-def _preflight_prepare(args, resolved: list[str]) -> None:
+def _preflight_prepare(spec, resolved: list[str]) -> None:
     import pyarrow.ipc as ipc
 
+    m, o = spec.metadata, spec.output
     sample_path = resolved[0]
     with open(sample_path, "rb") as f:
         schema_names = ipc.open_stream(f).schema.names
 
     validate_columnar_schema_roots(
         available_roots=schema_names,
-        required_columns=(args.audio_column, args.id_column),
+        required_columns=(m.audio_column, m.id_column),
         optional_columns=(
-            args.text_column,
-            args.language_column,
-            args.custom_columns,
+            m.text_column,
+            m.language_column,
+            m.custom_columns,
         ),
         source_path=sample_path,
         source_kind="Arrow",
@@ -257,13 +259,13 @@ def _preflight_prepare(args, resolved: list[str]) -> None:
     )
 
     validate_prepare_runtime(
-        resampling_backend=args.resampling_backend,
+        resampling_backend=o.resampling_backend,
         require_ffmpeg=True,
-        text_tokenizer_path=args.text_tokenizer,
+        text_tokenizer_path=o.text_tokenizer,
     )
 
 
-def main(argv=None):
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert HF arrow shards → Lhotse Shar (parallel)",
     )
@@ -295,41 +297,45 @@ def main(argv=None):
     add_external_metadata_args(parser, include_custom_fields=True)
     add_input_clip_id_parser_arg(parser)
     add_parallelism_args(parser)
-    args = parser.parse_args(argv)
+    return parser
 
-    # Resolve arrow files
-    if args.arrow_files:
-        resolved = sorted(args.arrow_files)
-    elif args.arrow_dir:
-        resolved = sorted(str(p) for p in args.arrow_dir.glob(args.arrow_glob))
+
+def run(spec):
+    """Execute HF arrow prepare for a typed PrepareSpec."""
+    i, o, m = spec.input, spec.output, spec.metadata
+    shar_dir = Path(o.shar_dir)
+
+    if i.arrow_files:
+        resolved = sorted(i.arrow_files)
+    elif i.arrow_dir:
+        resolved = sorted(str(p) for p in Path(i.arrow_dir).glob(i.arrow_glob))
     else:
-        parser.error("Either --arrow-files or --arrow-dir is required")
+        raise ValueError("prepare.input requires arrow_dir or arrow_files")
     if not resolved:
         raise FileNotFoundError("No arrow files resolved")
 
-    _preflight_prepare(args, resolved)
+    _preflight_prepare(spec, resolved)
 
-    args.shar_dir.mkdir(parents=True, exist_ok=True)
+    shar_dir.mkdir(parents=True, exist_ok=True)
+    write_prepare_state_for_spec(spec)
 
     num_workers = ensure_worker_assignment(
-        args.shar_dir, resolved, args.num_workers, _ITEMS_KEY, "arrow files",
+        shar_dir, resolved, o.num_workers, _ITEMS_KEY, "arrow files",
     )
 
     logger.info(f"Found {len(resolved)} arrow files, using {num_workers} workers")
-    logger.info(f"Output: {args.shar_dir}")
+    logger.info(f"Output: {shar_dir}")
 
-    # Distribute arrow files across workers (round-robin)
     worker_arrows = distribute_round_robin(resolved, num_workers)
+    text_tokenizer = load_text_tokenizer(o.text_tokenizer)
 
-    # Load text tokenizer before forking (shared via COW across workers)
-    text_tokenizer = load_text_tokenizer(args.text_tokenizer)
     global _EXTERNAL_METADATA
-    if args.external_metadata:
+    if m.external_metadata:
         _EXTERNAL_METADATA = load_external_metadata(
-            args.external_metadata,
-            tuple(args.custom_fields) if args.custom_fields else None,
-            id_field=args.id_field,
-            text_field=args.text_field,
+            m.external_metadata,
+            tuple(m.custom_fields) if m.custom_fields else None,
+            id_field=m.id_field,
+            text_field=m.text_field,
         )
         mp_start_method = "fork"
         logger.info("Using fork start method for COW sharing of external metadata")
@@ -341,21 +347,21 @@ def main(argv=None):
         (
             wid,
             arrows,
-            str(args.shar_dir),
-            args.target_sr,
-            args.shard_size,
-            args.shar_format,
-            args.id_column,
-            args.audio_column,
-            args.text_column,
-            args.language_column,
-            args.language,
-            args.custom_columns,
-            args.text_tokenize_custom_columns,
+            str(shar_dir),
+            o.target_sr,
+            o.shard_size,
+            o.shar_format,
+            m.id_column,
+            m.audio_column,
+            m.text_column,
+            m.language_column,
+            m.language,
+            m.custom_columns or None,
+            m.text_tokenize_custom_columns or None,
             text_tokenizer,
-            args.resampling_backend,
-            args.input_clip_id_parser,
-            args.read_batch_size,
+            o.resampling_backend,
+            m.input_clip_id_parser,
+            o.read_batch_size,
         )
         for wid, arrows in enumerate(worker_arrows)
         if arrows
@@ -364,10 +370,51 @@ def main(argv=None):
     run_pool_and_finalize(
         _convert_worker,
         worker_args,
-        args.shar_dir,
+        shar_dir,
         num_workers,
         mp_start_method=mp_start_method,
     )
+
+
+def _args_to_spec(args):
+    from audio_tokenization.config.schema import PrepareSpec
+
+    return PrepareSpec.from_mapping({
+        "family": "hf",
+        "input": {
+            "arrow_dir": str(args.arrow_dir) if args.arrow_dir else None,
+            "arrow_glob": args.arrow_glob,
+            "arrow_files": args.arrow_files,
+        },
+        "output": {
+            "shar_dir": str(args.shar_dir),
+            "shard_size": args.shard_size,
+            "shar_format": args.shar_format,
+            "target_sr": args.target_sr,
+            "text_tokenizer": args.text_tokenizer,
+            "num_workers": args.num_workers,
+            "resampling_backend": args.resampling_backend,
+            "read_batch_size": args.read_batch_size,
+        },
+        "metadata": {
+            "audio_column": args.audio_column,
+            "text_column": args.text_column,
+            "id_column": args.id_column,
+            "language_column": args.language_column,
+            "language": args.language,
+            "custom_columns": args.custom_columns or [],
+            "text_tokenize_custom_columns": args.text_tokenize_custom_columns or [],
+            "external_metadata": args.external_metadata,
+            "custom_fields": args.custom_fields or [],
+            "id_field": args.id_field,
+            "text_field": args.text_field,
+            "input_clip_id_parser": args.input_clip_id_parser,
+        },
+    })
+
+
+def main(argv=None):
+    return run(_args_to_spec(build_parser().parse_args(argv)))
 
 
 if __name__ == "__main__":

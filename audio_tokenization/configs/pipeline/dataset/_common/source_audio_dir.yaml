@@ -1,0 +1,11 @@
+convert:
+  family: audio_dir
+  input:
+    audio_ext: .ogg
+    min_sr: null
+    no_mono_downmix: false
+    vad_max_chunk_sec: 200.0
+    vad_min_chunk_sec: 5.0
+    vad_sample_rate: 16000
+    vad_max_merge_gap_sec: 1.0
+    vad_max_duration_sec: null

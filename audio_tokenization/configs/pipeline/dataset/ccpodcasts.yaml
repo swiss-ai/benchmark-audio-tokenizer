@@ -1,0 +1,50 @@
+defaults:
+  - _common/pipeline@_here_
+  - _common/source_parquet@_here_
+  - _common/tokenize_audio_text_interleaved@_here_
+  - _common/materialize_interleave@_here_
+  - _self_
+
+# CCpodcasts — TWiV / TWiEVO / TWiP / TWiM science podcasts (English).
+# 416,758 segments × ~25s avg, 2,124 parent episodes, ~2,793 hours.
+# Source pre-segmented; packed via
+# multimodal-data/01-dataset-download/audio/ccpodcasts/convert_to_parquet.py
+# into 84 HF-style parquet shards.
+#
+# Provenance: contains identifiable hosts/guests, episode metadata, and
+# producer-side transcripts (some ASR noise — "Tuivo" for "TWiV", etc.).
+# Land outputs under SHAR/internal-only and tokenized/internal-only.
+
+name: ccpodcasts
+
+convert:
+  input:
+    parquet_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/ccpodcasts_parquet
+    parquet_glob: train-*.parquet
+  output:
+    shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/internal-only/ccpodcasts
+  metadata:
+    text_column: text
+    duration_column: duration
+    id_column:
+      - source_id
+      - segment_idx
+    language: en
+    input_clip_id_parser: trailing_number
+    custom_columns:
+      - parent_audio
+      - parent_start
+      - parent_end
+
+tokenize:
+  tokenizer:
+    path: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok
+  output:
+    output_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/internal-only
+    output_name: ccpodcasts
+
+materialize:
+  interleave:
+    transcribe_ratio: 0.5
+    max_seq_len: 8192
+    output_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/internal-only/ccpodcasts_interleaved

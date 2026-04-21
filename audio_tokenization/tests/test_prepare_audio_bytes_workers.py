@@ -627,19 +627,23 @@ def test_prepare_parquet_preflight_checks_runtime_and_logs_missing_optional_colu
         lambda **kwargs: calls.append(kwargs),
     )
 
-    args = types.SimpleNamespace(
-        audio_column="audio",
-        id_column="audio.path",
-        text_column="transcription",
-        duration_column="duration",
-        language_column=None,
-        custom_columns=None,
-        resampling_backend="soxr",
-        text_tokenizer=str(tmp_path / "tokenizer.json"),
+    spec = types.SimpleNamespace(
+        metadata=types.SimpleNamespace(
+            audio_column="audio",
+            id_column="audio.path",
+            text_column="transcription",
+            duration_column="duration",
+            language_column=None,
+            custom_columns=None,
+        ),
+        output=types.SimpleNamespace(
+            resampling_backend="soxr",
+            text_tokenizer=str(tmp_path / "tokenizer.json"),
+        ),
     )
 
     with caplog.at_level("INFO"):
-        prepare_parquet_to_shar._preflight_prepare(args, ["dataset.parquet"])
+        prepare_parquet_to_shar._preflight_prepare(spec, ["dataset.parquet"])
 
     assert calls == [
         {
@@ -668,19 +672,23 @@ def test_prepare_parquet_preflight_raises_for_missing_required_audio_column(monk
         lambda **kwargs: None,
     )
 
-    args = types.SimpleNamespace(
-        audio_column="audio",
-        id_column="id",
-        text_column="text",
-        duration_column=None,
-        language_column=None,
-        custom_columns=None,
-        resampling_backend="soxr",
-        text_tokenizer=None,
+    spec = types.SimpleNamespace(
+        metadata=types.SimpleNamespace(
+            audio_column="audio",
+            id_column="id",
+            text_column="text",
+            duration_column=None,
+            language_column=None,
+            custom_columns=None,
+        ),
+        output=types.SimpleNamespace(
+            resampling_backend="soxr",
+            text_tokenizer=None,
+        ),
     )
 
     with pytest.raises(RuntimeError, match="required column roots are missing"):
-        prepare_parquet_to_shar._preflight_prepare(args, ["dataset.parquet"])
+        prepare_parquet_to_shar._preflight_prepare(spec, ["dataset.parquet"])
 
 
 def test_validate_prepare_runtime_requires_ffmpeg(monkeypatch):

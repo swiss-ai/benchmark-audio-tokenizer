@@ -13,6 +13,7 @@ from typing import Iterable, Mapping, Sequence
 
 from audio_tokenization.prepare.constants import (
     CURRENT_PREPARE_STATE_VERSION,
+    PREPARE_STATE_FILE,
     PREPARE_SUMMARY_FILE,
     SUCCESS_MARKER_FILE,
     WORKER_ASSIGNMENT_FILE,
@@ -159,6 +160,24 @@ def read_prepare_state(state_path: Path) -> dict:
     return payload
 
 
+def diff_fingerprint(
+    expected: Mapping[str, object], on_disk: Mapping[str, object]
+) -> dict[str, tuple[object, object]]:
+    """{key: (expected, actual)} pairs that disagree.
+
+    Ignores keys in *on_disk* that aren't part of the expected fingerprint
+    (the ``version`` sentinel the state writer injects, plus any future
+    additive on-disk fields).
+    """
+    drift: dict[str, tuple[object, object]] = {}
+    for k, v in expected.items():
+        if k not in on_disk:
+            drift[k] = (v, "<missing>")
+        elif on_disk[k] != v:
+            drift[k] = (v, on_disk[k])
+    return drift
+
+
 def validate_or_write_prepare_state(
     state_path: Path,
     *,
@@ -205,6 +224,54 @@ def validate_or_write_prepare_state(
     versioned = {"version": CURRENT_PREPARE_STATE_VERSION, **dict(expected)}
     _atomic_write_state_json(state_path, versioned)
     return True
+
+
+def resolve_num_workers(requested: int | None, *, num_inputs: int | None = None) -> int:
+    """Resolve a worker count from the user request and the available resources.
+
+    - ``requested`` is None → use ``SLURM_CPUS_PER_TASK`` if running under
+      SLURM, else ``os.cpu_count()``.
+    - Result is clamped to ``num_inputs`` when provided so the pool never
+      spawns more processes than there is work for.
+    - Result is at least 1.
+
+    Why this exists: defaulting to "one worker per input shard" silently OOMs
+    on large datasets (e.g. SRG Apertus has 1361 parquet shards; each lhotse-
+    loaded forkserver worker is ~1+ GB). Defaulting to "the resources you
+    actually allocated" is the only safe behaviour.
+    """
+    if requested is None:
+        cap = int(os.environ.get("SLURM_CPUS_PER_TASK") or os.cpu_count() or 1)
+    else:
+        cap = int(requested)
+    if num_inputs is not None:
+        cap = min(cap, num_inputs)
+    return max(1, cap)
+
+
+def write_prepare_state_for_spec(spec) -> None:
+    """Persist (or assert) the canonical PREPARE_STATE for a typed PrepareSpec.
+
+    All five family runners share an identical state-file contract:
+    state file at ``<shar_dir>/PREPARE_STATE_FILE``, expected payload =
+    ``spec.fingerprint_payload()``, every key invariant. Hoisting here
+    keeps the contract single-sourced.
+    """
+    shar_dir = Path(spec.output.shar_dir)
+    state_path = shar_dir / PREPARE_STATE_FILE
+    expected = spec.fingerprint_payload()
+    wrote = validate_or_write_prepare_state(
+        state_path,
+        expected=expected,
+        invariant_keys=tuple(expected.keys()),
+        guidance=(
+            "The run's configuration has drifted from a previous run that "
+            f"wrote to {shar_dir}. Re-issue the original config to resume, "
+            f"or remove {shar_dir} and restart from scratch."
+        ),
+    )
+    if wrote:
+        logger.info(f"Wrote prepare state: {state_path}")
 
 
 def build_shar_index_from_parts(
@@ -476,7 +543,7 @@ def ensure_worker_assignment(
         logger.info(f"Reusing worker assignment from {assignment['path']} (num_workers={final})")
         return final
 
-    final = min(num_workers or len(resolved_items), len(resolved_items))
+    final = resolve_num_workers(num_workers, num_inputs=len(resolved_items))
     assignment_path = write_worker_assignment(
         shar_dir, final, resolved_items, items_key=items_key,
     )
