@@ -1,7 +1,0 @@
-convert:
-  family: lhotse_recipe
-  input:
-    recipe_kwargs: "{}"
-    min_sample_rate: null
-    trim_to_supervisions: false
-    shar_index_filename: shar_index.json

@@ -18,7 +18,7 @@ for dataset_dir in ${INPUT_ROOT}/*/; do
     dataset_name=$(basename ${dataset_dir})
     output_prefix=${OUTPUT_ROOT}/${dataset_name}
     echo "[$(date '+%F %T')] Merging ${dataset_name} ..."
-    python -m audio_tokenization.utils.indexed_dataset.audio_filter_and_merge \
+    python scripts/audio_filter_and_merge.py \
         --input-dirs ${dataset_dir} \
         --output-prefix ${output_prefix} \
         --min-unique-tokens 5 \

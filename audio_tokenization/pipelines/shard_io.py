@@ -8,36 +8,71 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List
 
+from audio_tokenization.contracts.artifacts import (
+    INTERLEAVE_CACHE_LAYOUT_FILENAME,
+    INTERLEAVE_CACHE_LAYOUT_V2,
+    INTERLEAVE_CACHE_OUTPUT_STEM,
+    INTERLEAVE_CACHE_SCHEMA_VERSION,
+    next_chunk_id,
+    prune_orphan_bin_files,
+    validate_v2_chunks_complete,
+)
+from audio_tokenization.utils.io import (
+    atomic_replace_files,
+    atomic_streaming_write,
+    atomic_write_json,
+    cleanup_tmp_files,
+    fsync_file,
+)
 from audio_tokenization.utils.indexed_dataset import DType, IndexedDatasetBuilder
+from audio_tokenization.utils.indexed_dataset.constants import CUT_ID_SIDECAR_SUFFIX
 
 logger = logging.getLogger(__name__)
 
-INTERLEAVE_CACHE_LAYOUT_V2 = "v2"
 
+class CutIdSidecarWriter:
+    """Write one JSON-encoded cut ID per Megatron document.
 
-def _fsync_file(path: Path) -> None:
-    fd = os.open(str(path), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    The line number is the local document index inside the corresponding
+    ``rank_XXXX_chunk_YYYY.{bin,idx}`` pair. This sidecar is only for
+    Megatron-format outputs; interleave cache rows carry identity natively.
+    """
 
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._stream = atomic_streaming_write(self.path, mode="wb", compression="zst")
+        self._file = self._stream.__enter__()
+        self.count = 0
+        self._closed = False
 
-def _fsync_dir(path: Path) -> None:
-    fd = os.open(str(path), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    @property
+    def tmp_path(self) -> Path:
+        return self._stream.tmp_path
 
+    def write(self, cut_id: str) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot write to a closed CutIdSidecarWriter")
+        line = json.dumps(str(cut_id)) + "\n"
+        self._file.write(line.encode("utf-8"))
+        self.count += 1
 
-def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    _fsync_file(tmp)
-    os.replace(tmp, path)
-    _fsync_dir(path.parent)
+    def finalize(self) -> None:
+        if not self._closed:
+            self._stream.commit()
+            self._closed = True
 
+    def close_temp(self) -> None:
+        if not self._closed:
+            self._stream.close_temp()
+
+    def mark_committed(self) -> None:
+        self._stream.mark_committed()
+        self._closed = True
+
+    def abort(self) -> None:
+        if not self._closed:
+            self._stream.abort()
+            self._closed = True
 
 
 def finalize_shard_writer(
@@ -46,6 +81,7 @@ def finalize_shard_writer(
     tmp_idx: str,
     bin_path: str,
     idx_path: str,
+    cut_id_writer: CutIdSidecarWriter | None = None,
 ) -> None:
     """Finalize index and atomically move temporary shard files in place.
 
@@ -53,137 +89,37 @@ def finalize_shard_writer(
     durable on network filesystems (e.g. Lustre) where client write-back
     caching can lose data if the process is killed before a flush.
     """
-    builder.finalize(tmp_idx)
-    for p in (tmp_bin, tmp_idx):
-        _fsync_file(Path(p))
-    os.replace(tmp_bin, bin_path)
-    os.replace(tmp_idx, idx_path)
+    try:
+        if cut_id_writer is not None:
+            expected_docs = max(0, len(builder.document_indices) - 1)
+            if cut_id_writer.count != expected_docs:
+                cut_id_writer.abort()
+                raise RuntimeError(
+                    "Cut ID sidecar/document count mismatch for "
+                    f"{bin_path}: sidecar={cut_id_writer.count}, indexed_docs={expected_docs}"
+                )
 
-
-# ---------------------------------------------------------------------------
-# Parquet chunk writer for audio_text_interleaving pre-tokenization cache
-# ---------------------------------------------------------------------------
-
-
-class ParquetChunkWriter:
-    """Streaming Parquet writer with periodic row group flushing.
-
-    Buffers rows in columnar form and flushes them as row groups to a
-    ``ParquetWriter`` when the buffer exceeds ``row_group_size``.  This
-    bounds memory usage regardless of how many samples are written
-    between checkpoints.
-
-    ``finalize()`` flushes remaining rows, closes the writer, fsyncs,
-    and atomically renames ``.tmp`` → ``.parquet``.
-
-    Schema columns:
-        clip_id (str), source_id (str), clip_num (int), speaker (str),
-        duration (float), text (str), text_tokens (list<int32>),
-        audio_tokens (list<int32>), dataset (str)
-    """
-
-    _SCHEMA = None
-
-    @classmethod
-    def _get_schema(cls):
-        if cls._SCHEMA is None:
-            import pyarrow as pa
-            cls._SCHEMA = pa.schema([
-                ("clip_id", pa.string()),
-                ("source_id", pa.string()),
-                ("clip_num", pa.int64()),
-                ("clip_start", pa.float64()),
-                ("speaker", pa.string()),
-                ("duration", pa.float64()),
-                ("text", pa.string()),
-                ("text_tokens", pa.list_(pa.int32())),
-                ("audio_tokens", pa.list_(pa.int32())),
-                ("dataset", pa.string()),
-            ])
-        return cls._SCHEMA
-
-    def __init__(self, output_dir: str, rank: int, chunk_id: int = 0,
-                 row_group_size: int = 10000):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.rank = rank
-        self.chunk_id = chunk_id
-        self.row_group_size = row_group_size
-        self._columns: Dict[str, list] = {name: [] for name in self._get_schema().names}
-        self._buffered: int = 0
-        self._total_rows: int = 0
-        self._writer = None
-        self._tmp_path = None
-        self._final_path = None
-
-    def _open_writer(self):
-        """Lazily open a ParquetWriter for the current chunk."""
-        import pyarrow.parquet as pq
-        self._final_path = self.output_dir / f"rank_{self.rank:04d}_chunk_{self.chunk_id:04d}.parquet"
-        self._tmp_path = self._final_path.with_suffix(".parquet.tmp")
-        self._writer = pq.ParquetWriter(str(self._tmp_path), self._get_schema())
-
-    def add_rows(self, rows: List[Dict[str, Any]]) -> None:
-        """Append a batch of rows to the column buffer."""
-        if not rows:
-            return
-        if self._writer is None:
-            self._open_writer()
-        for row in rows:
-            for key in self._get_schema().names:
-                self._columns[key].append(row[key])
-        self._buffered += len(rows)
-        self._total_rows += len(rows)
-
-    def flush_if_needed(self) -> None:
-        """Write a row group to disk if the buffer exceeds ``row_group_size``."""
-        if self._buffered >= self.row_group_size:
-            self._flush_row_group()
-
-    def _flush_row_group(self) -> None:
-        """Write the current column buffer as a row group and clear it."""
-        if self._buffered == 0:
-            return
-        import pyarrow as pa
-        table = pa.table(self._columns, schema=self._get_schema())
-        self._writer.write_table(table)
-        for col in self._columns.values():
-            col.clear()
-        self._buffered = 0
-
-    @property
-    def num_rows(self) -> int:
-        return self._total_rows
-
-    @property
-    def num_samples(self) -> int:
-        """Alias for ``num_rows``."""
-        return self._total_rows
-
-    def finalize(self) -> int:
-        """Flush remaining rows, close writer, fsync, rename. Returns finalized chunk_id."""
-        if self._writer is None:
-            self._open_writer()
-        self._flush_row_group()
-        self._writer.close()
-        _fsync_file(self._tmp_path)
-        os.replace(str(self._tmp_path), str(self._final_path))
-
-        finalized_id = self.chunk_id
-        logger.info(
-            f"[rank {self.rank}] Wrote {self._total_rows} rows to {self._final_path.name}"
-        )
-
-        # Reset for next chunk
-        self.chunk_id += 1
-        for col in self._columns.values():
-            col.clear()
-        self._buffered = 0
-        self._total_rows = 0
-        self._writer = None
-        self._tmp_path = None
-        self._final_path = None
-        return finalized_id
+        builder.finalize(tmp_idx)
+        if cut_id_writer is not None:
+            cut_id_writer.close_temp()
+            atomic_replace_files(
+                [
+                    (tmp_bin, bin_path),
+                    (cut_id_writer.tmp_path, cut_id_writer.path),
+                    (tmp_idx, idx_path),
+                ],
+                fsync_sources=True,
+            )
+            cut_id_writer.mark_committed()
+        else:
+            atomic_replace_files(
+                [(tmp_bin, bin_path), (tmp_idx, idx_path)],
+                fsync_sources=True,
+            )
+    except BaseException:
+        if cut_id_writer is not None:
+            cut_id_writer.abort()
+        raise
 
 
 class StructuredCacheChunkWriter:
@@ -210,6 +146,7 @@ class StructuredCacheChunkWriter:
                 ("source_id", pa.string()),
                 ("clip_num", pa.int64()),
                 ("clip_start", pa.float64()),
+                ("clip_duration", pa.float64()),
                 ("speaker", pa.string()),
                 ("duration", pa.float64()),
                 ("text", pa.string()),
@@ -220,24 +157,6 @@ class StructuredCacheChunkWriter:
                 ("text_token_length", pa.int32()),
             ])
         return cls._SCHEMA
-
-    @staticmethod
-    def _normalize_partitioning(partitioning: Dict[str, Any] | None) -> Dict[str, Any]:
-        if not partitioning:
-            return {"type": "hash", "field": "source_id", "num_buckets": 16}
-        ptype = str(partitioning.get("type", "hash"))
-        if ptype == "hash":
-            field = str(partitioning.get("field", "source_id"))
-            num_buckets = int(partitioning.get("num_buckets", 16))
-            if num_buckets <= 0:
-                raise ValueError("partitioning.num_buckets must be > 0")
-            return {"type": "hash", "field": field, "num_buckets": num_buckets}
-        if ptype == "field":
-            field = partitioning.get("field")
-            if not field:
-                raise ValueError("partitioning.field is required for field partitioning")
-            return {"type": "field", "field": str(field)}
-        raise ValueError(f"Unsupported partitioning.type: {ptype!r}")
 
     @staticmethod
     def _sanitize_partition_value(value: Any) -> str:
@@ -279,40 +198,20 @@ class StructuredCacheChunkWriter:
 
         @staticmethod
         def infer_next_chunk_id(partition_dir: Path, rank: int) -> int:
-            rank_dir = partition_dir / f"rank_{rank:04d}"
-            if not rank_dir.exists():
-                return 0
-            stems = []
-            for clips_path in rank_dir.glob("clips.*.parquet"):
-                try:
-                    stems.append(int(clips_path.name.split(".")[1]))
-                except (IndexError, ValueError):
-                    continue
-            return max(stems) + 1 if stems else 0
+            return next_chunk_id(partition_dir / f"rank_{rank:04d}")
 
         def _cleanup_incomplete_rank_dir(self) -> None:
             # Each rank owns exactly one rank-local directory within a partition.
-            for tmp in self.rank_dir.glob("*.tmp"):
-                tmp.unlink()
-
-            for clips_path in self.rank_dir.glob("clips.*.parquet"):
-                stem = clips_path.name.split(".")[1]
-                audio_path = self.rank_dir / f"audio_tokens.{stem}.bin"
-                text_path = self.rank_dir / f"text_tokens.{stem}.bin"
-                if not audio_path.exists() or not text_path.exists():
-                    raise RuntimeError(
-                        f"Incomplete structured cache chunk detected for rank {self.rank}: "
-                        f"{clips_path.name} exists without both token bins."
-                    )
-
-            clip_ids = {p.name.split(".")[1] for p in self.rank_dir.glob("clips.*.parquet")}
-            for bin_path in list(self.rank_dir.glob("audio_tokens.*.bin")) + list(self.rank_dir.glob("text_tokens.*.bin")):
-                stem = bin_path.name.split(".")[1]
-                if stem not in clip_ids:
-                    logger.warning(
-                        f"[rank {self.rank}] Removing orphan structured cache payload with no commit marker: {bin_path.name}"
-                    )
-                    bin_path.unlink()
+            cleanup_tmp_files(self.rank_dir, "*.tmp", logger=logger)
+            validate_v2_chunks_complete(
+                self.rank_dir,
+                error_label=f"structured cache (rank {self.rank})",
+            )
+            prune_orphan_bin_files(
+                self.rank_dir,
+                logger=logger,
+                label=f"[rank {self.rank}] structured cache payload with no commit marker",
+            )
 
         def _open_chunk(self) -> None:
             stem = f"{self.chunk_id:06d}"
@@ -350,6 +249,7 @@ class StructuredCacheChunkWriter:
                     "source_id": row["source_id"],
                     "clip_num": row["clip_num"],
                     "clip_start": row["clip_start"],
+                    "clip_duration": row.get("clip_duration"),
                     "speaker": row["speaker"],
                     "duration": row["duration"],
                     "text": row["text"],
@@ -362,9 +262,6 @@ class StructuredCacheChunkWriter:
                 self._audio_offset += len(audio_tokens) * np.dtype(np.int32).itemsize
                 self._text_offset += len(text_tokens) * np.dtype(np.int32).itemsize
                 self._total_rows += 1
-
-        def flush_if_needed(self) -> None:
-            return None
 
         def finalize(self) -> int:
             if not self._opened:
@@ -385,12 +282,16 @@ class StructuredCacheChunkWriter:
                 schema=StructuredCacheChunkWriter._get_schema(),
             )
             pq.write_table(table, self._clips_tmp_path)
-            _fsync_file(self._clips_tmp_path)
+            fsync_file(self._clips_tmp_path)
 
-            os.replace(self._audio_tmp_path, self._audio_final_path)
-            os.replace(self._text_tmp_path, self._text_final_path)
-            os.replace(self._clips_tmp_path, self._clips_final_path)
-            _fsync_dir(self.rank_dir)
+            atomic_replace_files(
+                [
+                    (self._audio_tmp_path, self._audio_final_path),
+                    (self._text_tmp_path, self._text_final_path),
+                    (self._clips_tmp_path, self._clips_final_path),
+                ],
+                fsync_sources=False,
+            )
 
             finalized_id = self.chunk_id
             logger.info(
@@ -427,7 +328,7 @@ class StructuredCacheChunkWriter:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.rank = rank
-        self.partitioning = self._normalize_partitioning(partitioning)
+        self.partitioning = partitioning or {"type": "hash", "field": "source_id", "num_buckets": 16}
         self._initial_writer_state = (
             dict(writer_state) if isinstance(writer_state, dict) else {"__default__": int(writer_state)}
         )
@@ -438,6 +339,7 @@ class StructuredCacheChunkWriter:
             self.output_dir,
             {
                 "version": INTERLEAVE_CACHE_LAYOUT_V2,
+                "schema_version": INTERLEAVE_CACHE_SCHEMA_VERSION,
                 "kind": "structured_interleave_cache",
                 "commit_marker": "clips.parquet",
                 "rank_dirs": False,
@@ -450,7 +352,7 @@ class StructuredCacheChunkWriter:
         self._bootstrap_existing_partition_writers()
 
     def _write_layout_metadata(self, path: Path, payload: Dict[str, Any]) -> None:
-        layout_path = path / "_CACHE_LAYOUT.json"
+        layout_path = path / INTERLEAVE_CACHE_LAYOUT_FILENAME
         if layout_path.exists():
             try:
                 existing = json.loads(layout_path.read_text())
@@ -462,8 +364,15 @@ class StructuredCacheChunkWriter:
                     f"expected version {INTERLEAVE_CACHE_LAYOUT_V2!r}, "
                     f"found {existing.get('version')!r}"
                 )
+            if existing.get("schema_version") != INTERLEAVE_CACHE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Structured cache schema mismatch at {layout_path}: "
+                    f"expected schema_version {INTERLEAVE_CACHE_SCHEMA_VERSION!r}, "
+                    f"found {existing.get('schema_version')!r}. "
+                    "Rerun tokenize into a fresh interleave cache directory."
+                )
             return
-        _write_json_atomic(layout_path, payload)
+        atomic_write_json(layout_path, payload)
 
     def _partition_name_for_row(self, row: Dict[str, Any]) -> str:
         if self.partitioning["type"] == "hash":
@@ -485,6 +394,7 @@ class StructuredCacheChunkWriter:
             partition_dir,
             {
                 "version": INTERLEAVE_CACHE_LAYOUT_V2,
+                "schema_version": INTERLEAVE_CACHE_SCHEMA_VERSION,
                 "kind": "structured_interleave_cache",
                 "commit_marker": "clips.parquet",
                 "rank_dirs": True,
@@ -509,7 +419,7 @@ class StructuredCacheChunkWriter:
     def _bootstrap_existing_partition_writers(self) -> None:
         for partition_dir in sorted(
             p for p in self.output_dir.iterdir()
-            if p.is_dir() and (p / "_CACHE_LAYOUT.json").exists()
+            if p.is_dir() and (p / INTERLEAVE_CACHE_LAYOUT_FILENAME).exists()
         ):
             rank_dir = partition_dir / f"rank_{self.rank:04d}"
             if not rank_dir.exists():
@@ -537,9 +447,6 @@ class StructuredCacheChunkWriter:
             writer.add_rows(part_rows)
             self._num_rows += len(part_rows)
 
-    def flush_if_needed(self) -> None:
-        return None
-
     def finalize(self) -> Dict[str, int]:
         done: Dict[str, int] = {}
         for partition_name, writer in sorted(self._partition_writers.items()):
@@ -562,10 +469,3 @@ class StructuredCacheChunkWriter:
         for partition_name, writer in self._partition_writers.items():
             state[partition_name] = writer.get_state()
         return state
-
-
-def parquet_cache_exists(parquet_dir: Path) -> bool:
-    """Check if a Parquet cache directory has at least one .parquet file."""
-    if not parquet_dir.is_dir():
-        return False
-    return any(parquet_dir.glob("*.parquet"))

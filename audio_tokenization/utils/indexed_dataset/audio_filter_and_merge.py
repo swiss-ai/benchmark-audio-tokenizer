@@ -14,14 +14,14 @@ a lightweight numpy mmap reader for reading.
 
 Usage
 -----
-    python -m audio_tokenization.utils.indexed_dataset.audio_filter_and_merge \
+    python scripts/audio_filter_and_merge.py \
         --input-dirs /path/to/tokenized/dataset1 /path/to/tokenized/dataset2 \
         --output-prefix /path/to/output/merged_filtered \
         --min-unique-tokens 5 \
         --recursive
 
     # Dry-run to inspect unique-token distribution before committing:
-    python -m audio_tokenization.utils.indexed_dataset.audio_filter_and_merge \
+    python scripts/audio_filter_and_merge.py \
         --input-dirs /path/to/tokenized/dataset \
         --output-prefix /tmp/unused \
         --min-unique-tokens 5 \
@@ -41,16 +41,17 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from audio_tokenization.utils.indexed_dataset.constants import MEGATRON_INDEX_HEADER
+from audio_tokenization.utils.indexed_dataset.dtypes import DType
 from audio_tokenization.utils.indexed_dataset.indexed_dataset_megatron import (
-    DType,
     IndexedDatasetBuilder,
-    _INDEX_HEADER,
     get_bin_path,
     get_idx_path,
 )
 from audio_tokenization.utils.indexed_dataset.merge_indexed_dataset import (
     discover_indexed_prefixes,
 )
+from audio_tokenization.utils.io import atomic_write_json
 
 # ---------------------------------------------------------------------------
 # Lightweight mmap reader (no Megatron dependency)
@@ -64,8 +65,8 @@ class IndexedDatasetReader:
         bin_path = prefix + ".bin"
 
         with open(idx_path, "rb") as f:
-            header = f.read(9)
-            assert header == _INDEX_HEADER, f"Bad header in {idx_path}"
+            header = f.read(len(MEGATRON_INDEX_HEADER))
+            assert header == MEGATRON_INDEX_HEADER, f"Bad header in {idx_path}"
             (version,) = struct.unpack("<Q", f.read(8))
             assert version == 1, f"Unsupported version {version}"
             (dtype_code,) = struct.unpack("<B", f.read(1))
@@ -504,8 +505,7 @@ def filter_and_merge(
     if stats_json:
         stats_path = Path(stats_json).expanduser().resolve()
         stats_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stats_path, "w") as f:
-            json.dump(stats, f, indent=2)
+        atomic_write_json(stats_path, stats, sort_keys=False)
         print(f"\n  Stats written to: {stats_path}")
 
     return stats

@@ -11,7 +11,8 @@ Two invariants worth keeping in mind:
   (open HTML on a laptop) is a separate report-side concern, not a schema
   feature.
 
-v1 (legacy, unversioned) files are auto-upgraded on read.
+Readers require the current schema version. Regenerate stale inference JSON
+instead of migrating it in place.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
 
 
 logger = logging.getLogger(__name__)
@@ -32,28 +33,6 @@ CURRENT_INFERENCE_OUTPUT_VERSION = 2
 
 Task = Literal["transcribe", "continue", "translate"]
 Backend = Literal["transformers", "vllm"]
-
-# v1 → key inside results[i] holding the model output. v2 stops using these.
-_V1_TASK_OUTPUT_KEY: dict[Task, str] = {
-    "transcribe": "transcription",
-    "continue": "continuation",
-    "translate": "translation",
-}
-
-# Top-level fields that must be present on a v1 file.
-_V1_REQUIRED_RUN_FIELDS: tuple[str, ...] = (
-    "model_path",
-    "data_source",
-    "dataset_name",
-    "task",
-    "backend",
-    "num_samples",
-    "max_new_tokens",
-    "temperature",
-    "top_p",
-    "results",
-)
-
 
 @dataclass(frozen=True)
 class PredictionRecord:
@@ -69,7 +48,7 @@ class PredictionRecord:
     text_tokens: int | None = None
     audio_tokens_out: int | None = None
     gen_time_s: float | None = None
-    dataset: str | None = None  # legacy --wav-dir metadata.tsv field
+    dataset: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,47 +64,13 @@ class InferenceRun:
     records: list[PredictionRecord] = field(default_factory=list)
 
 
-def _migrate_v1_to_v2(payload: dict) -> dict:
-    """Promote a legacy unversioned inference output to v2."""
-    missing = [k for k in _V1_REQUIRED_RUN_FIELDS if k not in payload]
-    if missing:
-        raise RuntimeError(
-            f"v1 inference output missing required field(s) {missing}; "
-            f"cannot migrate to v{CURRENT_INFERENCE_OUTPUT_VERSION}."
-        )
-    task = payload["task"]
-    if task not in _V1_TASK_OUTPUT_KEY:
-        raise RuntimeError(
-            f"v1 inference output has unknown task {task!r}; cannot pick the "
-            f"right output key. Known: {sorted(_V1_TASK_OUTPUT_KEY)}"
-        )
-    output_key = _V1_TASK_OUTPUT_KEY[task]
-
-    upgraded_records = [
-        {
-            **{k: v for k, v in rec.items() if k not in (output_key, "ground_truth")},
-            "prediction_text": rec.get(output_key, ""),
-            "reference_text": rec.get("ground_truth", ""),
-            "audio_uri": None,
-        }
-        for rec in payload.get("results", [])
-    ]
-
-    upgraded = {k: v for k, v in payload.items() if k != "results"}
-    upgraded["schema_version"] = 2
-    upgraded["records"] = upgraded_records
-    return upgraded
-
-
-_INFERENCE_OUTPUT_MIGRATIONS: dict[tuple[int, int], Callable[[dict], dict]] = {
-    (1, 2): _migrate_v1_to_v2,
-}
-
-
 def _detect_version(payload: dict) -> int:
     v = payload.get("schema_version")
     if v is None:
-        return 1
+        raise RuntimeError(
+            "Inference output is missing schema_version. Regenerate it with "
+            "the current audio_inference.py writer."
+        )
     if not isinstance(v, int):
         raise RuntimeError(
             f"Invalid inference output: schema_version must be int, got "
@@ -138,9 +83,8 @@ def _instantiate(payload: dict) -> InferenceRun:
     """Build an InferenceRun from a v2-shaped dict.
 
     Drops unknown record keys silently — additive fields within the same
-    schema_version are allowed (a future writer may add optional metadata
-    that this reader doesn't model). Breaking changes must bump the version
-    and add a migration; ``_detect_version`` already rejects future versions.
+    schema_version are allowed. Breaking changes must bump the version;
+    ``_detect_version`` rejects future versions.
     """
     record_fields = {f.name for f in dataclasses.fields(PredictionRecord)}
     records = [
@@ -153,15 +97,12 @@ def _instantiate(payload: dict) -> InferenceRun:
 
 
 def read_inference_run(path: Path) -> InferenceRun:
-    """Read an inference output JSON, auto-migrating v1 → v2 in memory.
-
-    Does not write the upgrade back to disk — files are regenerable, and
-    silent rewrites would surprise readers expecting them unchanged.
+    """Read a current-version inference output JSON.
 
     Raises:
         FileNotFoundError: if path does not exist.
-        RuntimeError: malformed JSON, future schema version, missing required
-            v1 fields, unknown v1 task, or num_samples mismatch.
+        RuntimeError: malformed JSON, missing/currently unsupported schema
+            version, or num_samples mismatch.
     """
     path = Path(path)
     if not path.is_file():
@@ -178,16 +119,12 @@ def read_inference_run(path: Path) -> InferenceRun:
             f"only knows how to read up to version "
             f"{CURRENT_INFERENCE_OUTPUT_VERSION}."
         )
-    while version < CURRENT_INFERENCE_OUTPUT_VERSION:
-        step = (version, version + 1)
-        migrate = _INFERENCE_OUTPUT_MIGRATIONS.get(step)
-        if migrate is None:
-            raise RuntimeError(
-                f"Missing inference-output migration for {step}; this is a "
-                f"bug. File: {path}"
-            )
-        payload = migrate(payload)
-        version += 1
+    if version < CURRENT_INFERENCE_OUTPUT_VERSION:
+        raise RuntimeError(
+            f"Inference output at {path} is stale version {version}; expected "
+            f"{CURRENT_INFERENCE_OUTPUT_VERSION}. Regenerate it with the "
+            "current audio_inference.py writer."
+        )
 
     run = _instantiate(payload)
 

@@ -36,30 +36,6 @@ def _make_run(records: list[PredictionRecord], **overrides) -> InferenceRun:
     return InferenceRun(**base)
 
 
-def _v1_payload(*, task: str, key: str, records: list[dict]) -> dict:
-    return {
-        "model_path": "/models/foo",
-        "data_source": "/data/test",
-        "dataset_name": "test_ds",
-        "task": task,
-        "backend": "transformers",
-        "num_samples": len(records),
-        "max_new_tokens": 128,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "results": [
-            {
-                "sample_idx": i,
-                "sample_id": f"s{i}",
-                "duration_s": 1.0,
-                "ground_truth": f"gt-{i}",
-                key: f"pred-{i}",
-            }
-            for i in range(len(records))
-        ],
-    }
-
-
 # ---------------------------------------------------------------------------
 # Round-trip + writer contract
 # ---------------------------------------------------------------------------
@@ -114,36 +90,14 @@ def test_read_rejects_num_samples_mismatch(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v1 → v2 migration
+# Schema version checks
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("task", "key"),
-    [
-        ("transcribe", "transcription"),
-        ("continue", "continuation"),
-        ("translate", "translation"),
-    ],
-)
-def test_v1_legacy_migrates(tmp_path, task, key):
+def test_read_rejects_missing_schema_version(tmp_path):
     out = tmp_path / "run.json"
-    out.write_text(json.dumps(_v1_payload(task=task, key=key, records=[{}, {}])))
-    run = read_inference_run(out)
-    assert run.task == task
-    assert len(run.records) == 2
-    assert run.records[0].prediction_text == "pred-0"
-    assert run.records[1].prediction_text == "pred-1"
-    assert run.records[0].reference_text == "gt-0"
-    assert run.records[0].audio_uri is None  # v1 had no canonical path
-
-
-def test_v1_legacy_missing_task_rejected(tmp_path):
-    payload = _v1_payload(task="transcribe", key="transcription", records=[{}])
-    payload.pop("task")
-    out = tmp_path / "run.json"
-    out.write_text(json.dumps(payload))
-    with pytest.raises(RuntimeError, match=r"missing required field"):
+    out.write_text(json.dumps({"task": "transcribe", "records": []}))
+    with pytest.raises(RuntimeError, match="missing schema_version"):
         read_inference_run(out)
 
 
@@ -194,7 +148,6 @@ def test_resolve_audio_src_v2_no_embed_emits_relative_url(tmp_path):
     """
     import generate_html_report as ghr
 
-    audio = tmp_path / "/capstor/store/scratch" / "x.flac"  # arbitrary absolute
     rec = PredictionRecord(
         sample_idx=0, sample_id="s0", duration_s=1.0,
         audio_uri="/capstor/store/scratch/x.flac",
@@ -226,7 +179,7 @@ def test_resolve_audio_src_v2_embed_reads_canonical_uri(tmp_path):
     assert src.startswith("data:audio/flac;base64,")
 
 
-def test_resolve_audio_src_v1_falls_back_to_flac(tmp_path):
+def test_resolve_audio_src_without_audio_uri_returns_empty(tmp_path):
     import generate_html_report as ghr
 
     ds_dir = tmp_path / "ds_a"
@@ -241,7 +194,7 @@ def test_resolve_audio_src_v1_falls_back_to_flac(tmp_path):
         rec, wav_root=str(tmp_path), ds_name="ds_a",
         sample_idx=0, embed=False, audio_url_prefix="audio",
     )
-    assert src == "audio/ds_a/s0.flac"
+    assert src == ""
 
 
 def test_render_report_html_v2_includes_predictions(tmp_path):

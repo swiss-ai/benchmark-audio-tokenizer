@@ -12,7 +12,6 @@ from audio_tokenization.interleave.common import (
     _detect_runs,
     compute_ratio_adjustment,
     list_interleave_cache_partitions,
-    load_parquets,
     load_interleave_cache,
     prepare_interleave_cache_and_runs,
     prepare_length_metadata,
@@ -314,27 +313,8 @@ class TestDetectRuns:
         assert int(lengths.sum()) == len(df)
 
 
-class TestLoadParquets:
-    def test_falls_back_to_generic_parquet_names(self, tmp_path: Path):
-        df = pl.DataFrame(
-            {
-                "source_id": ["s1", "s1"],
-                "clip_num": [0, 1],
-                "audio_tokens": [[1, 2], [3, 4]],
-                "text_tokens": [[5], [6]],
-            }
-        )
-        df.write_parquet(tmp_path / "part_00000.parquet")
-
-        loaded = load_parquets(tmp_path)
-
-        assert loaded.shape == (2, 4)
-        assert loaded["source_id"].to_list() == ["s1", "s1"]
-        assert loaded["clip_num"].to_list() == [0, 1]
-
-
 class TestInterleaveCacheReaders:
-    def test_load_interleave_cache_uses_v1_without_layout_file(self, tmp_path: Path):
+    def test_load_interleave_cache_rejects_unversioned_legacy_cache(self, tmp_path: Path):
         df = pl.DataFrame(
             {
                 "source_id": ["s1", "s1"],
@@ -345,10 +325,11 @@ class TestInterleaveCacheReaders:
         )
         df.write_parquet(tmp_path / "part_00000.parquet")
 
-        loaded_df, reader = load_interleave_cache(tmp_path)
+        with pytest.raises(RuntimeError, match="missing _CACHE_LAYOUT.json"):
+            load_interleave_cache(tmp_path)
 
-        assert reader.__class__.__name__ == "_V1InterleaveCacheReader"
-        assert loaded_df.shape == (2, 4)
+        with pytest.raises(RuntimeError, match="missing _CACHE_LAYOUT.json"):
+            list_interleave_cache_partitions(tmp_path)
 
     def test_prepare_length_metadata_accepts_v2_length_columns(self):
         df = pl.DataFrame(
@@ -367,7 +348,10 @@ class TestInterleaveCacheReaders:
         assert lengths_df["_tlen"].to_list() == [4, 5]
 
     def test_load_interleave_cache_reads_v2_metadata_and_payload(self, tmp_path: Path):
-        from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
+        from audio_tokenization.pipelines.shard_io import (
+            INTERLEAVE_CACHE_SCHEMA_VERSION,
+            StructuredCacheChunkWriter,
+        )
 
         writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
         writer.add_rows([
@@ -376,6 +360,7 @@ class TestInterleaveCacheReaders:
                 "source_id": "s1",
                 "clip_num": 0,
                 "clip_start": 0.0,
+                "clip_duration": None,
                 "speaker": "",
                 "duration": 1.0,
                 "text": "a",
@@ -388,6 +373,7 @@ class TestInterleaveCacheReaders:
                 "source_id": "s1",
                 "clip_num": 1,
                 "clip_start": 1.0,
+                "clip_duration": None,
                 "speaker": "",
                 "duration": 1.0,
                 "text": "b",
@@ -403,6 +389,11 @@ class TestInterleaveCacheReaders:
         cache, starts, lengths, n_clips, n_sources = prepare_interleave_cache_and_runs(df, reader)
 
         assert reader.__class__.__name__ == "_V2InterleaveCacheReader"
+        assert "clip_start" in df.columns
+        assert "clip_duration" in df.columns
+        assert json.loads((tmp_path / "_CACHE_LAYOUT.json").read_text())["schema_version"] == (
+            INTERLEAVE_CACHE_SCHEMA_VERSION
+        )
         assert n_clips == 2
         assert n_sources == 1
         assert starts.tolist() == [0]
@@ -418,6 +409,36 @@ class TestInterleaveCacheReaders:
         with pytest.raises(RuntimeError, match="Unsupported interleave cache layout version"):
             load_interleave_cache(tmp_path)
 
+    def test_load_interleave_cache_rejects_v2_layout_without_schema_version(self, tmp_path: Path):
+        from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
+
+        writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
+        writer.add_rows([
+            {
+                "clip_id": "s1@000000",
+                "source_id": "s1",
+                "clip_num": 0,
+                "clip_start": 0.0,
+                "clip_duration": None,
+                "speaker": "",
+                "duration": 1.0,
+                "text": "a",
+                "text_tokens": [10],
+                "audio_tokens": [1, 2, 3],
+                "dataset": "ds",
+            }
+        ])
+        writer.finalize()
+
+        partition_dir = list_interleave_cache_partitions(tmp_path)[0]
+        layout_path = partition_dir / "_CACHE_LAYOUT.json"
+        layout = json.loads(layout_path.read_text())
+        layout.pop("schema_version")
+        layout_path.write_text(json.dumps(layout))
+
+        with pytest.raises(RuntimeError, match="schema version"):
+            load_interleave_cache(partition_dir)
+
     def test_v2_reader_raises_when_fd_budget_is_too_low(self, tmp_path: Path, monkeypatch):
         from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
         import audio_tokenization.interleave.common as bic
@@ -429,6 +450,7 @@ class TestInterleaveCacheReaders:
                 "source_id": "s1",
                 "clip_num": 0,
                 "clip_start": 0.0,
+                "clip_duration": None,
                 "speaker": "",
                 "duration": 1.0,
                 "text": "a",

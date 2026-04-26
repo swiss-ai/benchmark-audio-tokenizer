@@ -9,6 +9,7 @@ from typing import Any
 from audio_tokenization.config.schema import (
     DatasetSpec,
     InterleaveProductSpec,
+    SftProductSpec,
 )
 from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.runtime import resolve_num_workers
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 INTERLEAVE_STATE_FILE = "products_interleave_state.json"
+SFT_STATE_FILE = "products_sft_state.json"
 
 
 def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
@@ -64,6 +66,7 @@ def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
         effective={
             "strategy": interleave.strategy,
             "max_seq_len": interleave.max_seq_len,
+            "max_gap_sec": interleave.max_gap_sec,
             "num_workers": interleave.num_workers,
         },
         fingerprint=fingerprint,
@@ -83,11 +86,36 @@ def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
 
 
 def run_materialize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
-    plan = resolve_materialize_plan(spec)
-    if not plan.enabled:
-        return {"interleave": {"skipped": True, "reason": plan.reason or "interleave.disabled"}}
-    plan.preflight()
-    return plan.execute(resume)
+    results: dict[str, Any] = {}
+
+    interleave_plan = resolve_materialize_plan(spec)
+    if interleave_plan.enabled:
+        interleave_plan.preflight()
+        results.update(interleave_plan.execute(resume))
+    else:
+        results["interleave"] = {
+            "skipped": True,
+            "reason": interleave_plan.reason or "interleave.disabled",
+        }
+
+    sft = spec.materialize.sft
+    if sft.enabled:
+        results["sft"] = _run_sft_materialize(sft, resume=resume)
+    else:
+        results["sft"] = {"skipped": True, "reason": "sft.disabled"}
+
+    return results
+
+
+def _run_sft_materialize(sft: SftProductSpec, *, resume: bool) -> dict[str, Any]:
+    # Fail on the unimplemented surface before validating config — users
+    # shouldn't chase config errors for a product the assembler doesn't yet
+    # build. Add product-specific preflight with the assembler implementation.
+    raise NotImplementedError(
+        "materialize.sft is a typed product now, but the SFT assembler is not "
+        "implemented in this slice. It will consume doc_manifest + audio token "
+        "cache manifests and write final Megatron sequences."
+    )
 
 
 def _preflight_materialize_plan(
@@ -143,16 +171,9 @@ def _resolve_parquet_dir(spec: DatasetSpec, interleave: InterleaveProductSpec) -
         return Path(interleave.cache_dir)
 
     assert spec.tokenize is not None  # gated by DatasetSpec cross-section validator
-    from audio_tokenization.pipelines.lhotse.core import _build_output_subdir
+    from audio_tokenization.output_layout import resolve_tokenize_output_dir
 
-    pipeline_cfg = {
-        "output_name": spec.tokenize.output.output_name or spec.name,
-        "mode": spec.tokenize.mode,
-        "audio_text_format": spec.tokenize.audio_text_format,
-        "audio_text_task": spec.tokenize.audio_text_task,
-    }
-    subdir = _build_output_subdir(pipeline_cfg)
-    return Path(spec.tokenize.output.output_dir) / subdir
+    return resolve_tokenize_output_dir(spec.tokenize, dataset_name=spec.name)
 
 
 def _resolve_tokenizer_path(spec: DatasetSpec, interleave: InterleaveProductSpec) -> str:
@@ -200,6 +221,8 @@ def _build_interleave_argv(
         "--max-seq-len", str(interleave.max_seq_len),
         "--num-workers", str(num_workers),
     ]
+    if interleave.max_gap_sec is not None:
+        argv += ["--max-gap-sec", str(interleave.max_gap_sec)]
     if interleave.seq_threshold is not None:
         argv += ["--seq-threshold", str(interleave.seq_threshold)]
     if interleave.transcribe_ratio is not None:

@@ -1,6 +1,6 @@
 """Mixin defaults must mirror schema defaults exactly.
 
-Each ``_common/*.yaml`` mixin lists default values explicitly so a user can
+Each stage profile YAML lists default values explicitly so a user can
 discover them by reading YAML rather than grepping ``schema.py``. Pydantic
 defaults remain authoritative for python-side construction (tests build
 ``DatasetSpec`` from minimal payloads). This test guards the contract: if
@@ -16,25 +16,22 @@ import yaml
 
 from audio_tokenization.config.schema import (
     InterleaveProductSpec,
-    PrepareAudioDirInputSpec,
-    PrepareHfInputSpec,
-    PrepareLhotseRecipeInputSpec,
     PrepareMetadataSpec,
     PrepareOutputSpec,
-    PrepareParquetInputSpec,
-    PrepareWdsInputSpec,
+    SftProductSpec,
     TokenizeDataloaderSpec,
     TokenizeFilterSpec,
     TokenizeOutputSpec,
     TokenizerSpec,
+    _INPUT_SPEC_BY_FAMILY,
 )
 
 
-_COMMON = Path(__file__).resolve().parents[1] / "configs" / "pipeline" / "dataset" / "_common"
+_PROFILES = Path(__file__).resolve().parents[1] / "configs" / "pipeline"
 
 
 def _load(name: str) -> dict[str, Any]:
-    return yaml.safe_load((_COMMON / name).read_text())
+    return yaml.safe_load((_PROFILES / name).read_text())
 
 
 def _schema_defaults(model_cls) -> dict[str, Any]:
@@ -69,40 +66,100 @@ def _assert_subset(
 
 
 _TOKENIZE_MIXINS = [
-    "tokenize_audio_only.yaml",
-    "tokenize_audio_text_direct.yaml",
-    "tokenize_audio_text_interleaved.yaml",
+    "tokenize/audio_only.yaml",
+    "tokenize/audio_text_direct.yaml",
+    "tokenize/audio_text_interleaved.yaml",
 ]
 
 
-def test_pipeline_mixin_mirrors_convert_output_and_metadata_defaults():
-    pipeline = _load("pipeline.yaml")
+# Single source of truth: schema dictates the family list. Any new convert
+# family added to ``_INPUT_SPEC_BY_FAMILY`` is automatically picked up here,
+# so the parity check covers it on day one.
+_CONVERT_FAMILY_INPUT_SPECS = sorted(
+    (f"convert/{family}.yaml", spec_cls)
+    for family, spec_cls in _INPUT_SPEC_BY_FAMILY.items()
+)
+
+
+def test_convert_common_mirrors_output_and_metadata_defaults():
+    """convert/_common.yaml is the single source of schema-mirror truth.
+
+    Family YAMLs (parquet/hf/wds/audio_dir/lhotse_recipe) compose this base via
+    Hydra ``defaults`` and add only family-specific overrides. The YAML stores
+    keys at top level (Hydra group convention); downstream consumers see the
+    composed result wrapped under the ``convert`` package.
+    """
+    common = _load("convert/_common.yaml")
     _assert_subset(
-        pipeline["convert"]["output"], _schema_defaults(PrepareOutputSpec),
-        "pipeline.yaml convert.output",
-        site_overrides=("text_tokenizer",),
+        common["output"], _schema_defaults(PrepareOutputSpec),
+        "convert/_common.yaml output",
     )
-    _assert_subset(pipeline["convert"]["metadata"], _schema_defaults(PrepareMetadataSpec),
-                   "pipeline.yaml convert.metadata")
-    _assert_subset(pipeline["materialize"]["interleave"], _schema_defaults(InterleaveProductSpec),
-                   "pipeline.yaml materialize.interleave")
+    _assert_subset(
+        common["metadata"], _schema_defaults(PrepareMetadataSpec),
+        "convert/_common.yaml metadata",
+    )
+
+
+def test_materialize_default_mirrors_schema_defaults():
+    materialize = _load("materialize/default.yaml")
+    _assert_subset(
+        materialize["materialize"]["interleave"], _schema_defaults(InterleaveProductSpec),
+        "materialize/default.yaml materialize.interleave",
+    )
+    _assert_subset(
+        materialize["materialize"]["sft"], _schema_defaults(SftProductSpec),
+        "materialize/default.yaml materialize.sft",
+    )
 
 
 @pytest.mark.parametrize(
-    "mixin_filename,input_cls",
-    [
-        ("source_parquet.yaml", PrepareParquetInputSpec),
-        ("source_hf.yaml", PrepareHfInputSpec),
-        ("source_wds.yaml", PrepareWdsInputSpec),
-        ("source_audio_dir.yaml", PrepareAudioDirInputSpec),
-        ("source_lhotse_recipe.yaml", PrepareLhotseRecipeInputSpec),
-    ],
+    "family",
+    [Path(name).stem for name, _ in _CONVERT_FAMILY_INPUT_SPECS],
 )
+def test_convert_family_compose_includes_common_defaults(family):
+    """Hydra-compose each family; the merged ``convert.metadata`` and
+    ``convert.output`` must carry every schema-default key from ``_common``.
+
+    A real compose, not a YAML-string check: catches a missing
+    ``defaults: [_common, _self_]`` AND any future restructuring that
+    breaks the family→_common composition chain.
+    """
+    from hydra import compose, initialize_config_dir
+
+    metadata_required = set(PrepareMetadataSpec.model_fields.keys())
+    # shar_dir is the only required output field (no default), so it
+    # legitimately doesn't appear in the YAML defaults.
+    output_required = {
+        name for name, info in PrepareOutputSpec.model_fields.items()
+        if not info.is_required()
+    }
+
+    with initialize_config_dir(version_base=None, config_dir=str(_PROFILES.resolve())):
+        cfg = compose(config_name=f"convert/{family}")
+
+    metadata = set(cfg.convert.metadata.keys())
+    output = set(cfg.convert.output.keys())
+
+    missing_metadata = metadata_required - metadata
+    missing_output = output_required - output
+
+    assert not missing_metadata, (
+        f"convert/{family}.yaml compose is missing metadata defaults from _common: "
+        f"{sorted(missing_metadata)}. Either add `defaults: [_common, _self_]` to the "
+        "family YAML, or extend _common.yaml to mirror the schema."
+    )
+    assert not missing_output, (
+        f"convert/{family}.yaml compose is missing output defaults from _common: "
+        f"{sorted(missing_output)}."
+    )
+
+
+@pytest.mark.parametrize("mixin_filename,input_cls", _CONVERT_FAMILY_INPUT_SPECS)
 def test_source_mixin_mirrors_input_defaults(mixin_filename, input_cls):
     _assert_subset(
-        _load(mixin_filename)["convert"]["input"],
+        _load(mixin_filename)["input"],
         _schema_defaults(input_cls),
-        f"{mixin_filename} convert.input",
+        f"{mixin_filename} input",
     )
 
 

@@ -30,8 +30,9 @@ import logging
 import time
 from pathlib import Path
 
-from audio_tokenization.prepare.audio_ops import to_mono
-from audio_tokenization.prepare.identity import set_universal_cut_id
+from audio_tokenization.prepare.audio_ops import apply_audio_pipeline, write_cut_to_shar
+from audio_tokenization.prepare.cli import expand_path_patterns
+from audio_tokenization.prepare.identity import set_interleave_metadata
 from audio_tokenization.prepare.runtime import (
     build_audio_index,
     check_worker_reuse,
@@ -55,6 +56,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _ITEMS_KEY = "resolved_jsonls"
+_AUDIO_INDEX = None
 
 
 # ---------------------------------------------------------------------------
@@ -67,24 +69,50 @@ def _convert_worker(args_tuple):
     Each worker writes to its own ``worker_XX/`` directory to avoid contention.
     Resume is considered complete only when ``worker_XX/_SUCCESS`` exists.
     """
-    (
-        worker_id,
-        jsonl_paths,
-        audio_index,
-        shar_dir,
-        target_sr,
-        shard_size,
-        shar_format,
-        min_sr,
-        mono_downmix,
-        vad_max_chunk_sec,
-        vad_min_chunk_sec,
-        vad_sample_rate,
-        vad_max_merge_gap_sec,
-        vad_max_duration_sec,
-        audio_ext,
-        resampling_backend,
-    ) = args_tuple
+    if len(args_tuple) == 16:
+        (
+            worker_id,
+            jsonl_paths,
+            audio_index,
+            shar_dir,
+            target_sr,
+            shard_size,
+            shar_format,
+            min_sr,
+            mono_downmix,
+            vad_max_chunk_sec,
+            vad_min_chunk_sec,
+            vad_sample_rate,
+            vad_max_merge_gap_sec,
+            vad_max_duration_sec,
+            audio_ext,
+            resampling_backend,
+        ) = args_tuple
+    else:
+        (
+            worker_id,
+            jsonl_paths,
+            shar_dir,
+            target_sr,
+            shard_size,
+            shar_format,
+            min_sr,
+            mono_downmix,
+            vad_max_chunk_sec,
+            vad_min_chunk_sec,
+            vad_sample_rate,
+            vad_max_merge_gap_sec,
+            vad_max_duration_sec,
+            audio_ext,
+            resampling_backend,
+        ) = args_tuple
+        audio_index = _AUDIO_INDEX
+        if audio_index is None:
+            raise RuntimeError(
+                "audio_dir worker did not receive an audio index. Use fork "
+                "start method for the shared-index path or pass the legacy "
+                "worker tuple containing audio_index."
+            )
 
     reused = check_worker_reuse(worker_id, shar_dir)
     if reused is not None:
@@ -189,22 +217,32 @@ def _convert_worker(args_tuple):
                                     offset=offset, duration=chunk_duration
                                 )
 
-                            subcut = to_mono(
-                                subcut,
-                                mono_downmix=mono_downmix,
-                                stats=runtime_counts,
-                            )
                             subcut.custom = subcut.custom or {}
                             subcut.custom["global_offset_sec"] = offset
                             subcut.custom["lang"] = lang
-                            set_universal_cut_id(
+                            subcut, skip, decoded_audio = apply_audio_pipeline(
+                                subcut,
+                                target_sr=None,  # already resampled before VAD
+                                mono_downmix=mono_downmix,
+                                tokenize_fn=None,
+                                runtime_counts=runtime_counts,
+                            )
+                            if skip:
+                                skipped += 1
+                                continue
+                            set_interleave_metadata(
                                 subcut,
                                 key,
                                 chunk_idx,
                                 clip_start=offset,
                             )
 
-                            writer.write(subcut)
+                            write_cut_to_shar(
+                                writer,
+                                subcut,
+                                audio=decoded_audio,
+                                runtime_counts=runtime_counts,
+                            )
                             written += 1
                             total_duration_sec += subcut.duration
                             runtime_counts["cuts_written"] += 1
@@ -291,6 +329,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Parallelism
     parser.add_argument("--num-workers", type=int, default=None,
                         help="Number of parallel workers (default: one per JSONL file)")
+    parser.add_argument("--mp-start-method", default="fork",
+                        help="multiprocessing start method (default: fork for shared audio index)")
 
     return parser
 
@@ -304,9 +344,9 @@ def run(spec):
     if not audio_root.is_dir():
         raise NotADirectoryError(f"Audio root not found: {audio_root}")
 
-    resolved_jsonls = sorted(i.jsonl_files)
+    resolved_jsonls = expand_path_patterns(i.jsonl_files)
     if not resolved_jsonls:
-        raise FileNotFoundError("No JSONL files provided")
+        raise FileNotFoundError(f"No files match patterns: {list(i.jsonl_files)}")
 
     validate_prepare_runtime(
         resampling_backend=o.resampling_backend,
@@ -344,11 +384,16 @@ def run(spec):
 
     worker_jsonls = distribute_round_robin(resolved_jsonls, num_workers)
 
-    worker_args = [
-        (
+    use_shared_audio_index = o.mp_start_method == "fork"
+    global _AUDIO_INDEX
+    _AUDIO_INDEX = audio_index if use_shared_audio_index else None
+    worker_args = []
+    for wid, jsonls in enumerate(worker_jsonls):
+        if not jsonls:
+            continue
+        common = (
             wid,
             jsonls,
-            audio_index,
             str(shar_dir),
             o.target_sr,
             o.shard_size,
@@ -363,11 +408,21 @@ def run(spec):
             i.audio_ext,
             o.resampling_backend,
         )
-        for wid, jsonls in enumerate(worker_jsonls)
-        if jsonls
-    ]
+        if use_shared_audio_index:
+            worker_args.append(common)
+        else:
+            worker_args.append((wid, jsonls, audio_index, *common[2:]))
 
-    run_pool_and_finalize(_convert_worker, worker_args, shar_dir, num_workers)
+    try:
+        run_pool_and_finalize(
+            _convert_worker,
+            worker_args,
+            shar_dir,
+            num_workers,
+            mp_start_method=o.mp_start_method,
+        )
+    finally:
+        _AUDIO_INDEX = None
 
 
 def _args_to_spec(args):
@@ -394,6 +449,7 @@ def _args_to_spec(args):
             "target_sr": args.target_sr,
             "num_workers": args.num_workers,
             "resampling_backend": args.resampling_backend,
+            "mp_start_method": args.mp_start_method,
         },
     })
 

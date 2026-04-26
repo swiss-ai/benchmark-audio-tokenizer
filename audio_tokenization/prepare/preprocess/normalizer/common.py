@@ -112,11 +112,11 @@ def load_llm(model_path: str, temperature: float = 0.0, max_tokens: int = 256):
 def write_jsonl_zst(entries: list[dict], out_path):
     """Write entries to a zstandard-compressed JSONL file."""
     import json
-    import zstandard
     from pathlib import Path
 
+    from audio_tokenization.utils.io import atomic_streaming_write
+
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    cctx = zstandard.ZstdCompressor(level=3)
-    with open(out_path, "wb") as f_raw, cctx.stream_writer(f_raw) as f:
+    with atomic_streaming_write(out_path, compression="zst") as f:
         for e in entries:
             f.write((json.dumps(e, ensure_ascii=False) + "\n").encode("utf-8"))

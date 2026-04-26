@@ -116,9 +116,10 @@ from multiprocessing import Process
 from pathlib import Path
 from typing import Optional
 
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.prepare.audio_ops import make_rms_filter_fn, to_mono
 from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
-from audio_tokenization.prepare.identity import assign_universal_ids
+from audio_tokenization.prepare.identity import assign_interleave_metadata
 from audio_tokenization.prepare.runtime import (
     build_shar_index_from_parts,
     mark_partition_success,
@@ -130,6 +131,7 @@ from audio_tokenization.prepare.text_ops import (
     load_text_tokenizer,
     make_text_tokenize_fn,
 )
+from audio_tokenization.utils.io import atomic_write_json
 
 logging.basicConfig(
     level=logging.INFO,
@@ -239,7 +241,7 @@ def convert_worker(
     )
 
     if stats_dir is not None:
-        (stats_dir / f"part-{rank:05d}.json").write_text(json.dumps(stats))
+        atomic_write_json(stats_dir / f"part-{rank:05d}.json", stats, indent=None)
     mark_partition_success(output_dir, success_marker_name=PART_SUCCESS_MARKER)
     logger.info(f"[worker {rank}] Done → {output_dir}")
 
@@ -294,7 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--shar_shard_size", type=int, default=1000)
     parser.add_argument("--shar_format", default="flac")
-    parser.add_argument("--shar_index_filename", default="shar_index.json")
+    parser.add_argument("--shar_index_filename", default=SHAR_INDEX_FILENAME)
 
     # Audio processing
     parser.add_argument("--target_sample_rate", type=int, default=None)
@@ -373,7 +375,7 @@ def run(spec):
     )
 
     cuts_list = list(cuts)
-    cuts_list = assign_universal_ids(cuts_list, store_clip_start=True)
+    cuts_list = assign_interleave_metadata(cuts_list, store_clip_start=True)
     logger.info(f"Built CutSet with {len(cuts_list)} cuts from {i.recipe}/{i.split}")
     logger.info(f"Converting to Shar → {shar_dir}")
     logger.info(f"Using {num_workers} parallel workers")
@@ -439,7 +441,7 @@ def run(spec):
 def _args_to_spec(args):
     """Translate flat argparse Namespace → typed PrepareSpec.
 
-    The legacy CLI's ``--shar_output_dir`` / ``--shar_base_dir`` derivation
+    The CLI's ``--shar_output_dir`` / ``--shar_base_dir`` derivation
     happens here so the typed runner can assume a concrete ``shar_dir``.
     """
     from audio_tokenization.config.schema import PrepareSpec

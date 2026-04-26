@@ -1,0 +1,42 @@
+defaults:
+  - /recipe/hf_audio_only@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - /profile/cscs@_here_
+  - _self_
+
+# Stage-1 AudioSet balanced rebuild from the local HF Arrow cache.
+
+name: stage1_audioset_balanced
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/audioset_cache/agkphysics___audio_set/full/0.0.0/0c609e8302cf139307f639c57652032af0a88041
+  files: audio_set-bal_train-*.arrow
+
+columns:
+  id: video_id
+  id_prefix: audioset_bal_train
+  keep: [video_id, audio.path, labels, human_labels]
+  external_metadata: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/javisdata-audios/audio/AudioSet/balanced_train_segments.csv
+  id_field: YTID
+  text_field: __unused_text__
+  custom_fields: [YTID, start_seconds, end_seconds, positive_labels]
+  constant:
+    dataset: audioset
+    split: bal_train
+  derived:
+    source_url: https://www.youtube.com/watch?v={video_id}
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1_rebuild/audioset_balanced
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/stage_1_rebuild
+  name: audioset_balanced
+
+conversion:
+  shard_size: 5000
+  read_batch_size: 64
+
+tokenization:
+  min_duration: 2.0
+  max_duration: 200.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000

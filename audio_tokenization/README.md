@@ -34,7 +34,7 @@ graph TD
 
     subgraph Tokenize["4 — GPU Audio Tokenization"]
         direction TB
-        ENTRY["tokenize.py"] --> MODE{{"Mode"}}
+        ENTRY["stage=tokenize"] --> MODE{{"Mode"}}
         MODE -->|audio_only| AO["AudioOnly"]
         MODE -->|"audio_text<br>(direct)"| ATD["AudioText Direct"]
         MODE -->|"audio_text<br>(interleaved)"| ATI["AudioText Interleaved"]
@@ -44,8 +44,8 @@ graph TD
     end
 
     subgraph Compose["5 — Compose Patterns<br>(CPU-only, re-runnable)"]
-        PQ_CACHE --> BUILD["build_interleaved_indexed.py"]
-        BUILD --> BIN_P["Megatron .bin/.idx<br>one per pattern"]
+        PQ_CACHE --> BUILD["stage=materialize<br>interleave product"]
+        BUILD --> BIN_P["Megatron .bin/.idx"]
     end
 
     DL --> Preprocess
@@ -55,18 +55,18 @@ graph TD
     BIN_AO & BIN_ATD & BIN_P --> TRAIN["Megatron-LM Training"]
 
 
-    click MERGE href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/chunking.py"
-    click LANGFILT href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/filter_langid_vad.py"
-    click TAR href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_wds_to_shar.py"
-    click ARROW href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_hf_to_shar.py"
-    click RECIPE href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_lhotse_recipe_to_shar.py"
-    click AUDIODIR href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_audio_dir_to_shar.py"
-    click PARQUET_IN href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_parquet_to_shar.py"
-    click ENTRY href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/tokenize.py"
+    click MERGE href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/preprocess/chunking.py"
+    click LANGFILT href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/preprocess/filter_langid_vad.py"
+    click TAR href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_wds_to_shar.py"
+    click ARROW href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_hf_to_shar.py"
+    click RECIPE href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_lhotse_recipe_to_shar.py"
+    click AUDIODIR href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_audio_dir_to_shar.py"
+    click PARQUET_IN href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_parquet_to_shar.py"
+    click ENTRY href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/stages/tokenize.py"
     click AO href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/pipelines/lhotse/audio_only.py"
     click ATD href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/pipelines/lhotse/audio_text.py"
     click ATI href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/pipelines/lhotse/audio_text.py"
-    click BUILD href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/build_interleaved_indexed.py"
+    click BUILD href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/stages/materialize.py"
 
     style Download fill:#e3f2fd,stroke:#1565C0
     style Preprocess fill:#fce4ec,stroke:#C62828
@@ -86,13 +86,13 @@ Unsupervised datasets (e.g. VoxPopuli, People's Speech) contain long recordings 
 
 | Step | Script | What it does |
 |------|--------|-------------|
-| **Silero VAD** | [`run_vad.py`](./utils/prepare_data/run_vad.py) | Detect speech timestamps per recording |
-| **Merge + Pack** | [`chunking.py`](./utils/prepare_data/chunking.py) | Merge segments when gap < `max_merge_gap_sec`, pack into chunks up to `max_chunk_sec`, drop chunks < `min_chunk_sec` |
-| **Language Filter** | [`filter_langid_vad.py`](./utils/prepare_data/filter_langid_vad.py) | Keep only target languages, produce per-shard VAD JSONL |
+| **Silero VAD** | [`run_vad.py`](./prepare/preprocess/run_vad.py) | Detect speech timestamps per recording |
+| **Merge + Pack** | [`chunking.py`](./prepare/preprocess/chunking.py) | Merge segments when gap < `max_merge_gap_sec`, pack into chunks up to `max_chunk_sec`, drop chunks < `min_chunk_sec` |
+| **Language Filter** | [`filter_langid_vad.py`](./prepare/preprocess/filter_langid_vad.py) | Keep only target languages, produce per-shard VAD JSONL |
 
 Audio-text datasets (e.g. Emilia, WenetSpeech) are already segmented with transcriptions and skip this step.
 
-> **Dry run:** Sweep VAD parameters and estimate hours/tokens per configuration with [`vad_sweep.py`](./utils/prepare_data/stats/vad_sweep.py) — no files written.
+> **Dry run:** Sweep VAD parameters and estimate hours/tokens per configuration with [`vad_sweep.py`](./prepare/stats/vad_sweep.py) — no files written.
 >
 > ```bash
 > python -m audio_tokenization.prepare.stats.vad_sweep \
@@ -105,7 +105,7 @@ Audio-text datasets (e.g. Emilia, WenetSpeech) are already segmented with transc
 
 ## 3. Convert to Shar
 
-All input formats converge into **Lhotse Shar** before tokenization. Each converter is a standalone script under [`utils/prepare_data/`](./utils/prepare_data/).
+All input formats converge into **Lhotse Shar** before tokenization. Each converter is a standalone script under [`prepare/`](./prepare/).
 
 **Text pre-tokenization happens here** (via `--text_tokenizer`): the Shar stores `text_tokens` per cut, so the GPU tokenization step only handles audio.
 
@@ -131,11 +131,11 @@ flowchart LR
         I["text_tokens — pre-tokenized text"]
     end
 
-    click A href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_wds_to_shar.py"
-    click B href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_hf_to_shar.py"
-    click C href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_lhotse_recipe_to_shar.py"
-    click D href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_audio_dir_to_shar.py"
-    click E href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/prepare_data/prepare_parquet_to_shar.py"
+    click A href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_wds_to_shar.py"
+    click B href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_hf_to_shar.py"
+    click C href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_lhotse_recipe_to_shar.py"
+    click D href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_audio_dir_to_shar.py"
+    click E href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/prepare/prepare_parquet_to_shar.py"
 
     style src fill:#e3f2fd,stroke:#1565C0
     style shar fill:#fff9c4,stroke:#F9A825
@@ -146,9 +146,9 @@ flowchart LR
 
 ## 4. GPU Audio Tokenization
 
-All modes share the same data loading pipeline ([`data.py`](./pipelines/lhotse/data.py)): load Shar, split shards across ranks, dynamic bucketing by duration, multi-worker CPU decoding, GPU tokenization with WavTokenizer.
+All modes share the same data loading pipeline ([`data.py`](./pipelines/lhotse/data.py)): load Shar, derive a duration-aware rank assignment from `_shar_work_manifest.json`, dynamic bucketing by duration, multi-worker CPU decoding, GPU tokenization with WavTokenizer.
 
-> **`trim_last_tokens`** — Batched GPU tokenization zero-pads shorter waveforms to the longest in the batch. We observed that zero-padded vs. non-padded audio produces identical tokens except for the last few positions (artifacts of the padding boundary). The `trim_last_tokens` config (default 5) strips these trailing tokens from any sample that was padded, so outputs match single-sample tokenization. See [`audio_only.py`](./vokenizers/wavtokenizer/audio_only.py).
+> **`trim_last_tokens`** — Batched GPU tokenization zero-pads shorter waveforms to the longest waveform in the batch. We observed that zero-padded vs. non-padded audio is stable except for the last few positions near the padding boundary. The `trim_last_tokens` config strips those trailing tokens only from samples that were actually batch-padded. See [`audio_only.py`](./vokenizers/wavtokenizer/audio_only.py).
 
 ### Mode A: Audio-Only
 
@@ -297,7 +297,7 @@ Each Parquet row stores one clip:
 
 ### Stage 2: Compose Patterns (CPU-only)
 
-[`build_interleaved_indexed.py`](./utils/build_interleaved_indexed.py) reads the Parquet cache and assembles training sequences. **No GPU needed** — re-run with different `--patterns` to experiment instantly.
+`stage=materialize` reads the interleave cache and assembles final Megatron training sequences. **No GPU needed** — re-run materialization when sequence policy changes; re-tokenization is not required.
 
 ```mermaid
 flowchart TD
@@ -318,8 +318,8 @@ flowchart TD
 
     WRITE & WRITE_C & WRITE_T --> TRAIN["Megatron-LM Training"]
 
-    click PQ href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/build_interleaved_indexed.py"
-    click DETECT href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/utils/build_interleaved_indexed.py"
+    click PQ href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/interleave/shift_by_one.py"
+    click DETECT href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/interleave/shift_by_one.py"
 
     style PQ fill:#fff9c4,stroke:#F9A825
     style WRITE fill:#e8f5e9,stroke:#2E7D32
@@ -399,98 +399,58 @@ Single-clip:       transcribe
 
 ```bash
 # Stage 1: Tokenize once (expensive, GPU)
-python -m audio_tokenization.tokenize \
-    mode=audio_text audio_text_format=interleaved num_gpus=4
+python -m audio_tokenization run dataset=infore2 stage=tokenize
 
-# Stage 2: Compose patterns (cheap, CPU-only — re-run as many times as you want)
-python -m audio_tokenization.interleave_indexed \
-    --parquet-dir /path/to/parquets \
-    --output-dir /path/to/output \
-    --tokenizer-path /path/to/omni_tokenizer \
-    --patterns ATAT TATA
-
-# Try different patterns — no re-tokenization needed
-python -m audio_tokenization.interleave_indexed \
-    --parquet-dir /path/to/parquets \
-    --output-dir /path/to/output_v2 \
-    --tokenizer-path /path/to/omni_tokenizer \
-    --patterns ATATAT TATATA AAT
-
-# Dry run — preview statistics only
-python -m audio_tokenization.interleave_indexed \
-    --parquet-dir /path/to/parquets \
-    --output-dir /tmp/dry \
-    --tokenizer-path /path/to/omni_tokenizer \
-    --patterns ATAT TATA \
-    --dry-run
+# Stage 2: materialize final interleave product (cheap, CPU-only)
+python -m audio_tokenization run dataset=infore2 stage=materialize
 ```
 
 ---
 
 ## 7. Configuration (Hydra)
 
-The pipeline uses [Hydra](https://hydra.cc/) for hierarchical configuration. The main config composes a dataset sub-config via the `defaults` list, and every field can be overridden from the CLI.
+The pipeline uses [Hydra](https://hydra.cc/) for hierarchical configuration. The root config is intentionally thin: `stage/*` selects the runnable stage, `runtime/*` carries operational knobs, and `dataset/*` is the canonical typed dataset spec.
 
 ```
-configs/
-├── config.yaml                       # Main: mode, tokenizer, W&B, resume
-└── dataset/
-    ├── audio_only/
-    │   ├── audioset.yaml             # AudioSet (unsupervised)
-    │   ├── voxpopuli.yaml
-    │   ├── commonvoice.yaml
-    │   ├── suno.yaml
-    │   └── ...
-    └── audio_text/
-        ├── emilia_yodas_interleaved.yaml
-        ├── wenetspeech_interleaved.yaml
-        └── ...
+configs/pipeline/
+├── config.yaml                       # stage + runtime + dataset composition
+├── convert/*.yaml                    # reusable conversion profiles
+├── tokenize/*.yaml                   # reusable tokenization profiles
+├── materialize/*.yaml                # reusable product profiles
+├── stage/*.yaml                      # convert/tokenize/materialize/all
+└── dataset/*.yaml                    # one canonical spec per dataset
 ```
 
-**Main config** ([`config.yaml`](./configs/config.yaml)):
+**Dataset specs** configure the enabled stages directly:
 
 | Key | Description |
 |-----|-------------|
-| `mode` | `audio_only` or `audio_text` |
-| `audio_text_format` | `direct` (Megatron) or `interleaved` (Parquet) |
-| `audio_text_task` | `transcribe` or `annotate` |
-| `tokenizer.path` | Path to omni-tokenizer (with audio tokens added) |
-| `tokenizer.sampling_rate` | Target sample rate for decoding (default 24000) |
-| `tokenizer.trim_last_tokens` | Trailing tokens to trim from padded audio (default 5) |
-| `num_gpus` | Total GPU count (cross-checked against `SLURM_NTASKS`) |
-| `resume` | Resume from rank checkpoints |
-| `wandb.*` | Weights & Biases logging settings |
-
-**Dataset configs** — each specifies Shar paths, filtering, bucketing, and DataLoader settings:
-
-| Key | Description |
-|-----|-------------|
-| `shar_dir` | Path(s) to pre-built Shar directories |
-| `min_duration` / `max_duration` | Duration filtering (seconds) |
-| `max_batch_duration` | Dynamic bucketing target (seconds of audio per batch) |
-| `num_buckets` | Number of duration buckets for balanced batching |
-| `num_workers` / `prefetch_factor` | DataLoader parallelism |
-| `checkpoint_interval_batches` | How often to write rank checkpoints |
+| `convert.*` | Raw source, conversion metadata, SHAR output, workers |
+| `tokenize.*` | SHAR input, tokenizer, filters, bucketing, DataLoader |
+| `materialize.interleave.*` | Interleave cache input and final sequence output |
+| `materialize.sft.*` | Future SFT product contract |
+| `runtime.resume` | Resume only when `_SUCCESS` and state fingerprints match |
 
 ```bash
 # Override from CLI
-python -m audio_tokenization.tokenize \
-    dataset=audio_text/emilia_yodas_interleaved \
-    mode=audio_text audio_text_format=interleaved \
-    num_gpus=8 tokenizer.trim_last_tokens=0
+python -m audio_tokenization run \
+    dataset=stage1_suno_s1 \
+    stage=tokenize \
+    dataset.tokenize.tokenizer.trim_last_tokens=0 \
+    dataset.tokenize.dataloader.max_batch_duration=2000
 ```
 
 ---
 
 ## 8. Multi-GPU Distribution
 
-Each rank processes an independent shard subset — no NCCL, no inter-rank communication. See [`core.py`](./pipelines/lhotse/core.py).
+Each rank processes an independent planned SHAR work subset — no NCCL, no inter-rank communication. Conversion writes `_shar_work_manifest.json`; tokenization writes `_tokenize_assignment.json` for the current launch. See [`planning.py`](./pipelines/lhotse/planning.py) and [`core.py`](./pipelines/lhotse/core.py).
 
 ```mermaid
 graph TD
-    SHAR[("Shar Directory<br>N shards")] --> SPLIT["Round-Robin<br>Shard Assignment"]
+    SHAR[("Shar Directory<br>N shards")] --> PLAN["Duration-Aware<br>Assignment Plan"]
 
-    SPLIT --> R0 & R1 & RN
+    PLAN --> R0 & R1 & RN
 
     subgraph R0["Rank 0"]
         direction TB
@@ -507,7 +467,7 @@ graph TD
         WN["CPU Workers"] --> TN["WavTokenizer<br>GPU N"] --> ON["rank_NNNN_chunk_*"]
     end
 
-    click SPLIT href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/pipelines/lhotse/data.py"
+    click PLAN href "https://github.com/swiss-ai/benchmark-audio-tokenizer/blob/batch_tok/audio_tokenization/pipelines/lhotse/planning.py"
 
     style SHAR fill:#fff9c4,stroke:#F9A825
     style R0 fill:#fce4ec,stroke:#C62828

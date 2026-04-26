@@ -1,0 +1,6 @@
+tokenizer:
+  path: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok
+  text_tokenizer: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json
+  sampling_rate: 24000
+  torch_compile: false
+  trim_last_tokens: 5

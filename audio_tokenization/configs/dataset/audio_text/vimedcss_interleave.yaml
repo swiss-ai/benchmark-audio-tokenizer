@@ -1,7 +1,0 @@
-dataset_name: vimedcss
-output_name: vimedcss_interleave
-
-shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/vimedcss_train
-
-num_buckets: 20

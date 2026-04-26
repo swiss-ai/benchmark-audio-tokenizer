@@ -1,7 +1,0 @@
-dataset_name: kazakh_speech
-output_name: kazakh_speech
-
-shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/kazakh_speech_train
-
-num_buckets: 20

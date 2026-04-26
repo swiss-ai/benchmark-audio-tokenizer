@@ -1,5 +1,6 @@
 import json
 import copy
+import gzip
 import re
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from omegaconf import OmegaConf
 from audio_tokenization.__main__ import _split_command
 from audio_tokenization.config import load_dataset_spec
 from audio_tokenization.config.schema import PrepareMetadataSpec, PrepareSpec
+from audio_tokenization.prepare.columnar import ColumnarWorkerArgs
+from audio_tokenization.prepare.cli import expand_path_patterns
 from audio_tokenization.stages import convert as convert_stage
 from audio_tokenization.prepare import (
     prepare_audio_dir_to_shar,
@@ -26,6 +29,29 @@ from audio_tokenization.prepare.runtime import (
     read_prepare_state,
     validate_or_write_prepare_state,
 )
+
+
+def _write_cut_shar_index(shar_dir: Path, durations=(10.0,)) -> None:
+    shar_dir.mkdir(parents=True, exist_ok=True)
+    cut_paths = []
+    for idx, duration in enumerate(durations):
+        name = f"cuts.{idx:06d}.jsonl.gz"
+        cut_paths.append(name)
+        with gzip.open(shar_dir / name, "wt") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "id": f"cut-{idx}",
+                        "duration": duration,
+                        "recording": {"sampling_rate": 24000},
+                        "custom": {"rms_db": -20.0},
+                    }
+                )
+                + "\n"
+            )
+    (shar_dir / "shar_index.json").write_text(
+        json.dumps({"fields": {"cuts": cut_paths}}) + "\n"
+    )
 
 
 _PIPELINE_CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "pipeline"
@@ -58,7 +84,13 @@ def test_load_dataset_spec_infore2_and_aozora():
 
     assert aozora.name == "aozora_hurigana"
     assert aozora.convert.metadata.id_column == "sample_id"
-    assert aozora.convert.metadata.custom_columns == ["author", "work", "rendition", "line_num"]
+    assert aozora.convert.metadata.custom_columns == [
+        "sample_id",
+        "author",
+        "work",
+        "rendition",
+        "line_num",
+    ]
 
 
 def test_load_dataset_spec_does_not_reconfigure_logging(monkeypatch):
@@ -125,7 +157,7 @@ def test_load_dataset_spec_does_not_import_prepare_modules():
     leaked = [k for k in sys.modules if "audio_tokenization.prepare.prepare_" in k]
     assert not leaked, (
         f"load_dataset_spec imported prepare modules: {sorted(leaked)}. "
-        "Schema parsing must remain decoupled from the legacy CLI scripts."
+        "Schema parsing must remain decoupled from standalone prepare scripts."
     )
 
 
@@ -173,7 +205,7 @@ def test_load_dataset_spec_coerces_numeric_string_fields():
 
 def test_text_column_defaults_to_none_when_key_omitted():
     """Canonical schema: omitting text_column means "do not extract text".
-    No legacy-CLI-parity substitution; setters opt in explicitly.
+    No CLI-default substitution; setters opt in explicitly.
     """
     spec = load_dataset_spec(
         {
@@ -250,37 +282,50 @@ def test_id_column_rejects_invalid_shape():
 
 
 # ---------------------------------------------------------------------------
-# state versioning + auto-upgrade of legacy v0 payloads
+# state versioning
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_state_auto_upgrades_legacy_v0_in_place(tmp_path):
-    """Unversioned state from the pre-refactor CLI must be accepted and
-    upgraded transparently so long-running resumes don't fail.
-    """
+def test_prepare_state_rejects_unversioned_payload(tmp_path):
     state_path = tmp_path / "_PREPARE_STATE.json"
-    legacy_payload = {
+    state_path.write_text(
+        json.dumps(
+            {
+                "parquet_dir": "/tmp/data",
+                "text_tokenizer": None,
+            }
+        )
+        + "\n"
+    )
+
+    with pytest.raises(RuntimeError, match="has no version"):
+        read_prepare_state(state_path)
+
+
+def test_prepare_state_rejects_stale_version(tmp_path):
+    state_path = tmp_path / "_PREPARE_STATE.json"
+    state_path.write_text(json.dumps({"version": 0, "parquet_dir": "/tmp/data"}) + "\n")
+
+    with pytest.raises(RuntimeError, match="stale version"):
+        read_prepare_state(state_path)
+
+
+def test_validate_or_write_prepare_state_rejects_missing_invariant(tmp_path):
+    state_path = tmp_path / "_PREPARE_STATE.json"
+    stale_payload = {
+        "version": CURRENT_PREPARE_STATE_VERSION,
         "parquet_dir": "/tmp/data",
         "text_tokenizer": None,
-        "input_clip_id_parser": None,
-        "external_metadata": None,
-        "id_field": "id",
-        "text_field": "text",
-        "custom_fields": None,
     }
-    state_path.write_text(json.dumps(legacy_payload) + "\n")
+    state_path.write_text(json.dumps(stale_payload) + "\n")
 
-    upgraded = read_prepare_state(state_path)
-
-    assert upgraded["version"] == CURRENT_PREPARE_STATE_VERSION
-    # Payload is preserved key-for-key apart from the new version sentinel.
-    for k, v in legacy_payload.items():
-        assert upgraded[k] == v
-
-    # The upgrade was persisted: reading again returns a versioned payload
-    # directly without re-migrating.
-    rewritten = json.loads(state_path.read_text())
-    assert rewritten["version"] == CURRENT_PREPARE_STATE_VERSION
+    with pytest.raises(AssertionError, match="missing a required invariant"):
+        validate_or_write_prepare_state(
+            state_path,
+            expected={**stale_payload, "metadata.text_column": "text"},
+            invariant_keys=("parquet_dir", "metadata.text_column"),
+            guidance="remove output dir to reset",
+        )
 
 
 def test_prepare_state_rejects_unknown_future_version(tmp_path):
@@ -307,34 +352,6 @@ def test_validate_or_write_prepare_state_first_run_writes_versioned(tmp_path):
     payload = json.loads(state_path.read_text())
     assert payload["version"] == CURRENT_PREPARE_STATE_VERSION
     assert payload["parquet_dir"] == "/tmp/data"
-
-
-def test_validate_or_write_prepare_state_resume_after_v0_upgrade(tmp_path):
-    """Legacy v0 state resumes cleanly when invariants still match."""
-    state_path = tmp_path / "_PREPARE_STATE.json"
-    legacy_payload = {
-        "parquet_dir": "/tmp/data",
-        "text_tokenizer": None,
-        "input_clip_id_parser": None,
-        "external_metadata": None,
-        "id_field": "id",
-        "text_field": "text",
-        "custom_fields": None,
-    }
-    state_path.write_text(json.dumps(legacy_payload) + "\n")
-
-    # Resume with identical expected values succeeds (no AssertionError).
-    wrote = validate_or_write_prepare_state(
-        state_path,
-        expected=legacy_payload,
-        invariant_keys=tuple(legacy_payload.keys()),
-        guidance="remove output dir to reset",
-    )
-    assert wrote is False
-
-    # File now includes the version sentinel.
-    payload = json.loads(state_path.read_text())
-    assert payload["version"] == CURRENT_PREPARE_STATE_VERSION
 
 
 def test_validate_or_write_prepare_state_detects_invariant_drift(tmp_path):
@@ -467,9 +484,65 @@ def test_schema_defaults_are_canonical():
     assert spec.convert.metadata.audio_column == "audio"
     assert spec.convert.metadata.text_column is None
     assert spec.convert.metadata.duration_column is None
+    assert spec.convert.metadata.source_id_column is None
+    assert spec.convert.metadata.clip_num_column is None
     assert spec.convert.metadata.id_column is None
     assert spec.convert.metadata.id_field == "id"
     assert spec.convert.metadata.text_field == "text"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"clip_end_column": "parent_end"},
+        {"clip_duration_column": "segment_duration"},
+    ],
+)
+def test_clip_timestamp_columns_require_clip_start_column(metadata):
+    payload = _minimal_payload("parquet")
+    payload["convert"]["metadata"] = metadata
+
+    with pytest.raises(ValueError, match="require clip_start_column"):
+        load_dataset_spec(payload)
+
+
+def test_clip_timestamp_columns_reject_end_and_duration_together():
+    payload = _minimal_payload("parquet")
+    payload["convert"]["metadata"] = {
+        "clip_start_column": "parent_start",
+        "clip_end_column": "parent_end",
+        "clip_duration_column": "segment_duration",
+    }
+
+    with pytest.raises(ValueError, match="set exactly one of clip_end_column or clip_duration_column"):
+        load_dataset_spec(payload)
+
+
+def test_clip_num_column_requires_source_id_column():
+    payload = _minimal_payload("parquet")
+    payload["convert"]["metadata"] = {"clip_num_column": "segment_index"}
+
+    with pytest.raises(ValueError, match="clip_num_column requires source_id_column"):
+        load_dataset_spec(payload)
+
+
+def test_source_id_column_requires_clip_num_or_clip_start_column():
+    payload = _minimal_payload("parquet")
+    payload["convert"]["metadata"] = {"source_id_column": "original_audio_id"}
+
+    with pytest.raises(ValueError, match="source_id_column without clip_num_column"):
+        load_dataset_spec(payload)
+
+
+def test_source_id_column_rejects_input_clip_id_parser():
+    payload = _minimal_payload("parquet")
+    payload["convert"]["metadata"] = {
+        "source_id_column": "original_audio_id",
+        "input_clip_id_parser": "trailing_number",
+    }
+
+    with pytest.raises(ValueError, match="set either source_id_column"):
+        load_dataset_spec(payload)
 
 
 @pytest.mark.parametrize(
@@ -534,6 +607,26 @@ def test_prepare_spec_fingerprint_payload_is_hashable_and_stable(
         assert fp[key] == expected
 
 
+@pytest.mark.parametrize("family", ["parquet", "hf"])
+def test_prepare_fingerprint_includes_clip_timestamp_metadata_fields(family):
+    payload = _minimal_payload(family)
+    payload["convert"]["metadata"] = {
+        "source_id_column": "original_audio_id",
+        "clip_start_column": "parent_start",
+        "clip_end_column": "parent_end",
+        "clip_duration_column": None,
+    }
+
+    spec = load_dataset_spec(payload)
+    fp = spec.convert.fingerprint_payload()
+
+    assert fp["metadata.source_id_column"] == "original_audio_id"
+    assert fp["metadata.clip_num_column"] is None
+    assert fp["metadata.clip_start_column"] == "parent_start"
+    assert fp["metadata.clip_end_column"] == "parent_end"
+    assert fp["metadata.clip_duration_column"] is None
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: spec drift detection at the parquet runner's state-file layer.
 # Both Hydra and CLI paths converge on PrepareSpec; tests build the spec
@@ -582,33 +675,25 @@ def test_e2e_parquet_prepare_state_rejects_drift(tmp_path, flag, v1, v2):
         _write_state_via_runtime_helper(spec_v2)
 
 
-def test_e2e_parquet_prepare_state_v0_legacy_backfills_and_then_enforces(tmp_path):
-    """Legacy v0 state (missing expanded invariants) must resume cleanly,
-    backfill current values, and enforce drift on the NEXT run."""
+def test_e2e_parquet_prepare_state_rejects_missing_expanded_invariant(tmp_path):
+    """Current state files must contain the full invariant set.
+
+    If a previous run lacks a newly required field, we rebuild instead of
+    backfilling it silently.
+    """
     out = tmp_path / "out"
     out.mkdir()
 
-    legacy_state = {
-        "parquet_dir": str((tmp_path / "in").resolve()),
-        "text_tokenizer": None,
-        "input_clip_id_parser": None,
-        "external_metadata": None,
-        "id_field": "id",
-        "text_field": "text",
-        "custom_fields": None,
-    }
-    (out / PREPARE_STATE_FILE).write_text(json.dumps(legacy_state) + "\n")
-
     spec_v1 = _minimal_parquet_spec(tmp_path, text_column="transcription")
-    _write_state_via_runtime_helper(spec_v1)
+    stale_state = {
+        "version": CURRENT_PREPARE_STATE_VERSION,
+        **spec_v1.fingerprint_payload(),
+    }
+    stale_state.pop("metadata.text_column")
+    (out / PREPARE_STATE_FILE).write_text(json.dumps(stale_state) + "\n")
 
-    stored = json.loads((out / PREPARE_STATE_FILE).read_text())
-    assert stored["metadata.text_column"] == "transcription"
-    assert stored["version"] == CURRENT_PREPARE_STATE_VERSION
-
-    spec_v2 = _minimal_parquet_spec(tmp_path, text_column="body")
-    with pytest.raises(AssertionError, match=r"(?s)Unsafe resume.*Key: metadata\.text_column"):
-        _write_state_via_runtime_helper(spec_v2)
+    with pytest.raises(AssertionError, match=r"(?s)Unsafe resume.*metadata\.text_column"):
+        _write_state_via_runtime_helper(spec_v1)
 
 
 @pytest.mark.parametrize(
@@ -711,6 +796,23 @@ def test_audio_dir_prepare_does_not_write_state_before_audio_index_succeeds(
     assert not (out / PREPARE_STATE_FILE).exists()
 
 
+def test_expand_path_patterns_resolves_globs_and_literals(tmp_path):
+    a = tmp_path / "a.jsonl"
+    b = tmp_path / "b.jsonl"
+    a.write_text("{}\n")
+    b.write_text("{}\n")
+
+    assert expand_path_patterns([str(tmp_path / "*.jsonl"), str(a)]) == [
+        str(a),
+        str(b),
+    ]
+
+
+def test_expand_path_patterns_rejects_unmatched_pattern(tmp_path):
+    with pytest.raises(FileNotFoundError, match="No files match pattern"):
+        expand_path_patterns([str(tmp_path / "*.missing")])
+
+
 def test_resolve_convert_plan_canonicalizes_lhotse_recipe_num_workers(tmp_path):
     """When num_workers is unset, the lhotse_recipe runner needs a concrete
     int (it does ``range(num_workers)`` directly). Hardcoded to 64 so the
@@ -794,6 +896,132 @@ def test_hf_cli_args_round_trip_to_spec():
     assert spec.output.shar_dir == "/out/a"
 
 
+def test_parquet_run_builds_typed_columnar_worker_args(tmp_path, monkeypatch):
+    in_dir = tmp_path / "parquet"
+    out_dir = tmp_path / "shar"
+    in_dir.mkdir()
+    (in_dir / "chunk.parquet").write_text("")
+    spec = PrepareSpec.from_mapping(
+        {
+            "family": "parquet",
+            "input": {"parquet_dir": str(in_dir)},
+            "output": {"shar_dir": str(out_dir), "shard_size": 2000},
+        }
+    )
+
+    monkeypatch.setattr(prepare_parquet_to_shar, "_preflight_prepare", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prepare_parquet_to_shar, "write_prepare_state_for_spec", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prepare_parquet_to_shar, "ensure_worker_assignment", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        prepare_parquet_to_shar,
+        "distribute_round_robin",
+        lambda resolved, _num_workers: [resolved],
+    )
+    monkeypatch.setattr(prepare_parquet_to_shar, "load_text_tokenizer", lambda _path: None)
+
+    captured = {}
+
+    def _capture(_worker_fn, worker_args, _shar_dir, _num_workers, mp_start_method="forkserver"):
+        captured["worker_args"] = worker_args
+        captured["mp_start_method"] = mp_start_method
+        return []
+
+    monkeypatch.setattr(prepare_parquet_to_shar, "run_pool_and_finalize", _capture)
+
+    prepare_parquet_to_shar.run(spec)
+
+    assert len(captured["worker_args"]) == 1
+    assert isinstance(captured["worker_args"][0], ColumnarWorkerArgs)
+    assert captured["worker_args"][0].input_paths == (str(in_dir / "chunk.parquet"),)
+
+
+def test_hf_run_builds_typed_columnar_worker_args(tmp_path, monkeypatch):
+    in_dir = tmp_path / "arrow"
+    out_dir = tmp_path / "shar"
+    in_dir.mkdir()
+    (in_dir / "chunk.arrow").write_text("")
+    spec = PrepareSpec.from_mapping(
+        {
+            "family": "hf",
+            "input": {"arrow_dir": str(in_dir)},
+            "output": {"shar_dir": str(out_dir), "shard_size": 2000},
+        }
+    )
+
+    monkeypatch.setattr(prepare_hf_to_shar, "_preflight_prepare", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prepare_hf_to_shar, "write_prepare_state_for_spec", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prepare_hf_to_shar, "ensure_worker_assignment", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        prepare_hf_to_shar,
+        "distribute_round_robin",
+        lambda resolved, _num_workers: [resolved],
+    )
+    monkeypatch.setattr(prepare_hf_to_shar, "load_text_tokenizer", lambda _path: None)
+
+    captured = {}
+
+    def _capture(_worker_fn, worker_args, _shar_dir, _num_workers, mp_start_method="forkserver"):
+        captured["worker_args"] = worker_args
+        captured["mp_start_method"] = mp_start_method
+        return []
+
+    monkeypatch.setattr(prepare_hf_to_shar, "run_pool_and_finalize", _capture)
+
+    prepare_hf_to_shar.run(spec)
+
+    assert len(captured["worker_args"]) == 1
+    assert isinstance(captured["worker_args"][0], ColumnarWorkerArgs)
+    assert captured["worker_args"][0].input_paths == (str(in_dir / "chunk.arrow"),)
+
+
+def test_audio_dir_run_uses_shared_audio_index_with_fork(tmp_path, monkeypatch):
+    audio_root = tmp_path / "audio"
+    audio_root.mkdir()
+    jsonl_path = tmp_path / "vad.jsonl"
+    jsonl_path.write_text("{}\n")
+    out_dir = tmp_path / "shar"
+    spec = PrepareSpec.from_mapping(
+        {
+            "family": "audio_dir",
+            "input": {
+                "audio_root": str(audio_root),
+                "jsonl_files": [str(jsonl_path)],
+            },
+            "output": {
+                "shar_dir": str(out_dir),
+                "shard_size": 2000,
+                "mp_start_method": "fork",
+            },
+        }
+    )
+
+    monkeypatch.setattr(prepare_audio_dir_to_shar, "validate_prepare_runtime", lambda **_kwargs: None)
+    monkeypatch.setattr(prepare_audio_dir_to_shar, "build_audio_index", lambda *_args, **_kwargs: {"clip": "/audio.wav"})
+    monkeypatch.setattr(prepare_audio_dir_to_shar, "write_prepare_state_for_spec", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prepare_audio_dir_to_shar, "ensure_worker_assignment", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        prepare_audio_dir_to_shar,
+        "distribute_round_robin",
+        lambda resolved, _num_workers: [resolved],
+    )
+
+    captured = {}
+
+    def _capture(_worker_fn, worker_args, _shar_dir, _num_workers, mp_start_method="forkserver"):
+        captured["worker_args"] = worker_args
+        captured["mp_start_method"] = mp_start_method
+        return []
+
+    monkeypatch.setattr(prepare_audio_dir_to_shar, "run_pool_and_finalize", _capture)
+
+    prepare_audio_dir_to_shar.run(spec)
+
+    assert captured["mp_start_method"] == "fork"
+    assert len(captured["worker_args"]) == 1
+    assert len(captured["worker_args"][0]) == 15
+    assert prepare_audio_dir_to_shar._AUDIO_INDEX is None
+
+
 def test_wds_cli_args_round_trip_to_spec():
     args = prepare_wds_to_shar.build_parser().parse_args([
         "--wds-shards", "/data/*.tar",
@@ -874,6 +1102,7 @@ def test_run_convert_resume_false_removes_existing_output_dir(tmp_path, monkeypa
         @staticmethod
         def run(prepare_spec):
             captured["exists_on_entry"] = Path(prepare_spec.output.shar_dir).exists()
+            _write_cut_shar_index(Path(prepare_spec.output.shar_dir))
             return {"ran": True}
 
     monkeypatch.setattr(
@@ -886,7 +1115,7 @@ def test_run_convert_resume_false_removes_existing_output_dir(tmp_path, monkeypa
     result = convert_stage.run_convert(spec, resume=False)
     assert result == {"ran": True}
     assert captured["exists_on_entry"] is False
-    assert out.exists() is False
+    assert (out / "_shar_work_manifest.json").is_file()
 
 
 def test_split_command_defaults_to_run():

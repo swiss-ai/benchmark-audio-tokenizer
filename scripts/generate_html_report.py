@@ -17,9 +17,6 @@ from audio_tokenization.contracts import InferenceRun, read_inference_run
 
 
 _AUDIO_MIME = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".flac": "audio/flac"}
-# v1 fallback only: probed extensions when audio_uri is missing. v2 readers
-# never hit this list.
-_LEGACY_EXT_PROBES = (".wav", ".mp3", ".flac")
 
 # Task → (subtitle shown next to the task badge, label of the reference column).
 # Reference column meaning differs per task: it's the ground-truth transcript
@@ -92,9 +89,8 @@ def resolve_audio_src(
         basenames across different source dirs, a copy/bundle step that
         rewrites paths is needed.
 
-    v1 legacy (``audio_uri is None``): probe ``wav_root/ds_name`` for
-    ``{sample_id}.{wav|mp3|flac}`` then ``sample_{i}.{wav|mp3|flac}``. This
-    path exists only for files written before schema v2.
+    Records without ``audio_uri`` have no portable source location and render
+    without an audio element. Regenerate the inference JSON if audio is needed.
     """
     if record.audio_uri:
         if embed:
@@ -103,14 +99,6 @@ def resolve_audio_src(
             return _embed_b64(record.audio_uri)
         basename = os.path.basename(record.audio_uri)
         return f"{audio_url_prefix}/{ds_name}/{basename}"
-
-    for name in (record.sample_id, f"sample_{sample_idx}"):
-        for ext in _LEGACY_EXT_PROBES:
-            candidate = os.path.join(wav_root, ds_name, name + ext)
-            if os.path.isfile(candidate):
-                if embed:
-                    return _embed_b64(candidate)
-                return f"{audio_url_prefix}/{ds_name}/{name + ext}"
     return ""
 
 

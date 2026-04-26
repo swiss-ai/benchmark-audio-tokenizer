@@ -375,7 +375,7 @@ rank_0000_chunk_0000.idx  # doc index</code></pre>
 <div class="vflow">
   <div class="flow-box green" style="min-width:380px;">
     <b>build_cutset()</b>
-    <small>Load shar_index.json &rarr; CutSet.from_shar() &rarr; round-robin split across ranks &rarr; filter (sr, duration)</small>
+    <small>Read _tokenize_assignment.json &rarr; load planned SHAR fields &rarr; filter (sr, duration, rms)</small>
   </div>
   <div class="fa">&darr;</div>
   <div class="flow-box blue" style="min-width:380px;">
@@ -432,7 +432,7 @@ rank_0000_chunk_0000.idx  # doc index</code></pre>
 </div>
 
 <div style="text-align:center; font-size:0.8rem; color:var(--text-dim); margin:0.5rem 0;">
-  Shard assignment: <code>shards[rank::world_size]</code> &mdash; each rank reads/writes independently
+  Shard assignment: <code>_shar_work_manifest.json</code> &rarr; duration-aware <code>_tokenize_assignment.json</code>; each rank reads/writes independently
 </div>
 
 <div class="cards" style="grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));">
@@ -491,9 +491,9 @@ rank_0000_chunk_0000.idx  # doc index</code></pre>
 <div class="arch">
   <div class="arch-col">
     <h4>Entry &amp; Config</h4>
-    <span class="f">tokenize.py <span>Hydra entry</span></span>
-    <span class="f">configs/config.yaml <span>defaults</span></span>
-    <span class="f">configs/dataset/**/*.yaml <span>per-dataset</span></span>
+    <span class="f">__main__.py <span>unified CLI</span></span>
+    <span class="f">configs/pipeline/config.yaml <span>composition root</span></span>
+    <span class="f">configs/pipeline/dataset/*.yaml <span>typed dataset specs</span></span>
   </div>
   <div class="arch-col">
     <h4>Pipeline (pipelines/lhotse/)</h4>
@@ -528,24 +528,19 @@ rank_0000_chunk_0000.idx  # doc index</code></pre>
 <!-- ================================================================ -->
 <h2>11. Quick Reference</h2>
 
-<pre><code># Step 1: Prepare Shar (includes text tokenization)
-python -m audio_tokenization.utils.prepare_data.prepare_wds_to_shar \
+<pre><code># Step 1: Convert to Shar (includes text tokenization)
+python -m audio_tokenization.prepare.prepare_wds_to_shar \
     --wds-shards '/data/shards/*.tar' \
     --shar-dir /output/shar \
     --text-tokenizer /path/to/tokenizer.json \
     --target-sr 24000 --num-workers 32
 
-# Step 2: GPU Tokenize (direct)
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
-    -m audio_tokenization.tokenize \
-    dataset=audio_text/emilia_yodas_isolated \
-    mode=audio_text audio_text_format=direct audio_text_task=transcribe
+# Step 2: GPU Tokenize
+srun --ntasks-per-node=4 --gpus-per-node=4 --kill-on-bad-exit=0 \
+    python -m audio_tokenization run dataset=infore2 stage=tokenize
 
-# Step 2: GPU Tokenize (interleaved)
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
-    -m audio_tokenization.tokenize \
-    dataset=audio_text/emilia_yodas_interleaved \
-    mode=audio_text audio_text_format=interleaved
+# Step 3: Materialize interleave product
+python -m audio_tokenization run dataset=infore2 stage=materialize
 
 # Verify: decode a sample back to audio
 python -c "

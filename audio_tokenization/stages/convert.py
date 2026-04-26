@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import glob
 import importlib
 import json
 import logging
@@ -11,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from audio_tokenization.config.schema import DatasetSpec, PrepareSpec
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
+from audio_tokenization.prepare.cli import expand_path_patterns
 from audio_tokenization.prepare.constants import PREPARE_STATE_FILE, SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.runtime import resolve_num_workers, validate_prepare_runtime
 from audio_tokenization.stages._plans import ResolvedStagePlan, disabled_stage_plan
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_convert_plan(spec: DatasetSpec) -> ResolvedStagePlan:
-    if not spec.convert.enabled:
+    if spec.convert is None or not spec.convert.enabled:
         return disabled_stage_plan(stage="convert", reason="convert.disabled")
 
     prepare_spec = _resolve_prepare_spec(spec.convert)
@@ -59,7 +60,7 @@ def resolve_convert_plan(spec: DatasetSpec) -> ResolvedStagePlan:
 
 
 def run_convert(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
-    if not spec.convert.enabled:
+    if spec.convert is None or not spec.convert.enabled:
         return {"skipped": True, "reason": "convert.disabled"}
 
     # Skip BEFORE plan resolution so a completed convert can be reused on
@@ -76,6 +77,7 @@ def run_convert(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
         logger=logger,
     )
     if skipped is not None:
+        _ensure_convert_shar_manifest(spec.convert)
         return skipped
 
     plan = resolve_convert_plan(spec)
@@ -113,8 +115,8 @@ def _resolve_convert_inputs(spec: PrepareSpec) -> tuple[list[str], dict[str, Any
         }
     if spec.family == "hf":
         if i.arrow_files:
-            resolved = sorted(i.arrow_files)
-            source = {"arrow_files": resolved}
+            resolved = expand_path_patterns(i.arrow_files)
+            source = {"arrow_files": list(i.arrow_files)}
         elif i.arrow_dir:
             arrow_dir = Path(i.arrow_dir)
             resolved = sorted(str(p) for p in arrow_dir.glob(i.arrow_glob))
@@ -129,7 +131,7 @@ def _resolve_convert_inputs(spec: PrepareSpec) -> tuple[list[str], dict[str, Any
             "resolved_inputs": resolved,
         }
     if spec.family == "wds":
-        resolved = sorted(set(p for pattern in i.wds_shards for p in glob.glob(pattern)))
+        resolved = expand_path_patterns(i.wds_shards)
         if not resolved:
             raise FileNotFoundError(f"No files match patterns: {i.wds_shards}")
         return resolved, {
@@ -138,9 +140,9 @@ def _resolve_convert_inputs(spec: PrepareSpec) -> tuple[list[str], dict[str, Any
             "resolved_inputs": resolved,
         }
     if spec.family == "audio_dir":
-        resolved = sorted(i.jsonl_files)
+        resolved = expand_path_patterns(i.jsonl_files)
         if not resolved:
-            raise FileNotFoundError("No JSONL files provided")
+            raise FileNotFoundError(f"No files match patterns: {i.jsonl_files}")
         return resolved, {
             "family": spec.family,
             "audio_root": i.audio_root,
@@ -264,10 +266,49 @@ def _execute_convert_plan(spec: PrepareSpec, *, resume: bool) -> dict[str, Any]:
         logger=logger,
     )
     if skipped is not None:
+        _ensure_convert_shar_manifest(spec)
         return skipped
 
     if not resume and shar_dir.is_dir():
         logger.warning("Removing %s for resume=false re-run.", shar_dir)
         shutil.rmtree(shar_dir)
     runner = importlib.import_module(_DISPATCH[spec.family]).run
-    return runner(spec) or {}
+    result = runner(spec) or {}
+    _ensure_convert_shar_manifest(spec)
+    return result
+
+
+def _ensure_convert_shar_manifest(spec: PrepareSpec) -> None:
+    """Backfill the durable SHAR manifest after convert success or resume skip.
+
+    Prepare runners are still family-specific, so the stage adapter owns the
+    cross-family handoff contract: every completed SHAR root should expose
+    ``_shar_work_manifest.json`` for tokenization planning, regardless of
+    whether the run was fresh or skipped by resume.
+    """
+
+    from audio_tokenization.pipelines.lhotse.planning import (
+        SHAR_WORK_MANIFEST_FILE,
+        write_shar_work_manifest,
+    )
+
+    shar_dir = Path(spec.output.shar_dir)
+    manifest_path = shar_dir / SHAR_WORK_MANIFEST_FILE
+    if manifest_path.is_file():
+        return
+    manifest = write_shar_work_manifest(
+        shar_dir,
+        index_name=_convert_shar_index_filename(spec),
+    )
+    logger.info(
+        "Wrote SHAR work manifest at %s: work_units=%s hours=%.2f",
+        manifest_path,
+        len(manifest.work_units),
+        sum(unit.duration_sec for unit in manifest.work_units) / 3600.0,
+    )
+
+
+def _convert_shar_index_filename(spec: PrepareSpec) -> str:
+    if spec.family == "lhotse_recipe":
+        return spec.input.shar_index_filename
+    return SHAR_INDEX_FILENAME

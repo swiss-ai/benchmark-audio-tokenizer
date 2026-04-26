@@ -31,22 +31,27 @@ from pathlib import Path
 from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
+    write_cut_to_shar,
 )
 from audio_tokenization.prepare.cli import (
     add_audio_processing_args,
     add_external_metadata_args,
     add_parallelism_args,
     add_shar_output_args,
+    expand_path_patterns,
 )
 from audio_tokenization.prepare.columnar import (
     add_columnar_metadata_args,
+    ColumnarWorkerArgs,
+    external_metadata_lookup_id,
+    extract_clip_timestamps,
+    extract_interleave_identity,
     extract_row_metadata,
     validate_columnar_schema_roots,
 )
 from audio_tokenization.prepare.identity import (
     add_input_clip_id_parser_arg,
-    resolve_input_source_and_clip_num,
-    set_universal_cut_id,
+    set_interleave_metadata,
 )
 from audio_tokenization.prepare.metadata import (
     load_external_metadata,
@@ -84,31 +89,37 @@ _EXTERNAL_METADATA = None
 _DEFAULT_READ_BATCH_SIZE = 256
 
 
-def _convert_worker(args_tuple):
+def _convert_worker(args: ColumnarWorkerArgs):
     """Convert rows from assigned arrow files to Shar.
 
     Each worker writes to its own ``worker_XX/`` directory. Resume is complete
     only when ``worker_XX/_SUCCESS`` exists.
     """
-    (
-        worker_id,
-        arrow_paths,
-        shar_dir,
-        target_sr,
-        shard_size,
-        shar_format,
-        id_column,
-        audio_column,
-        text_column,
-        language_column,
-        language,
-        custom_columns,
-        text_tokenize_custom_columns,
-        text_tokenizer,
-        resampling_backend,
-        input_clip_id_parser_name,
-        read_batch_size,
-    ) = args_tuple
+    worker_id = args.worker_id
+    arrow_paths = args.input_paths
+    shar_dir = args.shar_dir
+    target_sr = args.target_sr
+    shard_size = args.shard_size
+    shar_format = args.shar_format
+    id_column = args.id_column
+    id_prefix = args.id_prefix
+    audio_column = args.audio_column
+    text_column = args.text_column
+    language_column = args.language_column
+    language = args.language
+    custom_columns = args.custom_columns
+    constant_custom = args.constant_custom
+    derived_custom = args.derived_custom
+    text_tokenize_custom_columns = args.text_tokenize_custom_columns
+    text_tokenizer = load_text_tokenizer(args.text_tokenizer_path)
+    resampling_backend = args.resampling_backend
+    input_clip_id_parser_name = args.input_clip_id_parser_name
+    source_id_column = args.source_id_column
+    clip_num_column = args.clip_num_column
+    clip_start_column = args.clip_start_column
+    clip_end_column = args.clip_end_column
+    clip_duration_column = args.clip_duration_column
+    read_batch_size = args.read_batch_size
 
     reused = check_worker_reuse(worker_id, shar_dir)
     if reused is not None:
@@ -142,15 +153,19 @@ def _convert_worker(args_tuple):
             logger.info(f"Worker {worker_id}: reading {arrow_name}")
             row_idx = 0
             for row in iter_arrow_rows(arrow_path, batch_size=read_batch_size):
-                fallback_id = f"{arrow_stem}_{row_idx}" if not id_column else None
+                current_row_idx = row_idx
+                fallback_id = f"{arrow_stem}_{current_row_idx}" if not id_column else None
                 row_idx += 1
                 row_id, default_text, lang, custom = extract_row_metadata(
                     row,
                     id_column=id_column,
+                    id_prefix=id_prefix,
                     text_column=text_column,
                     language_column=language_column,
                     language=language,
                     custom_columns=custom_columns,
+                    constant_custom=constant_custom,
+                    derived_custom=derived_custom,
                     fallback_id=fallback_id,
                 )
                 try:
@@ -169,7 +184,7 @@ def _convert_worker(args_tuple):
                     cut = recording.to_cut()
 
                     text, custom = resolve_sample_text_and_custom(
-                        row_id,
+                        external_metadata_lookup_id(row_id, id_prefix),
                         default_text=default_text,
                         default_custom=custom,
                         external_metadata=external_metadata,
@@ -187,7 +202,7 @@ def _convert_worker(args_tuple):
                             language=lang,
                         )]
 
-                    cut, skip = apply_audio_pipeline(
+                    cut, skip, decoded_audio = apply_audio_pipeline(
                         cut,
                         target_sr=target_sr,
                         tokenize_fn=_tokenize_text,
@@ -197,17 +212,37 @@ def _convert_worker(args_tuple):
                         skipped += 1
                         continue
 
-                    source_id, clip_num = resolve_input_source_and_clip_num(
-                        row_id,
+                    clip_start_val, clip_duration_val = extract_clip_timestamps(
+                        row,
+                        clip_start_column=clip_start_column,
+                        clip_end_column=clip_end_column,
+                        clip_duration_column=clip_duration_column,
+                    )
+                    source_id, clip_num = extract_interleave_identity(
+                        row,
+                        row_id=row_id,
+                        # HF/Arrow rows are already prepared clips. The row
+                        # counter is only for fallback IDs, not chunk numbering.
+                        chunk_idx=0,
+                        source_id_column=source_id_column,
+                        clip_num_column=clip_num_column,
+                        clip_start=clip_start_val,
+                        clip_duration=clip_duration_val,
                         input_clip_id_parser=input_clip_id_parser,
                     )
-                    set_universal_cut_id(
+                    set_interleave_metadata(
                         cut,
                         source_id,
                         clip_num,
-                        clip_start=getattr(cut, "start", 0.0),
+                        clip_start=clip_start_val,
+                        clip_duration=clip_duration_val,
                     )
-                    writer.write(cut)
+                    write_cut_to_shar(
+                        writer,
+                        cut,
+                        audio=decoded_audio,
+                        runtime_counts=runtime_counts,
+                    )
                     written += 1
                     total_duration_sec += cut.duration
 
@@ -247,7 +282,15 @@ def _preflight_prepare(spec, resolved: list[str]) -> None:
 
     validate_columnar_schema_roots(
         available_roots=schema_names,
-        required_columns=(m.audio_column, m.id_column),
+        required_columns=(
+            m.audio_column,
+            m.id_column,
+            getattr(m, "source_id_column", None),
+            getattr(m, "clip_num_column", None),
+            getattr(m, "clip_start_column", None),
+            getattr(m, "clip_end_column", None),
+            getattr(m, "clip_duration_column", None),
+        ),
         optional_columns=(
             m.text_column,
             m.language_column,
@@ -306,7 +349,7 @@ def run(spec):
     shar_dir = Path(o.shar_dir)
 
     if i.arrow_files:
-        resolved = sorted(i.arrow_files)
+        resolved = expand_path_patterns(i.arrow_files)
     elif i.arrow_dir:
         resolved = sorted(str(p) for p in Path(i.arrow_dir).glob(i.arrow_glob))
     else:
@@ -327,8 +370,6 @@ def run(spec):
     logger.info(f"Output: {shar_dir}")
 
     worker_arrows = distribute_round_robin(resolved, num_workers)
-    text_tokenizer = load_text_tokenizer(o.text_tokenizer)
-
     global _EXTERNAL_METADATA
     if m.external_metadata:
         _EXTERNAL_METADATA = load_external_metadata(
@@ -344,24 +385,37 @@ def run(spec):
         mp_start_method = "forkserver"
 
     worker_args = [
-        (
-            wid,
-            arrows,
-            str(shar_dir),
-            o.target_sr,
-            o.shard_size,
-            o.shar_format,
-            m.id_column,
-            m.audio_column,
-            m.text_column,
-            m.language_column,
-            m.language,
-            m.custom_columns or None,
-            m.text_tokenize_custom_columns or None,
-            text_tokenizer,
-            o.resampling_backend,
-            m.input_clip_id_parser,
-            o.read_batch_size,
+        ColumnarWorkerArgs(
+            worker_id=wid,
+            input_paths=tuple(arrows),
+            shar_dir=str(shar_dir),
+            target_sr=o.target_sr,
+            shard_size=o.shard_size,
+            shar_format=o.shar_format,
+            id_column=tuple(m.id_column) if isinstance(m.id_column, list) else m.id_column,
+            id_prefix=m.id_prefix,
+            audio_column=m.audio_column,
+            text_column=m.text_column,
+            duration_column=None,
+            language_column=m.language_column,
+            language=m.language,
+            custom_columns=tuple(m.custom_columns) if m.custom_columns else None,
+            constant_custom=dict(m.constant_custom),
+            derived_custom=dict(m.derived_custom),
+            text_tokenize_custom_columns=(
+                tuple(m.text_tokenize_custom_columns)
+                if m.text_tokenize_custom_columns
+                else None
+            ),
+            text_tokenizer_path=o.text_tokenizer,
+            resampling_backend=o.resampling_backend,
+            input_clip_id_parser_name=m.input_clip_id_parser,
+            source_id_column=m.source_id_column,
+            clip_num_column=m.clip_num_column,
+            clip_start_column=m.clip_start_column,
+            clip_end_column=m.clip_end_column,
+            clip_duration_column=m.clip_duration_column,
+            read_batch_size=o.read_batch_size,
         )
         for wid, arrows in enumerate(worker_arrows)
         if arrows
@@ -399,10 +453,18 @@ def _args_to_spec(args):
         "metadata": {
             "audio_column": args.audio_column,
             "text_column": args.text_column,
+            "source_id_column": args.source_id_column,
+            "clip_num_column": args.clip_num_column,
+            "clip_start_column": args.clip_start_column,
+            "clip_end_column": args.clip_end_column,
+            "clip_duration_column": args.clip_duration_column,
             "id_column": args.id_column,
+            "id_prefix": None,
             "language_column": args.language_column,
             "language": args.language,
             "custom_columns": args.custom_columns or [],
+            "constant_custom": {},
+            "derived_custom": {},
             "text_tokenize_custom_columns": args.text_tokenize_custom_columns or [],
             "external_metadata": args.external_metadata,
             "custom_fields": args.custom_fields or [],

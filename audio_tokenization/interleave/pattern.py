@@ -72,6 +72,7 @@ from audio_tokenization.interleave.common import (
     prepare_interleave_cache_and_runs,
     prepare_length_metadata,
 )
+from audio_tokenization.utils.io import atomic_write_json
 
 # ---------------------------------------------------------------------------
 # Module-level globals for fork-based sharing (set before Pool creation)
@@ -984,8 +985,7 @@ def main() -> None:
         print(f"  {key}: {c['seqs']:,} sequences, {c['tokens']:,} tokens")
 
     metadata_path = output_dir / "metadata.json"
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+    atomic_write_json(metadata_path, metadata)
     print(f"\nMetadata written to {metadata_path}")
     print("Done.")
 

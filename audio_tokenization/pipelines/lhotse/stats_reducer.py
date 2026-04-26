@@ -10,10 +10,11 @@ CLI for recomputing summaries on old runs::
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from pathlib import Path
+
+from audio_tokenization.utils.io import atomic_write_json
+from audio_tokenization.utils.stats import load_json_records, max_field, sum_mapped_fields
 
 logger = logging.getLogger(__name__)
 
@@ -29,41 +30,20 @@ _SUM_FIELDS = (
 )
 
 
-def _atomic_json_write(path: Path, data: dict) -> None:
-    """Write JSON atomically via tmp + rename."""
-    tmp = path.with_suffix(f".tmp.{os.getpid()}")
-    try:
-        tmp.write_text(json.dumps(data, indent=2, default=str))
-        os.replace(tmp, path)
-    except BaseException:
-        if tmp.exists():
-            tmp.unlink()
-        raise
-
-
 def load_rank_stats(output_dir: Path) -> list[dict]:
     """Load all ``rank_XXXX_stats.json`` files, sorted by rank."""
-    stats = []
-    for f in sorted(output_dir.glob("rank_*_stats.json")):
-        try:
-            record = json.loads(f.read_text())
-            if "rank" in record:
-                stats.append(record)
-        except Exception:
-            logger.debug("Failed to read %s", f, exc_info=True)
-    return stats
+    return load_json_records(
+        sorted(output_dir.glob("rank_*_stats.json")),
+        required_key="rank",
+        logger=logger,
+    )
 
 
 def build_aggregate(rank_stats: list[dict]) -> dict:
     """Aggregate per-rank stats in a single pass."""
-    agg = {out_key: 0 for out_key, _ in _SUM_FIELDS}
+    agg = sum_mapped_fields(rank_stats, _SUM_FIELDS)
     agg["num_ranks"] = len(rank_stats)
-    max_elapsed = 0.0
-
-    for s in rank_stats:
-        for out_key, src_key in _SUM_FIELDS:
-            agg[out_key] += s.get(src_key, 0)
-        max_elapsed = max(max_elapsed, s.get("elapsed_time", 0))
+    max_elapsed = max_field(rank_stats, "elapsed_time")
 
     agg["total_tokens"] = agg["audio_tokens"] + agg["text_tokens"]
     agg["max_elapsed_s"] = max_elapsed
@@ -79,21 +59,39 @@ def write_rank_stats(output_dir: str | Path, result: dict) -> Path:
     output_dir = Path(output_dir)
     rank = result.get("rank", 0)
     stats_path = output_dir / f"rank_{rank:04d}_stats.json"
-    _atomic_json_write(stats_path, result)
+    atomic_write_json(stats_path, result, sort_keys=False)
     return stats_path
 
 
-def maybe_write_stats_summary(
+def maybe_publish_terminal_artifacts(
     output_dir: str | Path,
     expected_ranks: int,
 ) -> dict | None:
-    """Write summary if all ranks have reported. Returns None if not ready."""
+    """Convoy-leader publish: write ``stats_summary.json`` and, if every rank
+    reported ``success=True``, the partition ``_SUCCESS`` marker.
+
+    Each rank calls this after ``write_rank_stats``. The single rank whose
+    call observes that all ranks have reported wins the race and publishes
+    both artifacts. ``_SUCCESS`` is never written when any rank's stats
+    record ``success=False``; the failed rank's process re-raises so the
+    job exit code signals failure.
+    """
     output_dir = Path(output_dir)
     rank_stats = load_rank_stats(output_dir)
     if len(rank_stats) < expected_ranks:
         return None
     aggregate = build_aggregate(rank_stats)
-    _atomic_json_write(output_dir / "stats_summary.json", aggregate)
+    atomic_write_json(output_dir / "stats_summary.json", aggregate, sort_keys=False)
+    if all(s.get("success") is True for s in aggregate["per_rank"]):
+        from audio_tokenization.prepare.runtime import mark_partition_success
+
+        mark_partition_success(output_dir)
+    else:
+        failed = [s.get("rank") for s in aggregate["per_rank"] if s.get("success") is not True]
+        logger.warning(
+            "Skipping _SUCCESS publication; ranks reported failure: %s",
+            failed,
+        )
     return aggregate
 
 
@@ -119,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     aggregate = build_aggregate(rank_stats)
-    _atomic_json_write(output_dir / "stats_summary.json", aggregate)
+    atomic_write_json(output_dir / "stats_summary.json", aggregate, sort_keys=False)
 
     print(f"  Ranks: {aggregate['num_ranks']}")
     print(f"  Samples: {aggregate['samples_processed']:,}")

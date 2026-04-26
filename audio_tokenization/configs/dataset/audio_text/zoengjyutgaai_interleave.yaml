@@ -1,7 +1,0 @@
-dataset_name: zoengjyutgaai
-output_name: zoengjyutgaai_interleave
-
-shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/zoengjyutgaai_train
-
-num_buckets: 20

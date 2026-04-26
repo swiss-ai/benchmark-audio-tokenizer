@@ -1,0 +1,12 @@
+defaults:
+  - _common
+  - _self_
+
+family: hf
+input:
+  arrow_dir: null
+  arrow_glob: "*.arrow"
+  arrow_files: null
+output:
+  # Site override: pin the Alps wheelhouse tokenizer for in-cluster runs.
+  text_tokenizer: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json

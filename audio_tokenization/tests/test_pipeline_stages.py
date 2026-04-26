@@ -9,11 +9,14 @@ lives in its own test file.
 from __future__ import annotations
 
 import copy
+import gzip
 import json
+from pathlib import Path
 
 import pytest
 
 from audio_tokenization.config import load_dataset_spec
+from audio_tokenization.pipelines.shard_io import INTERLEAVE_CACHE_OUTPUT_STEM
 from audio_tokenization.stages import clean_stages, plan_stages, run_stages, status_stages
 
 
@@ -67,7 +70,10 @@ def test_run_stages_materialize_disabled_by_default():
     as a no-op, not raise. Replaces the old step-5 placeholder test."""
     result = run_stages(_disabled_parquet_spec(), stage="materialize")
     assert result == {
-        "materialize": {"interleave": {"skipped": True, "reason": "interleave.disabled"}}
+        "materialize": {
+            "interleave": {"skipped": True, "reason": "interleave.disabled"},
+            "sft": {"skipped": True, "reason": "sft.disabled"},
+        }
     }
 
 
@@ -91,6 +97,38 @@ def test_clean_stages_removes_resolved_tokenize_output_dir(tmp_path):
     assert not output_dir.exists()
 
 
+def test_run_with_resume_false_removes_drifted_state_before_validation(tmp_path):
+    from audio_tokenization.prepare.runtime import validate_or_write_prepare_state
+    from audio_tokenization.stages._resume import run_with_resume
+
+    output_dir = tmp_path / "stage_out"
+    output_dir.mkdir()
+    stale_file = output_dir / "stale.bin"
+    stale_file.write_text("stale\n")
+    validate_or_write_prepare_state(
+        output_dir / "state.json",
+        expected={"num_buckets": 20},
+        invariant_keys=("num_buckets",),
+        guidance="test",
+    )
+
+    result = run_with_resume(
+        output_dir=output_dir,
+        state_filename="state.json",
+        fingerprint={"num_buckets": 4},
+        guidance="test",
+        stage_label="tokenize",
+        resume=False,
+        work=lambda: {"ran": True},
+        logger=__import__("logging").getLogger(__name__),
+    )
+
+    assert result["skipped"] is False
+    assert result["ran"] is True
+    assert not stale_file.exists()
+    assert json.loads((output_dir / "state.json").read_text())["num_buckets"] == 4
+
+
 @pytest.mark.parametrize("alias", ["prepare", "products"])
 def test_run_stages_rejects_legacy_stage_names(alias):
     with pytest.raises(ValueError, match=f"Unknown stage {alias!r}"):
@@ -108,6 +146,37 @@ def _base_convert_payload():
         "input": {"parquet_dir": "/tmp/in"},
         "output": {"shar_dir": "/tmp/out", "shard_size": 2000},
     }
+
+
+def _write_cut_shar_index(shar_dir, durations=(10.0,)):
+    shar_dir.mkdir(parents=True, exist_ok=True)
+    cut_paths = []
+    for idx, duration in enumerate(durations):
+        name = f"cuts.{idx:06d}.jsonl.gz"
+        cut_paths.append(name)
+        with gzip.open(shar_dir / name, "wt") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "id": f"cut-{idx}",
+                        "duration": duration,
+                        "recording": {"sampling_rate": 24000},
+                        "custom": {
+                            "rms_db": -20.0,
+                            "interleave": {
+                                "source_id": "source",
+                                "clip_num": idx,
+                                "clip_start": float(idx),
+                                "clip_duration": duration,
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            )
+    (shar_dir / "shar_index.json").write_text(
+        json.dumps({"fields": {"cuts": cut_paths}}) + "\n"
+    )
 
 
 def test_run_stages_convert_short_circuits_when_marker_and_state_match(tmp_path, monkeypatch):
@@ -128,7 +197,7 @@ def test_run_stages_convert_short_circuits_when_marker_and_state_match(tmp_path,
     # parquets aren't mounted on this node (the resume-on-different-node
     # scenario).
     shar_dir = tmp_path / "out"
-    shar_dir.mkdir()
+    _write_cut_shar_index(shar_dir)
     spec = load_dataset_spec({
         "name": "d",
         "convert": {
@@ -157,6 +226,22 @@ def test_run_stages_convert_short_circuits_when_marker_and_state_match(tmp_path,
 def test_tokenize_section_absent_yields_none():
     spec = load_dataset_spec({"name": "d", "convert": _base_convert_payload()})
     assert spec.tokenize is None
+
+
+def test_partial_tokenize_spec_does_not_require_convert_section():
+    spec = load_dataset_spec(
+        {
+            "name": "tokenize_only",
+            "tokenize": {
+                "input_shar_dir": ["/tmp/shar"],
+                "tokenizer": {"path": "/tmp/tokenizer"},
+                "output": {"output_dir": "/tmp/out"},
+            },
+        }
+    )
+
+    assert spec.convert is None
+    assert spec.tokenize.input_shar_dir == ["/tmp/shar"]
 
 
 def test_tokenize_minimal_requires_tokenizer_path_and_output_dir():
@@ -250,6 +335,44 @@ def test_tokenize_sampling_rate_null_preserved_as_none():
         }
     )
     assert spec.tokenize.tokenizer.sampling_rate is None
+
+
+def test_tokenize_rejects_legacy_normalize_rms_db_key():
+    with pytest.raises(ValueError, match="normalize_rms_db"):
+        load_dataset_spec(
+            {
+                "name": "d",
+                "convert": _base_convert_payload(),
+                "tokenize": {
+                    "tokenizer": {"path": "/t"},
+                    "output": {"output_dir": "/o"},
+                    "filter": {"normalize_rms_db": -3},
+                },
+            }
+        )
+
+
+def test_interleaved_tokenize_uses_structured_cache_partitioning():
+    spec = load_dataset_spec(
+        {
+            "name": "d",
+            "convert": _base_convert_payload(),
+            "tokenize": {
+                "tokenizer": {"path": "/t"},
+                "output": {"output_dir": "/o"},
+                "mode": "audio_text",
+                "audio_text_format": "interleaved",
+            },
+        }
+    )
+
+    fp = spec.tokenize.fingerprint_payload()
+    assert "cache_layout_version" not in fp
+    assert fp["partitioning"] == {
+        "type": "hash",
+        "field": "source_id",
+        "num_buckets": 16,
+    }
 
 
 def test_tokenize_fingerprint_excludes_operational_knobs():
@@ -381,7 +504,7 @@ def test_run_tokenize_skips_prepare_check_when_input_shar_dir_explicit(tmp_path,
     from audio_tokenization.stages.tokenize import run_tokenize
 
     external_shar = tmp_path / "external_shar"
-    external_shar.mkdir()  # no _SUCCESS; adapter should NOT complain
+    _write_cut_shar_index(external_shar)  # no _SUCCESS; adapter should NOT complain
 
     payload = _tokenize_spec_payload(str(tmp_path / "our_prepare"), str(tmp_path / "out"))
     payload["tokenize"]["input_shar_dir"] = [str(external_shar)]
@@ -390,9 +513,10 @@ def test_run_tokenize_skips_prepare_check_when_input_shar_dir_explicit(tmp_path,
     # Stub out the heavy pipeline so we only exercise control flow.
     captured: dict = {}
 
-    def fake_run(pipeline_cfg):
-        captured["cfg"] = pipeline_cfg
-        return {"samples_processed": 0, "tokens_generated": 0, "output_dir": pipeline_cfg["output_dir"]}
+    def fake_run(tokenize_spec, **kwargs):
+        captured["spec"] = tokenize_spec
+        captured["kwargs"] = kwargs
+        return {"samples_processed": 0, "tokens_generated": 0, "output_dir": str(kwargs["final_output_dir"])}
 
     monkeypatch.setattr(
         "audio_tokenization.stages.tokenize._invoke_pipeline", fake_run
@@ -400,11 +524,298 @@ def test_run_tokenize_skips_prepare_check_when_input_shar_dir_explicit(tmp_path,
 
     result = run_tokenize(spec, resume=False)
     assert result["skipped"] is False
-    assert captured["cfg"]["shar_dir"] == [str(external_shar)]
+    assert captured["kwargs"]["input_shar_dirs"] == [str(external_shar)]
+
+
+def test_run_tokenize_expands_explicit_shar_dir_glob(tmp_path, monkeypatch):
+    from audio_tokenization.stages.tokenize import run_tokenize
+
+    node_02 = tmp_path / "node_02"
+    node_01 = tmp_path / "node_01"
+    _write_cut_shar_index(node_02)
+    _write_cut_shar_index(node_01)
+
+    payload = _tokenize_spec_payload(str(tmp_path / "our_prepare"), str(tmp_path / "out"))
+    payload["tokenize"]["input_shar_dir"] = [str(tmp_path / "node_*")]
+    spec = load_dataset_spec(payload)
+
+    captured: dict = {}
+
+    def fake_run(tokenize_spec, **kwargs):
+        captured["spec"] = tokenize_spec
+        captured["kwargs"] = kwargs
+        return {"samples_processed": 0, "tokens_generated": 0, "output_dir": str(kwargs["final_output_dir"])}
+
+    monkeypatch.setattr(
+        "audio_tokenization.stages.tokenize._invoke_pipeline", fake_run
+    )
+
+    result = run_tokenize(spec, resume=False)
+    assert result["skipped"] is False
+    assert captured["kwargs"]["input_shar_dirs"] == [str(node_01), str(node_02)]
+
+
+def test_run_tokenize_expands_partitioned_convert_root(tmp_path, monkeypatch):
+    from audio_tokenization.prepare.runtime import mark_partition_success
+    from audio_tokenization.stages.tokenize import run_tokenize
+
+    root = tmp_path / "partitioned_shar"
+    node_00 = root / "node_00"
+    node_01 = root / "node_01"
+    _write_cut_shar_index(node_00)
+    _write_cut_shar_index(node_01)
+    mark_partition_success(node_00)
+    mark_partition_success(node_01)
+
+    spec = load_dataset_spec(_tokenize_spec_payload(str(root), str(tmp_path / "out")))
+
+    captured: dict = {}
+
+    def fake_run(tokenize_spec, **kwargs):
+        captured["spec"] = tokenize_spec
+        captured["kwargs"] = kwargs
+        return {"samples_processed": 0, "tokens_generated": 0, "output_dir": str(kwargs["final_output_dir"])}
+
+    monkeypatch.setattr(
+        "audio_tokenization.stages.tokenize._invoke_pipeline", fake_run
+    )
+
+    result = run_tokenize(spec, resume=False)
+    assert result["skipped"] is False
+    assert captured["kwargs"]["input_shar_dirs"] == [str(node_00), str(node_01)]
+
+
+def test_run_tokenize_distributed_rank0_owns_cleanup_and_success(tmp_path, monkeypatch):
+    from audio_tokenization.prepare.runtime import (
+        mark_partition_success,
+        validate_or_write_prepare_state,
+    )
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
+    from audio_tokenization.stages.tokenize import (
+        TOKENIZE_START_FILE,
+        TOKENIZE_STATE_FILE,
+        run_tokenize,
+    )
+
+    shar_dir = tmp_path / "shar"
+    _write_cut_shar_index(shar_dir, durations=(10.0, 11.0, 12.0, 13.0))
+    mark_partition_success(shar_dir)
+
+    output_dir = tmp_path / "out"
+    spec = load_dataset_spec(_tokenize_spec_payload(str(shar_dir), str(output_dir)))
+    subdir = build_tokenize_output_subdir(spec.tokenize, dataset_name=spec.name)
+    final_dir = output_dir / subdir
+    final_dir.mkdir(parents=True)
+    stale_file = final_dir / "stale.bin"
+    stale_file.write_text("stale\n")
+    validate_or_write_prepare_state(
+        final_dir / TOKENIZE_STATE_FILE,
+        expected={"num_buckets": 999},
+        invariant_keys=("num_buckets",),
+        guidance="test",
+    )
+
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+
+    def stub_invoke(_spec, **kwargs):
+        # Simulate the convoy-leader contract: each rank writes its stats, the
+        # last rank publishes terminal artifacts (stats_summary + _SUCCESS).
+        # Here rank 0 plays the convoy leader by pre-populating the other
+        # ranks' stats first, then writing its own stats and triggering publish.
+        from audio_tokenization.pipelines.lhotse.stats_reducer import (
+            maybe_publish_terminal_artifacts,
+            write_rank_stats,
+        )
+
+        rank = kwargs["rank"]
+        world_size = kwargs["world_size"]
+        out = Path(kwargs["final_output_dir"])
+        for other in range(world_size):
+            if other == rank:
+                continue
+            write_rank_stats(out, {"rank": other, "success": True})
+        write_rank_stats(out, {"rank": rank, "success": True})
+        maybe_publish_terminal_artifacts(out, expected_ranks=world_size)
+        return {"rank": rank, "output_dir": str(out), "success": True}
+
+    monkeypatch.setattr(
+        "audio_tokenization.stages.tokenize._invoke_pipeline", stub_invoke
+    )
+
+    result = run_tokenize(spec, resume=False)
+
+    assert result["skipped"] is False
+    assert not stale_file.exists()
+    assert (final_dir / TOKENIZE_STATE_FILE).is_file()
+    assert json.loads((final_dir / TOKENIZE_STATE_FILE).read_text())["num_buckets"] == 20
+    assert (final_dir / TOKENIZE_START_FILE).is_file()
+    assert (final_dir / "_SUCCESS").is_file()
+
+
+def test_run_tokenize_distributed_nonzero_rank_does_not_cleanup(tmp_path, monkeypatch):
+    from audio_tokenization.prepare.runtime import mark_partition_success
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
+    from audio_tokenization.pipelines.lhotse.planning import (
+        TokenizeFilter,
+        build_shar_work_manifest,
+        build_tokenize_assignment,
+        write_tokenize_plan_artifacts,
+    )
+    from audio_tokenization.stages._provenance import (
+        build_tokenize_resume_fingerprint,
+        read_prepare_provenance,
+    )
+    from audio_tokenization.stages.tokenize import (
+        TOKENIZE_START_FILE,
+        _build_start_marker_payload,
+        run_tokenize,
+    )
+
+    shar_dir = tmp_path / "shar"
+    _write_cut_shar_index(shar_dir, durations=(10.0, 11.0, 12.0, 13.0))
+    mark_partition_success(shar_dir)
+
+    output_dir = tmp_path / "out"
+    spec = load_dataset_spec(_tokenize_spec_payload(str(shar_dir), str(output_dir)))
+    subdir = build_tokenize_output_subdir(spec.tokenize, dataset_name=spec.name)
+    final_dir = output_dir / subdir
+    final_dir.mkdir(parents=True)
+    stale_file = final_dir / "rank0-owned.bin"
+    stale_file.write_text("keep\n")
+    manifest = build_shar_work_manifest(
+        str(shar_dir),
+        tokenize_filter=TokenizeFilter(),
+    )
+    assignment = build_tokenize_assignment(manifest, world_size=4)
+    write_tokenize_plan_artifacts(
+        final_dir,
+        manifest=manifest,
+        assignment=assignment,
+    )
+    fingerprint = build_tokenize_resume_fingerprint(
+        spec,
+        input_shar_dirs=[str(shar_dir)],
+        prepare_provenance=read_prepare_provenance([str(shar_dir)]),
+    )
+    (final_dir / TOKENIZE_START_FILE).write_text(
+        json.dumps(_build_start_marker_payload(fingerprint, world_size=4)) + "\n"
+    )
+
+    monkeypatch.setenv("RANK", "2")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+
+    def fake_run(_spec, **kwargs):
+        assert stale_file.exists()
+        return {"rank": 2, "output_dir": str(kwargs["final_output_dir"])}
+
+    monkeypatch.setattr("audio_tokenization.stages.tokenize._invoke_pipeline", fake_run)
+
+    result = run_tokenize(spec, resume=False)
+
+    assert result["skipped"] is False
+    assert stale_file.exists()
+    assert not (final_dir / "_SUCCESS").exists()
+
+
+def test_read_prepare_provenance_tolerates_legacy_unversioned_state(tmp_path):
+    from audio_tokenization.stages._provenance import read_prepare_provenance
+
+    shar_dir = tmp_path / "legacy_shar"
+    shar_dir.mkdir()
+    legacy_state = {
+        "recipe": "commonvoice",
+        "corpus_dir": "/data/commonvoice24",
+        "split": "other",
+        "language": "de",
+    }
+    (shar_dir / "_PREPARE_STATE.json").write_text(json.dumps(legacy_state) + "\n")
+
+    provenance = read_prepare_provenance([str(shar_dir)])
+    payload = provenance[str(shar_dir)]
+
+    assert payload["provenance_format"] == "opaque_legacy_prepare_state"
+    assert payload["payload"] == legacy_state
+    assert len(payload["sha256"]) == 64
+
+
+def test_nonzero_rank_ignores_stale_tokenize_start_marker(tmp_path, monkeypatch):
+    from audio_tokenization.stages.tokenize import (
+        TOKENIZE_START_FILE,
+        _build_start_marker_payload,
+        _wait_for_rank0_tokenize_start,
+    )
+
+    final_dir = tmp_path / "out"
+    final_dir.mkdir()
+    start_marker = final_dir / TOKENIZE_START_FILE
+    fingerprint = {"tokenizer_path": "/tmp/tok", "resolved_input_shar_dirs": ["/tmp/shar"]}
+    monkeypatch.setenv("AUDIO_TOKENIZATION_RUN_ID", "fresh-run")
+    stale = _build_start_marker_payload(fingerprint, world_size=4)
+    stale["run_id"] = "old-run"
+    start_marker.write_text(json.dumps(stale) + "\n")
+    calls = {"sleep": 0}
+
+    def fake_sleep(_seconds):
+        calls["sleep"] += 1
+        if calls["sleep"] == 1:
+            fresh = _build_start_marker_payload(fingerprint, world_size=4)
+            assert fresh["run_id"] == "fresh-run"
+            (final_dir / "_tokenize_assignment.json").write_text("{}\n")
+            start_marker.write_text(json.dumps(fresh) + "\n")
+        else:  # pragma: no cover - would indicate we failed to observe fresh marker
+            raise AssertionError("nonzero rank did not accept fresh start marker")
+
+    monkeypatch.setattr("audio_tokenization.stages.tokenize.time.sleep", fake_sleep)
+
+    result = _wait_for_rank0_tokenize_start(
+        final_output_dir=final_dir,
+        state_filename="tokenize_state.json",
+        fingerprint=fingerprint,
+        start_marker=start_marker,
+        world_size=4,
+        resume=False,
+        rank=2,
+    )
+
+    assert result is None
+    assert calls["sleep"] == 1
+
+
+def test_run_tokenize_allows_more_ranks_than_cut_shards_with_planned_assignment(
+    tmp_path, monkeypatch
+):
+    from audio_tokenization.prepare.runtime import mark_partition_success
+    from audio_tokenization.pipelines.lhotse.planning import TOKENIZE_ASSIGNMENT_FILE
+    from audio_tokenization.stages.tokenize import run_tokenize
+
+    shar_dir = tmp_path / "shar"
+    _write_cut_shar_index(shar_dir, durations=(10.0,))
+    mark_partition_success(shar_dir)
+
+    spec = load_dataset_spec(_tokenize_spec_payload(str(shar_dir), str(tmp_path / "out")))
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    captured = {}
+    monkeypatch.setattr(
+        "audio_tokenization.stages.tokenize._invoke_pipeline",
+        lambda _spec, **kwargs: captured.setdefault("kwargs", kwargs) or {"rank": 0, "output_dir": str(kwargs["final_output_dir"])},
+    )
+
+    result = run_tokenize(spec, resume=False)
+
+    assert result["skipped"] is False
+    assert len(captured["kwargs"]["planned_shar_fields"]["cuts"]) == 1
+    assert captured["kwargs"]["assigned_cut_count"] == 1
+    assignment = json.loads(
+        (Path(result["output_dir"]) / TOKENIZE_ASSIGNMENT_FILE).read_text()
+    )
+    assert assignment["world_size"] == 4
+    assert assignment["active_ranks"] == 1
 
 
 def test_run_tokenize_explicit_missing_shar_does_not_delete_existing_output(tmp_path, monkeypatch):
-    from audio_tokenization.pipelines.lhotse.core import _build_output_subdir
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
     from audio_tokenization.stages.tokenize import run_tokenize
 
     output_dir = tmp_path / "out"
@@ -412,12 +823,7 @@ def test_run_tokenize_explicit_missing_shar_does_not_delete_existing_output(tmp_
     payload["tokenize"]["input_shar_dir"] = [str(tmp_path / "missing_shar")]
     spec = load_dataset_spec(payload)
 
-    subdir = _build_output_subdir({
-        "output_name": spec.name,
-        "mode": spec.tokenize.mode,
-        "audio_text_format": spec.tokenize.audio_text_format,
-        "audio_text_task": spec.tokenize.audio_text_task,
-    })
+    subdir = build_tokenize_output_subdir(spec.tokenize, dataset_name=spec.name)
     final_dir = output_dir / subdir
     final_dir.mkdir(parents=True, exist_ok=True)
     stale_file = final_dir / "stale.bin"
@@ -425,7 +831,7 @@ def test_run_tokenize_explicit_missing_shar_does_not_delete_existing_output(tmp_
 
     monkeypatch.setattr(
         "audio_tokenization.stages.tokenize._invoke_pipeline",
-        lambda _: (_ for _ in ()).throw(AssertionError("pipeline should not run")),
+        lambda _spec, **_kwargs: (_ for _ in ()).throw(AssertionError("pipeline should not run")),
     )
 
     with pytest.raises(FileNotFoundError, match=r"Tokenize input SHAR dir not found"):
@@ -440,7 +846,7 @@ def test_run_tokenize_skips_on_marker_and_state_match(tmp_path, monkeypatch):
         mark_partition_success,
         validate_or_write_prepare_state,
     )
-    from audio_tokenization.pipelines.lhotse.core import _build_output_subdir
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
     from audio_tokenization.stages._provenance import build_tokenize_resume_fingerprint
     from audio_tokenization.stages.tokenize import TOKENIZE_STATE_FILE, run_tokenize
 
@@ -456,12 +862,7 @@ def test_run_tokenize_skips_on_marker_and_state_match(tmp_path, monkeypatch):
     )
 
     # Emulate a successful previous run: final output dir + _SUCCESS + state file.
-    subdir = _build_output_subdir({
-        "output_name": spec.name,
-        "mode": spec.tokenize.mode,
-        "audio_text_format": spec.tokenize.audio_text_format,
-        "audio_text_task": spec.tokenize.audio_text_task,
-    })
+    subdir = build_tokenize_output_subdir(spec.tokenize, dataset_name=spec.name)
     final_dir = output_dir / subdir
     final_dir.mkdir(parents=True, exist_ok=True)
     validate_or_write_prepare_state(
@@ -472,7 +873,7 @@ def test_run_tokenize_skips_on_marker_and_state_match(tmp_path, monkeypatch):
     )
     mark_partition_success(final_dir)
 
-    def boom(cfg):  # pragma: no cover — should NEVER fire on the skip path
+    def boom(_spec, **_kwargs):  # pragma: no cover — should NEVER fire on the skip path
         raise AssertionError("pipeline invoked on resume-skip path")
 
     monkeypatch.setattr("audio_tokenization.stages.tokenize._invoke_pipeline", boom)
@@ -490,7 +891,7 @@ def test_run_tokenize_rejects_resume_on_state_drift(tmp_path, monkeypatch):
         mark_partition_success,
         validate_or_write_prepare_state,
     )
-    from audio_tokenization.pipelines.lhotse.core import _build_output_subdir
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
     from audio_tokenization.stages._provenance import build_tokenize_resume_fingerprint
     from audio_tokenization.stages.tokenize import TOKENIZE_STATE_FILE, run_tokenize
 
@@ -503,12 +904,7 @@ def test_run_tokenize_rejects_resume_on_state_drift(tmp_path, monkeypatch):
     payload_old["tokenize"]["filter"] = {"min_duration": 1.0}
     spec_old = load_dataset_spec(payload_old)
 
-    subdir = _build_output_subdir({
-        "output_name": spec_old.name,
-        "mode": spec_old.tokenize.mode,
-        "audio_text_format": spec_old.tokenize.audio_text_format,
-        "audio_text_task": spec_old.tokenize.audio_text_task,
-    })
+    subdir = build_tokenize_output_subdir(spec_old.tokenize, dataset_name=spec_old.name)
     final_dir = output_dir / subdir
     final_dir.mkdir(parents=True, exist_ok=True)
     fp_old = build_tokenize_resume_fingerprint(
@@ -530,7 +926,7 @@ def test_run_tokenize_rejects_resume_on_state_drift(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         "audio_tokenization.stages.tokenize._invoke_pipeline",
-        lambda _: (_ for _ in ()).throw(AssertionError("pipeline should not run on drift"))
+        lambda _spec, **_kwargs: (_ for _ in ()).throw(AssertionError("pipeline should not run on drift"))
     )
 
     with pytest.raises(AssertionError, match=r"Unsafe resume"):
@@ -543,7 +939,7 @@ def test_run_tokenize_rejects_resume_when_upstream_prepare_state_changes(tmp_pat
         mark_partition_success,
         validate_or_write_prepare_state,
     )
-    from audio_tokenization.pipelines.lhotse.core import _build_output_subdir
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
     from audio_tokenization.stages._provenance import (
         build_tokenize_resume_fingerprint,
         read_prepare_provenance,
@@ -567,12 +963,7 @@ def test_run_tokenize_rejects_resume_when_upstream_prepare_state_changes(tmp_pat
         guidance="test",
     )
 
-    subdir = _build_output_subdir({
-        "output_name": spec_old.name,
-        "mode": spec_old.tokenize.mode,
-        "audio_text_format": spec_old.tokenize.audio_text_format,
-        "audio_text_task": spec_old.tokenize.audio_text_task,
-    })
+    subdir = build_tokenize_output_subdir(spec_old.tokenize, dataset_name=spec_old.name)
     final_dir = output_dir / subdir
     final_dir.mkdir(parents=True, exist_ok=True)
     fp_old = build_tokenize_resume_fingerprint(
@@ -605,7 +996,7 @@ def test_run_tokenize_rejects_resume_when_upstream_prepare_state_changes(tmp_pat
 
     monkeypatch.setattr(
         "audio_tokenization.stages.tokenize._invoke_pipeline",
-        lambda _: (_ for _ in ()).throw(AssertionError("pipeline should not run on drift"))
+        lambda _spec, **_kwargs: (_ for _ in ()).throw(AssertionError("pipeline should not run on drift"))
     )
 
     with pytest.raises(AssertionError, match=r"Unsafe resume"):
@@ -621,7 +1012,7 @@ def test_run_tokenize_rejects_resume_when_upstream_audio_dir_prepare_state_chang
         validate_or_write_prepare_state,
         write_prepare_state_for_spec as write_audio_dir_prepare_state,
     )
-    from audio_tokenization.pipelines.lhotse.core import _build_output_subdir
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
     from audio_tokenization.stages._provenance import (
         build_tokenize_resume_fingerprint,
         read_prepare_provenance,
@@ -652,12 +1043,7 @@ def test_run_tokenize_rejects_resume_when_upstream_audio_dir_prepare_state_chang
     spec_old = load_dataset_spec(payload_old)
     write_audio_dir_prepare_state(spec_old.convert)
 
-    subdir = _build_output_subdir({
-        "output_name": spec_old.name,
-        "mode": spec_old.tokenize.mode,
-        "audio_text_format": spec_old.tokenize.audio_text_format,
-        "audio_text_task": spec_old.tokenize.audio_text_task,
-    })
+    subdir = build_tokenize_output_subdir(spec_old.tokenize, dataset_name=spec_old.name)
     final_dir = output_dir / subdir
     final_dir.mkdir(parents=True, exist_ok=True)
     fp_old = build_tokenize_resume_fingerprint(
@@ -690,7 +1076,7 @@ def test_run_tokenize_rejects_resume_when_upstream_audio_dir_prepare_state_chang
 
     monkeypatch.setattr(
         "audio_tokenization.stages.tokenize._invoke_pipeline",
-        lambda _: (_ for _ in ()).throw(AssertionError("pipeline should not run on drift"))
+        lambda _spec, **_kwargs: (_ for _ in ()).throw(AssertionError("pipeline should not run on drift"))
     )
 
     with pytest.raises(AssertionError, match=r"Unsafe resume"):
@@ -702,7 +1088,7 @@ def test_run_tokenize_derives_output_name_from_dataset_name(tmp_path, monkeypatc
     from audio_tokenization.stages.tokenize import run_tokenize
 
     shar_dir = tmp_path / "shar"
-    shar_dir.mkdir()
+    _write_cut_shar_index(shar_dir)
     mark_partition_success(shar_dir)
 
     payload = _tokenize_spec_payload(str(shar_dir), str(tmp_path / "out"))
@@ -711,17 +1097,18 @@ def test_run_tokenize_derives_output_name_from_dataset_name(tmp_path, monkeypatc
 
     captured: dict = {}
 
-    def fake_run(pipeline_cfg):
-        captured["cfg"] = pipeline_cfg
-        return {"output_dir": pipeline_cfg["output_dir"]}
+    def fake_run(tokenize_spec, **kwargs):
+        captured["spec"] = tokenize_spec
+        captured["kwargs"] = kwargs
+        return {"output_dir": str(kwargs["final_output_dir"])}
 
     monkeypatch.setattr(
         "audio_tokenization.stages.tokenize._invoke_pipeline", fake_run
     )
 
     run_tokenize(spec, resume=False)
-    assert captured["cfg"]["output_name"] == "infore2"
-    assert captured["cfg"]["dataset_name"] == "infore2"
+    assert captured["spec"].output.output_name is None
+    assert captured["kwargs"]["dataset_name"] == "infore2"
 
 
 def test_run_tokenize_clears_partial_output_dir_before_rerun(tmp_path, monkeypatch):
@@ -729,22 +1116,17 @@ def test_run_tokenize_clears_partial_output_dir_before_rerun(tmp_path, monkeypat
         mark_partition_success,
         validate_or_write_prepare_state,
     )
-    from audio_tokenization.pipelines.lhotse.core import _build_output_subdir
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
     from audio_tokenization.stages._provenance import build_tokenize_resume_fingerprint
     from audio_tokenization.stages.tokenize import TOKENIZE_STATE_FILE, run_tokenize
 
     shar_dir = tmp_path / "shar"
-    shar_dir.mkdir()
+    _write_cut_shar_index(shar_dir)
     mark_partition_success(shar_dir)
 
     output_dir = tmp_path / "out"
     spec = load_dataset_spec(_tokenize_spec_payload(str(shar_dir), str(output_dir)))
-    subdir = _build_output_subdir({
-        "output_name": spec.name,
-        "mode": spec.tokenize.mode,
-        "audio_text_format": spec.tokenize.audio_text_format,
-        "audio_text_task": spec.tokenize.audio_text_task,
-    })
+    subdir = build_tokenize_output_subdir(spec.tokenize, dataset_name=spec.name)
     final_dir = output_dir / subdir
     final_dir.mkdir(parents=True, exist_ok=True)
     stale_file = final_dir / "rank_0000_chunk_000001.bin"
@@ -761,7 +1143,7 @@ def test_run_tokenize_clears_partial_output_dir_before_rerun(tmp_path, monkeypat
         guidance="test",
     )
 
-    def fake_run(_cfg):
+    def fake_run(_spec, **_kwargs):
         assert not stale_file.exists(), "partial rerun leaked stale tokenize artifact"
         return {"samples_processed": 0, "tokens_generated": 0}
 
@@ -780,8 +1162,89 @@ def test_run_stages_all_runs_in_order_and_short_circuits():
     assert result == {
         "convert": {"skipped": True, "reason": "convert.disabled"},
         "tokenize": {"skipped": True, "reason": "tokenize.disabled"},
-        "materialize": {"interleave": {"skipped": True, "reason": "interleave.disabled"}},
+        "materialize": {
+            "interleave": {"skipped": True, "reason": "interleave.disabled"},
+            "sft": {"skipped": True, "reason": "sft.disabled"},
+        },
     }
+
+
+def test_run_stages_all_end_to_end_control_plane(tmp_path, monkeypatch):
+    """Convert -> tokenize -> materialize works as an artifact-driven graph.
+
+    Heavy decode/GPU/product work is faked; the real state files and success
+    markers are still written so downstream stages consume upstream artifacts
+    exactly as they do in production.
+    """
+    from audio_tokenization.prepare.runtime import (
+        mark_partition_success,
+        write_prepare_state_for_spec,
+    )
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
+
+    parquet_dir = tmp_path / "parquet"
+    parquet_dir.mkdir()
+    (parquet_dir / "data.parquet").write_text("stub\n")
+    shar_dir = tmp_path / "shar"
+    tokenized_dir = tmp_path / "tokenized"
+    materialized_dir = tmp_path / "materialized"
+
+    spec = load_dataset_spec(
+        {
+            "name": "e2e",
+            "convert": {
+                "family": "parquet",
+                "input": {"parquet_dir": str(parquet_dir)},
+                "output": {"shar_dir": str(shar_dir), "shard_size": 2000},
+            },
+            "tokenize": {
+                "tokenizer": {"path": "/tmp/tokenizer"},
+                "output": {"output_dir": str(tokenized_dir)},
+                "mode": "audio_text",
+                "audio_text_format": "interleaved",
+            },
+            "materialize": {
+                "interleave": {
+                    "enabled": True,
+                    "output_dir": str(materialized_dir),
+                }
+            },
+        }
+    )
+
+    def fake_convert(_prepare_spec):
+        _write_cut_shar_index(shar_dir)
+        write_prepare_state_for_spec(spec.convert)
+        mark_partition_success(shar_dir)
+        return {"converted": True, "output_dir": str(shar_dir)}
+
+    monkeypatch.setattr("audio_tokenization.stages.convert.validate_prepare_runtime", lambda **_: None)
+    monkeypatch.setattr(
+        "audio_tokenization.stages.convert._DISPATCH",
+        {"parquet": "test.fake_prepare_parquet_to_shar"},
+    )
+    monkeypatch.setattr(
+        "audio_tokenization.stages.convert.importlib.import_module",
+        lambda _name: type("FakePrepareModule", (), {"run": staticmethod(fake_convert)}),
+    )
+    monkeypatch.setattr(
+        "audio_tokenization.stages.tokenize._invoke_pipeline",
+        lambda _spec, **kwargs: {"tokenized": True, "output_dir": str(kwargs["final_output_dir"])},
+    )
+    monkeypatch.setattr(
+        "audio_tokenization.stages.materialize._invoke_shift_by_one",
+        lambda argv: None,
+    )
+
+    result = run_stages(spec, stage="all", resume=False)
+
+    cache_dir = tokenized_dir / build_tokenize_output_subdir(spec.tokenize, dataset_name=spec.name)
+    assert result["convert"]["converted"] is True
+    assert result["tokenize"]["tokenized"] is True
+    assert result["materialize"]["interleave"]["skipped"] is False
+    assert (shar_dir / "_SUCCESS").is_file()
+    assert (cache_dir / "_SUCCESS").is_file()
+    assert (materialized_dir / "_SUCCESS").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +1306,8 @@ def test_run_materialize_interleave_disabled_returns_skip():
         {"name": "d", "convert": _base_convert_payload()}
     )
     assert run_materialize_impl(spec) == {
-        "interleave": {"skipped": True, "reason": "interleave.disabled"}
+        "interleave": {"skipped": True, "reason": "interleave.disabled"},
+        "sft": {"skipped": True, "reason": "sft.disabled"},
     }
 
 
@@ -859,7 +1323,7 @@ def test_run_materialize_interleave_invokes_shift_by_one(tmp_path, monkeypatch):
         )
     )
     _materialize_tokenize_stage_success(
-        tokenize_out / "interleave_cache" / spec.name,
+        tokenize_out / INTERLEAVE_CACHE_OUTPUT_STEM / spec.name,
         spec,
     )
 
@@ -875,12 +1339,12 @@ def test_run_materialize_interleave_invokes_shift_by_one(tmp_path, monkeypatch):
     result = run_materialize_impl(spec, resume=False)
     assert result["interleave"]["skipped"] is False
 
-    # argv carries the derived parquet_dir (tokenize interleave_cache) and
+    # argv carries the derived parquet_dir (tokenize interleave cache) and
     # the inherited tokenizer_path from the tokenize section.
     argv = captured["argv"]
     assert "--parquet-dir" in argv
     parquet_dir = argv[argv.index("--parquet-dir") + 1]
-    assert parquet_dir.endswith("/interleave_cache/ds"), parquet_dir
+    assert parquet_dir.endswith(f"/{INTERLEAVE_CACHE_OUTPUT_STEM}/ds"), parquet_dir
     assert "--tokenizer-path" in argv
     assert argv[argv.index("--tokenizer-path") + 1] == "/tmp/tokenizer"
     assert "--output-dir" in argv
@@ -926,7 +1390,7 @@ def test_run_materialize_interleave_skips_on_marker_and_state_match(tmp_path, mo
             interleave_output_dir=str(interleave_out),
         )
     )
-    cache_dir = tokenize_out / "interleave_cache" / spec.name
+    cache_dir = tokenize_out / INTERLEAVE_CACHE_OUTPUT_STEM / spec.name
     _materialize_tokenize_stage_success(cache_dir, spec)
     fp = build_interleave_resume_fingerprint(
         spec.materialize.interleave,
@@ -979,7 +1443,7 @@ def test_run_materialize_interleave_rejects_resume_on_state_drift(tmp_path, monk
     )
     payload_old["materialize"]["interleave"]["max_seq_len"] = 131072
     spec_old = load_dataset_spec(payload_old)
-    cache_dir = tokenize_out / "interleave_cache" / spec_old.name
+    cache_dir = tokenize_out / INTERLEAVE_CACHE_OUTPUT_STEM / spec_old.name
     _materialize_tokenize_stage_success(cache_dir, spec_old)
     fp_old = build_interleave_resume_fingerprint(
         spec_old.materialize.interleave,
@@ -1014,6 +1478,37 @@ def test_run_materialize_interleave_rejects_resume_on_state_drift(tmp_path, monk
         run_materialize_impl(spec_new, resume=True)
 
 
+def test_materialize_max_gap_sec_affects_only_materialize_fingerprint(tmp_path):
+    from audio_tokenization.stages._provenance import build_interleave_resume_fingerprint
+
+    payload_old = _interleave_spec_payload(
+        tokenize_output_dir=str(tmp_path / "tokenize"),
+        interleave_output_dir=str(tmp_path / "interleave"),
+    )
+    payload_new = copy.deepcopy(payload_old)
+    payload_new["materialize"]["interleave"]["max_gap_sec"] = 5.0
+
+    spec_old = load_dataset_spec(payload_old)
+    spec_new = load_dataset_spec(payload_new)
+
+    assert spec_old.tokenize.fingerprint_payload() == spec_new.tokenize.fingerprint_payload()
+
+    fp_old = build_interleave_resume_fingerprint(
+        spec_old.materialize.interleave,
+        cache_dir=tmp_path / "cache",
+        tokenizer_path=spec_old.tokenize.tokenizer.path,
+    )
+    fp_new = build_interleave_resume_fingerprint(
+        spec_new.materialize.interleave,
+        cache_dir=tmp_path / "cache",
+        tokenizer_path=spec_new.tokenize.tokenizer.path,
+    )
+
+    assert fp_old["max_gap_sec"] is None
+    assert fp_new["max_gap_sec"] == 5.0
+    assert fp_old != fp_new
+
+
 def test_run_materialize_interleave_rejects_resume_when_derived_tokenizer_path_changes(
     tmp_path, monkeypatch
 ):
@@ -1037,7 +1532,7 @@ def test_run_materialize_interleave_rejects_resume_when_derived_tokenizer_path_c
     )
     payload_old["tokenize"]["tokenizer"]["path"] = "/tmp/tokenizer_old"
     spec_old = load_dataset_spec(payload_old)
-    cache_dir = tokenize_out / "interleave_cache" / spec_old.name
+    cache_dir = tokenize_out / INTERLEAVE_CACHE_OUTPUT_STEM / spec_old.name
     _materialize_tokenize_stage_success(cache_dir, spec_old)
     fp_old = build_interleave_resume_fingerprint(
         spec_old.materialize.interleave,
@@ -1095,7 +1590,7 @@ def test_run_materialize_interleave_rejects_resume_when_derived_cache_dir_change
         interleave_output_dir=str(interleave_out),
     )
     spec_old = load_dataset_spec(payload_old)
-    cache_dir_old = tokenize_out_old / "interleave_cache" / spec_old.name
+    cache_dir_old = tokenize_out_old / INTERLEAVE_CACHE_OUTPUT_STEM / spec_old.name
     _materialize_tokenize_stage_success(cache_dir_old, spec_old)
     fp_old = build_interleave_resume_fingerprint(
         spec_old.materialize.interleave,
@@ -1121,7 +1616,7 @@ def test_run_materialize_interleave_rejects_resume_when_derived_cache_dir_change
     )
     spec_new = load_dataset_spec(payload_new)
     _materialize_tokenize_stage_success(
-        tokenize_out_new / "interleave_cache" / spec_new.name,
+        tokenize_out_new / INTERLEAVE_CACHE_OUTPUT_STEM / spec_new.name,
         spec_new,
     )
 
@@ -1208,7 +1703,7 @@ def test_run_materialize_interleave_rejects_resume_when_upstream_tokenize_state_
     )
     payload_old["tokenize"]["filter"] = {"min_duration": 1.0}
     spec_old = load_dataset_spec(payload_old)
-    cache_dir = tokenize_out / "interleave_cache" / spec_old.name
+    cache_dir = tokenize_out / INTERLEAVE_CACHE_OUTPUT_STEM / spec_old.name
     _materialize_tokenize_stage_success(cache_dir, spec_old)
     fp_old = build_interleave_resume_fingerprint(
         spec_old.materialize.interleave,

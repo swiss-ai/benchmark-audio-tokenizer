@@ -1,12 +1,42 @@
 import json
+import struct
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import torch
 
-from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
+from audio_tokenization.pipelines.lhotse.checkpoint import open_chunk_writer
+from audio_tokenization.pipelines.shard_io import (
+    CUT_ID_SIDECAR_SUFFIX,
+    INTERLEAVE_CACHE_SCHEMA_VERSION,
+    StructuredCacheChunkWriter,
+    finalize_shard_writer,
+)
+from audio_tokenization.utils.indexed_dataset.cut_id_sidecar import (
+    collect_cutid_token_pairs,
+    compare_cutid_token_sets,
+)
+from audio_tokenization.utils.indexed_dataset.constants import MEGATRON_INDEX_HEADER
+from audio_tokenization.utils.io import atomic_streaming_write, open_compressed
+
+
+def _read_idx_document_count(idx_path: Path) -> int:
+    with open(idx_path, "rb") as f:
+        assert f.read(len(MEGATRON_INDEX_HEADER)) == MEGATRON_INDEX_HEADER
+        (version,) = struct.unpack("<Q", f.read(8))
+        assert version == 1
+        f.read(1)  # dtype code
+        f.read(8)  # sequence count
+        (document_index_count,) = struct.unpack("<Q", f.read(8))
+    return document_index_count - 1
+
+
+def _read_cut_id_sidecar(path: Path) -> list[str]:
+    with open_compressed(path, "rt") as f:
+        return [json.loads(line) for line in f]
 
 
 def _read_int32_tokens(path: Path, offset: int, length: int) -> list[int]:
@@ -25,6 +55,234 @@ def _single_partition_dir(root: Path) -> Path:
     return partitions[0]
 
 
+def _write_megatron_chunk(
+    root: Path,
+    *,
+    rank: int,
+    chunk_id: int,
+    rows: list[tuple[str, list[int]]],
+) -> None:
+    (
+        builder,
+        cut_id_writer,
+        tmp_bin,
+        tmp_idx,
+        _tmp_cut_ids,
+        bin_path,
+        idx_path,
+        _cut_ids_path,
+    ) = open_chunk_writer(str(root), rank=rank, chunk_id=chunk_id, vocab_size=1000)
+    for cut_id, tokens in rows:
+        builder.add_item(torch.tensor(tokens, dtype=torch.int64))
+        builder.end_document()
+        cut_id_writer.write(cut_id)
+    finalize_shard_writer(builder, tmp_bin, tmp_idx, bin_path, idx_path, cut_id_writer)
+
+
+def test_atomic_streaming_write_commits_zst_jsonl(tmp_path):
+    path = tmp_path / "rank_0000_chunk_0000.cut_ids.jsonl.zst"
+
+    with atomic_streaming_write(path, compression="zst") as f:
+        f.write(b'"cut-a"\n')
+        f.write(b'"cut-b"\n')
+
+    assert _read_cut_id_sidecar(path) == ["cut-a", "cut-b"]
+    assert not path.with_name(f"{path.name}.tmp").exists()
+
+
+def test_atomic_streaming_write_aborts_tmp_on_exception(tmp_path):
+    path = tmp_path / "rank_0000_chunk_0000.cut_ids.jsonl.zst"
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with atomic_streaming_write(path, compression="zst") as f:
+            f.write(b'"cut-a"\n')
+            raise RuntimeError("boom")
+
+    assert not path.exists()
+    assert not path.with_name(f"{path.name}.tmp").exists()
+
+
+def test_megatron_chunk_writer_writes_matching_cut_id_sidecar(tmp_path):
+    (
+        builder,
+        cut_id_writer,
+        tmp_bin,
+        tmp_idx,
+        tmp_cut_ids,
+        bin_path,
+        idx_path,
+        cut_ids_path,
+    ) = open_chunk_writer(str(tmp_path), rank=0, chunk_id=0, vocab_size=1000)
+
+    builder.add_item(torch.tensor([1, 2, 3], dtype=torch.int64))
+    builder.end_document()
+    cut_id_writer.write("cut-a")
+    builder.add_item(torch.tensor([4, 5], dtype=torch.int64))
+    builder.end_document()
+    cut_id_writer.write("cut-b")
+
+    finalize_shard_writer(builder, tmp_bin, tmp_idx, bin_path, idx_path, cut_id_writer)
+
+    assert Path(bin_path).exists()
+    assert Path(idx_path).exists()
+    assert Path(cut_ids_path).exists()
+    assert Path(cut_ids_path).name.endswith(CUT_ID_SIDECAR_SUFFIX)
+    assert not Path(tmp_bin).exists()
+    assert not Path(tmp_idx).exists()
+    assert not Path(tmp_cut_ids).exists()
+    assert _read_cut_id_sidecar(Path(cut_ids_path)) == ["cut-a", "cut-b"]
+    assert _read_idx_document_count(Path(idx_path)) == 2
+    assert len(_read_cut_id_sidecar(Path(cut_ids_path))) == _read_idx_document_count(Path(idx_path))
+    assert collect_cutid_token_pairs(tmp_path) == {
+        "cut-a": (1, 2, 3),
+        "cut-b": (4, 5),
+    }
+
+
+def test_compare_cutid_token_sets_ignores_rank_and_chunk_layout(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    _write_megatron_chunk(
+        left,
+        rank=0,
+        chunk_id=0,
+        rows=[("cut-a", [1, 2, 3]), ("cut-b", [4, 5])],
+    )
+    _write_megatron_chunk(
+        right,
+        rank=3,
+        chunk_id=7,
+        rows=[("cut-b", [4, 5])],
+    )
+    _write_megatron_chunk(
+        right,
+        rank=1,
+        chunk_id=2,
+        rows=[("cut-a", [1, 2, 3])],
+    )
+
+    assert compare_cutid_token_sets(left, right) == {"cuts": 2, "tokens": 5}
+
+
+def test_compare_cutid_token_sets_allows_trimmed_audio_tail_with_markers(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    _write_megatron_chunk(
+        left,
+        rank=0,
+        chunk_id=0,
+        rows=[("cut-a", [0, 10, 100, 101, 102, 11, 20, 21])],
+    )
+    _write_megatron_chunk(
+        right,
+        rank=1,
+        chunk_id=0,
+        rows=[("cut-a", [0, 10, 100, 101, 11, 20, 21])],
+    )
+
+    with pytest.raises(RuntimeError, match="token_mismatches=1"):
+        compare_cutid_token_sets(
+            left,
+            right,
+            audio_start_id=10,
+            audio_end_id=11,
+        )
+
+    assert compare_cutid_token_sets(
+        left,
+        right,
+        trim_tolerance=1,
+        audio_start_id=10,
+        audio_end_id=11,
+    ) == {
+        "cuts": 1,
+        "tokens_left": 8,
+        "tokens_right": 7,
+        "max_token_drift": 1,
+    }
+
+
+def test_compare_cutid_token_sets_keeps_text_strict_with_trim_tolerance(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    _write_megatron_chunk(
+        left,
+        rank=0,
+        chunk_id=0,
+        rows=[("cut-a", [0, 10, 100, 101, 102, 11, 20, 21])],
+    )
+    _write_megatron_chunk(
+        right,
+        rank=1,
+        chunk_id=0,
+        rows=[("cut-a", [0, 10, 100, 101, 11, 20, 99])],
+    )
+
+    with pytest.raises(RuntimeError, match="token_mismatches=1"):
+        compare_cutid_token_sets(
+            left,
+            right,
+            trim_tolerance=1,
+            audio_start_id=10,
+            audio_end_id=11,
+        )
+
+
+def test_compare_cutid_token_sets_rejects_drift_beyond_tolerance(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    _write_megatron_chunk(
+        left,
+        rank=0,
+        chunk_id=0,
+        rows=[("cut-a", [0, 10, 100, 101, 102, 103, 11, 20])],
+    )
+    _write_megatron_chunk(
+        right,
+        rank=1,
+        chunk_id=0,
+        rows=[("cut-a", [0, 10, 100, 11, 20])],
+    )
+
+    with pytest.raises(RuntimeError, match="token_mismatches=1"):
+        compare_cutid_token_sets(
+            left,
+            right,
+            trim_tolerance=2,
+            audio_start_id=10,
+            audio_end_id=11,
+        )
+
+
+def test_megatron_chunk_writer_aborts_sidecar_on_count_mismatch(tmp_path):
+    (
+        builder,
+        cut_id_writer,
+        tmp_bin,
+        tmp_idx,
+        tmp_cut_ids,
+        bin_path,
+        idx_path,
+        cut_ids_path,
+    ) = open_chunk_writer(str(tmp_path), rank=0, chunk_id=0, vocab_size=1000)
+    builder.add_item(torch.tensor([1, 2, 3], dtype=torch.int64))
+    builder.end_document()
+
+    with pytest.raises(RuntimeError, match="sidecar/document count mismatch"):
+        finalize_shard_writer(builder, tmp_bin, tmp_idx, bin_path, idx_path, cut_id_writer)
+
+    assert not Path(cut_ids_path).exists()
+    assert not Path(tmp_cut_ids).exists()
+
+
 def test_structured_cache_chunk_writer_writes_layout_and_offsets(tmp_path):
     writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
     writer.add_rows([
@@ -33,6 +291,7 @@ def test_structured_cache_chunk_writer_writes_layout_and_offsets(tmp_path):
             "source_id": "a",
             "clip_num": 0,
             "clip_start": 0.0,
+            "clip_duration": 1.0,
             "speaker": "",
             "duration": 1.0,
             "text": "hello",
@@ -45,6 +304,7 @@ def test_structured_cache_chunk_writer_writes_layout_and_offsets(tmp_path):
             "source_id": "a",
             "clip_num": 1,
             "clip_start": 1.0,
+            "clip_duration": 1.5,
             "speaker": "spk",
             "duration": 1.5,
             "text": "world",
@@ -59,6 +319,7 @@ def test_structured_cache_chunk_writer_writes_layout_and_offsets(tmp_path):
 
     layout = json.loads((tmp_path / "_CACHE_LAYOUT.json").read_text())
     assert layout["version"] == "v2"
+    assert layout["schema_version"] == INTERLEAVE_CACHE_SCHEMA_VERSION
     assert layout["commit_marker"] == "clips.parquet"
     assert layout["partitioned"] is True
     assert layout["partitioning"] == {"type": "hash", "field": "source_id", "num_buckets": 16}
@@ -96,7 +357,9 @@ def test_structured_cache_chunk_writer_removes_orphan_bins_without_commit_marker
     (rank_dir / "audio_tokens.000000.bin").write_bytes(b"orphan-audio")
     (rank_dir / "text_tokens.000000.bin").write_bytes(b"orphan-text")
     (rank_dir / "clips.000001.parquet.tmp").write_text("stale")
-    (rank_dir.parent / "_CACHE_LAYOUT.json").write_text(json.dumps({"version": "v2"}))
+    (rank_dir.parent / "_CACHE_LAYOUT.json").write_text(
+        json.dumps({"version": "v2", "schema_version": INTERLEAVE_CACHE_SCHEMA_VERSION})
+    )
 
     writer = StructuredCacheChunkWriter(str(tmp_path), rank=3, writer_state=0)
 
@@ -115,6 +378,7 @@ def test_structured_cache_chunk_writer_raises_on_missing_bins_for_committed_parq
             "source_id": ["a"],
             "clip_num": [0],
             "clip_start": [0.0],
+            "clip_duration": [None],
             "speaker": [""],
             "duration": [1.0],
             "text": ["hello"],
@@ -127,15 +391,23 @@ def test_structured_cache_chunk_writer_raises_on_missing_bins_for_committed_parq
         schema=StructuredCacheChunkWriter._get_schema(),
     )
     pq.write_table(table, rank_dir / "clips.000000.parquet")
-    (rank_dir.parent / "_CACHE_LAYOUT.json").write_text(json.dumps({"version": "v2"}))
+    (rank_dir.parent / "_CACHE_LAYOUT.json").write_text(
+        json.dumps({"version": "v2", "schema_version": INTERLEAVE_CACHE_SCHEMA_VERSION})
+    )
 
-    with pytest.raises(RuntimeError, match="exists without both token bins"):
+    with pytest.raises(RuntimeError, match="missing token bins"):
         StructuredCacheChunkWriter(str(tmp_path), rank=1, writer_state={"bucket_0000": 0})
 
 
 def test_structured_cache_chunk_writer_raises_on_layout_version_mismatch(tmp_path):
     (tmp_path / "_CACHE_LAYOUT.json").write_text(
-        json.dumps({"version": "v1", "kind": "structured_interleave_cache"})
+        json.dumps(
+            {
+                "version": "v1",
+                "schema_version": INTERLEAVE_CACHE_SCHEMA_VERSION,
+                "kind": "structured_interleave_cache",
+            }
+        )
     )
 
     with pytest.raises(RuntimeError, match="layout mismatch"):
@@ -155,6 +427,7 @@ def test_structured_cache_chunk_writer_resumes_per_partition_chunk_ids(tmp_path)
             "source_id": "fr",
             "clip_num": 0,
             "clip_start": 0.0,
+            "clip_duration": 1.0,
             "speaker": "",
             "duration": 1.0,
             "text": "bonjour",
@@ -168,6 +441,7 @@ def test_structured_cache_chunk_writer_resumes_per_partition_chunk_ids(tmp_path)
             "source_id": "de",
             "clip_num": 0,
             "clip_start": 0.0,
+            "clip_duration": 1.0,
             "speaker": "",
             "duration": 1.0,
             "text": "hallo",

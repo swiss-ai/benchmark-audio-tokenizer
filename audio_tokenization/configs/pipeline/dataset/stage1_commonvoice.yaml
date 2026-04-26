@@ -1,0 +1,33 @@
+defaults:
+  - /recipe/lhotse_recipe_audio_only@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - /profile/cscs@_here_
+  - _self_
+
+# Stage-1 CommonVoice "other" splits. The existing SHAR is already partitioned
+# by language under outputs.shar_dir, so this card tokenizes that root directly.
+
+name: stage1_commonvoice
+
+source:
+  recipe: commonvoice
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/commonvoice24
+  split: other
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1/commonvoice
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/stage_1_rebuild
+  name: commonvoice
+
+conversion:
+  # CommonVoice Stage-1 was already converted per language; rebuild individual
+  # language roots separately if raw metadata changes.
+  enabled: false
+
+tokenization:
+  input_shar_dir:
+    - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1/commonvoice
+  min_duration: 3.0
+  max_duration: 500.0
+  max_batch_duration: 1000.0
+  checkpoint_interval_batches: 2000

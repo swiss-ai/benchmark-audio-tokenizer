@@ -1,8 +1,32 @@
-"""Shared CLI argument builders for prepare_data scripts."""
+"""Shared CLI argument builders for prepare scripts."""
 
 from __future__ import annotations
 
+import glob
+import os
 from pathlib import Path
+from typing import Iterable
+
+
+def expand_path_patterns(patterns: Iterable[str]) -> list[str]:
+    """Expand user-provided path patterns to a deduplicated, sorted list.
+
+    Convert input file lists (``arrow_files``, ``wds_shards``, ``jsonl_files``)
+    are user-authored; literal paths and glob patterns must both resolve here.
+    Used uniformly by the stage adapter and the standalone prepare CLIs so a
+    YAML/argparse value with wildcards behaves the same way in both paths.
+
+    Each pattern must resolve to at least one file: a typo'd or stale glob
+    raises ``FileNotFoundError`` rather than silently producing a partial
+    dataset. ``~`` is expanded so user-home paths in YAML resolve.
+    """
+    out: set[str] = set()
+    for pattern in patterns:
+        matches = glob.glob(os.path.expanduser(pattern))
+        if not matches:
+            raise FileNotFoundError(f"No files match pattern: {pattern!r}")
+        out.update(matches)
+    return sorted(out)
 
 
 def add_external_metadata_args(parser, *, include_custom_fields: bool = True) -> None:
@@ -96,4 +120,3 @@ def add_parallelism_args(parser, *, num_workers_default=20,
         parser.add_argument("--mp-start-method", type=str, default="forkserver",
                             choices=["fork", "forkserver", "spawn"],
                             help="Multiprocessing start method (default: forkserver)")
-

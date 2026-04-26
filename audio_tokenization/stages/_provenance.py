@@ -9,13 +9,18 @@ Why this exists:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Sequence
 
 from audio_tokenization.config.schema import DatasetSpec, InterleaveProductSpec
 from audio_tokenization.prepare.constants import PREPARE_STATE_FILE
 from audio_tokenization.prepare.metadata import normalize_optional_path
-from audio_tokenization.prepare.runtime import read_prepare_state
+from audio_tokenization.prepare.runtime import (
+    PrepareStateLegacyError,
+    read_prepare_state,
+)
 
 
 def read_stage_provenance(
@@ -26,7 +31,7 @@ def read_stage_provenance(
     for input_dir in _normalize_paths(input_dirs):
         state_path = Path(input_dir) / state_filename
         if state_path.is_file():
-            provenance[input_dir] = read_prepare_state(state_path)
+            provenance[input_dir] = _read_upstream_state_for_provenance(state_path)
     return provenance
 
 
@@ -71,3 +76,36 @@ def build_interleave_resume_fingerprint(
 
 def _normalize_paths(paths: Sequence[str | Path]) -> list[str]:
     return sorted(normalize_optional_path(path) for path in paths)
+
+
+def _read_upstream_state_for_provenance(state_path: Path) -> dict[str, Any]:
+    """Read an upstream state file for fingerprinting, tolerating legacy SHARs.
+
+    Stage ownership stays strict: convert resume still rejects stale or
+    unversioned prepare state through ``read_prepare_state``. Tokenize is only a
+    consumer of upstream SHARs, including legacy/external roots; for those, an
+    opaque content hash is enough to invalidate stale downstream resumes if the
+    upstream state changes.
+
+    Only ``PrepareStateLegacyError`` (no-version / stale-version) gets the
+    opaque-hash fallback. Future-version state, malformed payloads, or other
+    bugs still propagate as ``RuntimeError`` so downgrade and corruption
+    scenarios fail loud instead of silently being treated as legacy data.
+    """
+
+    try:
+        return read_prepare_state(state_path)
+    except PrepareStateLegacyError:
+        raw = state_path.read_bytes()
+        payload: Any
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+        legacy: dict[str, Any] = {
+            "provenance_format": "opaque_legacy_prepare_state",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        if isinstance(payload, dict):
+            legacy["payload"] = payload
+        return legacy

@@ -8,7 +8,7 @@ variable-length *accumulate* mode:
 - Megatron .idx writing
 - Shard merging
 - Worker partitioning
-- Parquet loading and Arrow preparation
+- Structured cache loading
 """
 
 from __future__ import annotations
@@ -18,16 +18,21 @@ import os
 import resource
 import shutil
 import struct
-import time
 from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 import polars as pl
-import pyarrow as pa
 from transformers import AutoTokenizer
 
+from audio_tokenization.contracts.artifacts import (
+    INTERLEAVE_CACHE_LAYOUT_FILENAME,
+    INTERLEAVE_CACHE_LAYOUT_V2,
+    INTERLEAVE_CACHE_SCHEMA_VERSION,
+    validate_v2_chunks_complete,
+)
+from audio_tokenization.utils.indexed_dataset.constants import MEGATRON_INDEX_HEADER
 from audio_tokenization.utils.indexed_dataset.indexed_dataset_megatron import (
-    _INDEX_HEADER,
     DType,
     IndexedDatasetBuilder,
     get_bin_path,
@@ -36,7 +41,7 @@ from audio_tokenization.utils.indexed_dataset.indexed_dataset_megatron import (
 
 # Re-export indexed dataset symbols so callers import from one place
 __all__ = [
-    "_INDEX_HEADER",
+    "MEGATRON_INDEX_HEADER",
     "DType",
     "IndexedDatasetBuilder",
     "get_bin_path",
@@ -55,8 +60,6 @@ __all__ = [
     "list_interleave_cache_partitions",
     "summarize_partition_stats",
     "print_partition_stats",
-    "load_parquets",
-    "prepare_arrow_and_runs",
     "load_interleave_cache",
     "prepare_interleave_cache_and_runs",
     "prepare_length_metadata",
@@ -182,37 +185,34 @@ class PreparedInterleaveCache:
         return self.text.lengths
 
 
-class _V1InterleaveCacheReader:
-    def __init__(self, parquet_dir: Path):
-        self.parquet_dir = parquet_dir
-        self.parquet_files = sorted(
-            p
-            for p in parquet_dir.glob("rank_*_chunk_*.parquet")
-            if not p.name.endswith(".tmp")
-        )
-        if not self.parquet_files:
-            self.parquet_files = sorted(
-                p
-                for p in parquet_dir.glob("*.parquet")
-                if not p.name.endswith(".tmp")
-            )
+def _parquet_schema_names(path: Path) -> set[str]:
+    import pyarrow.parquet as pq
 
-    def load_metadata(self) -> pl.DataFrame:
-        return pl.read_parquet(
-            self.parquet_files,
-            columns=["source_id", "clip_num", "audio_tokens", "text_tokens"],
-        )
+    return set(pq.ParquetFile(path).schema_arrow.names)
 
-    def prepare(self, sorted_df: pl.DataFrame) -> PreparedInterleaveCache:
-        _audio_raw = sorted_df["audio_tokens"].to_arrow()
-        _text_raw = sorted_df["text_tokens"].to_arrow()
-        audio_arrow = _audio_raw.combine_chunks() if isinstance(_audio_raw, pa.ChunkedArray) else _audio_raw
-        text_arrow = _text_raw.combine_chunks() if isinstance(_text_raw, pa.ChunkedArray) else _text_raw
-        del _audio_raw, _text_raw
-        return PreparedInterleaveCache(
-            _ArrowTokenAccessor(audio_arrow),
-            _ArrowTokenAccessor(text_arrow),
-        )
+
+def _read_parquet_metadata(
+    paths: Path | list[Path],
+    *,
+    required_columns: list[str],
+    optional_columns: list[str] | None = None,
+) -> pl.DataFrame:
+    if isinstance(paths, Path):
+        path_list = [paths]
+    else:
+        path_list = paths
+
+    selected_columns = list(required_columns)
+    if path_list:
+        schema_names = _parquet_schema_names(path_list[0])
+        for optional in ("clip_start", "clip_duration"):
+            if optional in schema_names:
+                selected_columns.append(optional)
+        for optional in optional_columns or []:
+            if optional in schema_names and optional not in selected_columns:
+                selected_columns.append(optional)
+
+    return pl.read_parquet(path_list, columns=selected_columns)
 
 
 class _V2InterleaveCacheReader:
@@ -221,23 +221,15 @@ class _V2InterleaveCacheReader:
         self.layout = layout
         self.chunks: list[tuple[Path, Path, Path]] = []
         for rank_dir in sorted(p for p in cache_dir.glob("rank_*") if p.is_dir()):
-            for clips_path in sorted(rank_dir.glob("clips.*.parquet")):
-                stem = clips_path.name.split(".")[1]
-                audio_path = rank_dir / f"audio_tokens.{stem}.bin"
-                text_path = rank_dir / f"text_tokens.{stem}.bin"
-                if not audio_path.exists() or not text_path.exists():
-                    raise RuntimeError(
-                        f"Incomplete v2 structured cache chunk under {rank_dir}: "
-                        f"{clips_path.name} missing token bins"
-                    )
-                self.chunks.append((clips_path, audio_path, text_path))
+            for chunk in validate_v2_chunks_complete(rank_dir, error_label="v2 structured cache"):
+                self.chunks.append((chunk.clips_path, chunk.audio_path, chunk.text_path))
 
-    def load_metadata(self) -> pl.DataFrame:
+    def load_metadata(self, *, include_text: bool = False) -> pl.DataFrame:
         parts: list[pl.DataFrame] = []
         for chunk_idx, (clips_path, _audio_path, _text_path) in enumerate(self.chunks):
-            part = pl.read_parquet(
+            part = _read_parquet_metadata(
                 clips_path,
-                columns=[
+                required_columns=[
                     "source_id",
                     "clip_num",
                     "audio_token_offset",
@@ -245,6 +237,10 @@ class _V2InterleaveCacheReader:
                     "text_token_offset",
                     "text_token_length",
                 ],
+                optional_columns=(
+                    ["clip_id", "text", "speaker", "duration", "dataset"]
+                    if include_text else None
+                ),
             ).with_columns(
                 pl.lit(chunk_idx).alias("_chunk_idx"),
                 (pl.col("audio_token_offset") // np.dtype(np.int32).itemsize).cast(pl.Int64).alias("_audio_token_start"),
@@ -372,30 +368,57 @@ def find_consecutive_runs(sorted_clip_nums: list[int]) -> list[list[int]]:
 # ---------------------------------------------------------------------------
 
 
-def _detect_runs(df: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
-    """Sort by (source_id, clip_num) and detect consecutive-clip runs.
+def _detect_runs(
+    df: pl.DataFrame,
+    *,
+    max_gap_sec: float | None = None,
+) -> tuple[pl.DataFrame, np.ndarray, np.ndarray]:
+    """Sort interleave cache metadata and detect consecutive source runs.
 
-    A new run starts whenever the source changes **or** clip_num is not the
-    previous clip_num + 1.
+    Without timestamp gap detection, runs use dense ``clip_num`` continuity:
+    a new run starts whenever the source changes or ``clip_num`` is not the
+    previous ``clip_num + 1``.
 
-    **Invariant**: this function assumes clip_num is dense (0, 1, 2, ...)
-    within each source_id in the SHAR before tokenization. Gaps in clip_num
-    after tokenization indicate filtered clips (min_duration, min_rms_db)
-    and are treated as real discontinuities — the run breaks and isolated
-    clips become transcribe sequences.
-
-    Sparse or timestamp-based clip_num (e.g. start_ms) will cause excessive
-    fragmentation. Ensure SHAR patching assigns dense clip_num before
-    tokenization.
+    When ``max_gap_sec`` is set, timestamps become first-class: rows are sorted
+    by ``source_id`` and ``clip_start`` and a new run starts when the source
+    changes or the current clip begins more than ``max_gap_sec`` seconds after
+    the previous clip ended. In this mode ``clip_num`` is only a deterministic
+    tie-breaker, so sparse clip numbers or timestamp-derived clip numbers do
+    not fragment runs.
 
     Returns (sorted_df, run_starts, run_lengths) where *run_starts* and
     *run_lengths* are 1-D int arrays indexing into the sorted dataframe.
     """
-    df = df.sort(["source_id", "clip_num"])
-    is_new_run = (
-        (df["source_id"] != df["source_id"].shift(1))
-        | (df["clip_num"] != (df["clip_num"].shift(1) + 1))
-    ).fill_null(True)  # first row is always a run start
+    if max_gap_sec is not None:
+        missing = {"clip_start", "clip_duration"} - set(df.columns)
+        if missing:
+            raise RuntimeError(
+                "Gap-aware run detection requires tokenize cache timing columns "
+                f"{sorted(missing)!r}. Rerun tokenize with the current interleave cache schema."
+            )
+        if df.select(
+            pl.any_horizontal(
+                pl.col("clip_start").is_null(),
+                pl.col("clip_duration").is_null(),
+            ).any()
+        ).item():
+            raise RuntimeError(
+                "Gap-aware run detection requires non-null clip_start and clip_duration "
+                "for every cached clip. Reconvert/tokenize with first-class "
+                "timestamp metadata."
+            )
+        df = df.sort(["source_id", "clip_start", "clip_num"])
+        prev_clip_end = df["clip_start"].shift(1) + df["clip_duration"].shift(1)
+        is_new_run = (
+            (df["source_id"] != df["source_id"].shift(1))
+            | ((df["clip_start"] - prev_clip_end) > max_gap_sec)
+        ).fill_null(True)
+    else:
+        df = df.sort(["source_id", "clip_num"])
+        is_new_run = (
+            (df["source_id"] != df["source_id"].shift(1))
+            | (df["clip_num"] != (df["clip_num"].shift(1) + 1))
+        ).fill_null(True)
     starts = np.where(is_new_run.to_numpy())[0]
     lengths = np.diff(np.append(starts, len(df)))
     return df, starts, lengths
@@ -422,7 +445,7 @@ def _write_idx_file(
         pointers[0] = 0
 
     with open(idx_path, "wb") as f:
-        f.write(_INDEX_HEADER)
+        f.write(MEGATRON_INDEX_HEADER)
         f.write(struct.pack("<Q", 1))  # version
         f.write(struct.pack("<B", DType.code_from_dtype(dtype)))
         f.write(struct.pack("<Q", len(sequence_lengths)))
@@ -562,26 +585,42 @@ def format_distribution(arr: np.ndarray, indent: str = "    ") -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Parquet loading & Arrow preparation helpers
+# Structured cache loading helpers
 # ---------------------------------------------------------------------------
 
 
 def _load_cache_layout(parquet_dir: Path) -> dict[str, object] | None:
-    layout_path = parquet_dir / "_CACHE_LAYOUT.json"
+    layout_path = parquet_dir / INTERLEAVE_CACHE_LAYOUT_FILENAME
     if not layout_path.exists():
         return None
     with open(layout_path) as f:
         return json.load(f)
 
 
+def _validate_cache_layout(layout: Mapping[str, object], layout_path: Path) -> None:
+    """Validate the structured interleave cache layout contract."""
+    if layout.get("version") != INTERLEAVE_CACHE_LAYOUT_V2:
+        raise RuntimeError(
+            f"Unsupported interleave cache layout version at {layout_path}: "
+            f"{layout.get('version')!r}"
+        )
+    if layout.get("schema_version") != INTERLEAVE_CACHE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported interleave cache schema version at {layout_path}: "
+            f"{layout.get('schema_version')!r}; expected {INTERLEAVE_CACHE_SCHEMA_VERSION!r}"
+        )
+
+
 def list_interleave_cache_partitions(cache_dir: Path) -> list[Path]:
     """Return leaf cache directories to plan/build independently."""
     layout = _load_cache_layout(cache_dir)
     if not layout:
-        return [cache_dir]
+        raise RuntimeError(
+            f"{cache_dir} is not a structured interleave cache: missing {INTERLEAVE_CACHE_LAYOUT_FILENAME}. "
+            "Re-run tokenization to build the current cache format."
+        )
 
-    if layout.get("version") != "v2":
-        return [cache_dir]
+    _validate_cache_layout(layout, cache_dir / INTERLEAVE_CACHE_LAYOUT_FILENAME)
 
     if any(p.is_dir() and p.name.startswith("rank_") for p in cache_dir.iterdir()):
         return [cache_dir]
@@ -589,7 +628,7 @@ def list_interleave_cache_partitions(cache_dir: Path) -> list[Path]:
     partition_dirs = sorted(
         p for p in cache_dir.iterdir()
         if p.is_dir()
-        and (p / "_CACHE_LAYOUT.json").exists()
+        and (p / INTERLEAVE_CACHE_LAYOUT_FILENAME).exists()
         and any(child.is_dir() and child.name.startswith("rank_") for child in p.iterdir())
     )
     if partition_dirs:
@@ -644,48 +683,39 @@ def print_partition_stats(partition_stats: list[dict[str, int | str]], top_k: in
     return summary
 
 
-def load_interleave_cache(parquet_dir: Path) -> tuple[pl.DataFrame, object]:
+def load_interleave_cache(parquet_dir: Path, *, include_text: bool = False) -> tuple[pl.DataFrame, object]:
     """Load interleave cache metadata and return the matching cache reader."""
     layout = _load_cache_layout(parquet_dir)
-    if layout:
-        version = layout.get("version")
-        if version == "v2":
-            if not any(p.is_dir() and p.name.startswith("rank_") for p in parquet_dir.iterdir()):
-                raise RuntimeError(
-                    f"{parquet_dir} is a partitioned v2 cache root. "
-                    "Pass a leaf partition directory or use list_interleave_cache_partitions()."
-                )
-            reader = _V2InterleaveCacheReader(parquet_dir, layout)
-            df = reader.load_metadata()
-            print(f"\nFound {len(reader.chunks)} v2 cache chunks in {parquet_dir}")
-            print("Cache layout: v2 (metadata parquet + token bins)")
-            return df, reader
+    if not layout:
         raise RuntimeError(
-            f"Unsupported interleave cache layout version at {parquet_dir / '_CACHE_LAYOUT.json'}: {version!r}"
+            f"{parquet_dir} is not a structured interleave cache: missing {INTERLEAVE_CACHE_LAYOUT_FILENAME}. "
+            "Legacy nested-token Parquet caches are no longer supported; "
+            "re-run tokenization to build the current cache format."
         )
 
-    reader = _V1InterleaveCacheReader(parquet_dir)
-    print(f"\nFound {len(reader.parquet_files)} parquet files in {parquet_dir}")
-    print("Cache layout: v1 (nested token parquet)")
-    t0 = time.time()
-    df = reader.load_metadata()
-    elapsed = time.time() - t0
-    print(f"Loaded {len(df):,} clips in {elapsed:.1f}s")
+    _validate_cache_layout(layout, parquet_dir / INTERLEAVE_CACHE_LAYOUT_FILENAME)
+
+    if not any(p.is_dir() and p.name.startswith("rank_") for p in parquet_dir.iterdir()):
+        raise RuntimeError(
+            f"{parquet_dir} is a partitioned v2 cache root. "
+            "Pass a leaf partition directory or use list_interleave_cache_partitions()."
+        )
+
+    reader = _V2InterleaveCacheReader(parquet_dir, layout)
+    df = reader.load_metadata(include_text=include_text)
+    print(f"\nFound {len(reader.chunks)} v2 cache chunks in {parquet_dir}")
+    print("Cache layout: v2 (metadata parquet + token bins)")
     return df, reader
 
 
 def prepare_length_metadata(df: pl.DataFrame) -> pl.DataFrame:
     """Return a metadata-only dataframe with token lengths for dry runs/planning."""
-    if "audio_tokens" in df.columns and "text_tokens" in df.columns:
-        return df.with_columns(
-            df["audio_tokens"].list.len().cast(pl.UInt64).alias("_alen"),
-            df["text_tokens"].list.len().cast(pl.UInt64).alias("_tlen"),
-        ).select(["source_id", "clip_num", "_alen", "_tlen"])
-
+    timing_columns = [col for col in ("clip_start", "clip_duration") if col in df.columns]
     if "audio_token_length" in df.columns and "text_token_length" in df.columns:
         return df.select(
             "source_id",
             "clip_num",
+            *timing_columns,
             pl.col("audio_token_length").cast(pl.UInt64).alias("_alen"),
             pl.col("text_token_length").cast(pl.UInt64).alias("_tlen"),
         )
@@ -696,10 +726,12 @@ def prepare_length_metadata(df: pl.DataFrame) -> pl.DataFrame:
 def prepare_interleave_cache_and_runs(
     df: pl.DataFrame,
     reader,
+    *,
+    max_gap_sec: float | None = None,
 ) -> tuple[PreparedInterleaveCache, np.ndarray, np.ndarray, int, int]:
     """Prepare a sorted cache view and run boundaries from interleave metadata."""
     print("\nDetecting consecutive runs ...")
-    sorted_df, run_starts, run_lengths = _detect_runs(df)
+    sorted_df, run_starts, run_lengths = _detect_runs(df, max_gap_sec=max_gap_sec)
     n_runs = len(run_starts)
     print(f"  {n_runs:,} runs")
 
@@ -708,64 +740,6 @@ def prepare_interleave_cache_and_runs(
     cache = reader.prepare(sorted_df)
     del sorted_df
     return cache, run_starts, run_lengths, n_clips, n_sources
-
-
-def load_parquets(parquet_dir: Path) -> pl.DataFrame:
-    """Load token parquets from a cache directory.
-
-    Prefer the original tokenization cache naming scheme
-    ``rank_*_chunk_*.parquet``. If none are present, fall back to any
-    ``*.parquet`` files in the directory so repartitioned caches such as
-    per-language ``part_*.parquet`` layouts remain compatible.
-    """
-    parquet_files = sorted(
-        p
-        for p in parquet_dir.glob("rank_*_chunk_*.parquet")
-        if not p.name.endswith(".tmp")
-    )
-    if not parquet_files:
-        parquet_files = sorted(
-            p
-            for p in parquet_dir.glob("*.parquet")
-            if not p.name.endswith(".tmp")
-        )
-    print(f"\nFound {len(parquet_files)} parquet files in {parquet_dir}")
-
-    t0 = time.time()
-    df = pl.read_parquet(
-        parquet_files,
-        columns=["source_id", "clip_num", "audio_tokens", "text_tokens"],
-    )
-    elapsed = time.time() - t0
-    print(f"Loaded {len(df):,} clips in {elapsed:.1f}s")
-    return df
-
-
-def prepare_arrow_and_runs(
-    df: pl.DataFrame,
-) -> tuple[pa.Array, pa.Array, np.ndarray, np.ndarray, int, int]:
-    """Detect runs, extract Arrow arrays, free DataFrame.
-
-    Returns (audio_arrow, text_arrow, run_starts, run_lengths, n_clips, n_sources).
-    """
-    print("\nDetecting consecutive runs ...")
-    df, run_starts, run_lengths = _detect_runs(df)
-    n_runs = len(run_starts)
-    print(f"  {n_runs:,} runs")
-
-    n_clips = len(df)
-    n_sources = df["source_id"].n_unique()
-
-    _audio_raw = df["audio_tokens"].to_arrow()
-    _text_raw = df["text_tokens"].to_arrow()
-    audio_arrow = _audio_raw.combine_chunks() if isinstance(_audio_raw, pa.ChunkedArray) else _audio_raw
-    text_arrow = _text_raw.combine_chunks() if isinstance(_text_raw, pa.ChunkedArray) else _text_raw
-    del _audio_raw, _text_raw
-
-    # Free the polars DataFrame — token data lives in the Arrow arrays
-    del df
-
-    return audio_arrow, text_arrow, run_starts, run_lengths, n_clips, n_sources
 
 
 # ---------------------------------------------------------------------------

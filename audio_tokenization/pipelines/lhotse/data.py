@@ -7,14 +7,18 @@ Data preparation (HF/WDS -> Shar) is handled by standalone scripts:
 This module only loads pre-built Shar and applies runtime filters.
 """
 
+import glob
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Sequence
+
+from audio_tokenization.config.schema import TokenizeSpec
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 
 logger = logging.getLogger(__name__)
 
-SHAR_INDEX_FILENAME = "shar_index.json"
+_GLOB_CHARS = "*?["
 
 
 # ---------------------------------------------------------------------------
@@ -22,12 +26,61 @@ SHAR_INDEX_FILENAME = "shar_index.json"
 # ---------------------------------------------------------------------------
 
 
-def _resolve_index_paths(shar_root: Path, fields: Dict[str, list]) -> Dict[str, list]:
+def resolve_shar_dirs(shar_dir, *, index_name: str = SHAR_INDEX_FILENAME) -> list[str]:
+    """Resolve SHAR inputs to concrete leaf directories.
+
+    Accepts a single directory, a list of directories, glob patterns such as
+    ``/path/to/root/node_*``, and partitioned roots containing child directories
+    with ``shar_index.json``. Returned paths are sorted and de-duplicated for
+    stable resume fingerprints.
+    """
+    if not shar_dir:
+        raise ValueError("Lhotse tokenization requires 'shar_dir' with prepared Shar data.")
+
+    raw_dirs = shar_dir if isinstance(shar_dir, (list, tuple)) else [shar_dir]
+    resolved: list[str] = []
+
+    for item in raw_dirs:
+        item_str = str(item)
+        if any(ch in item_str for ch in _GLOB_CHARS):
+            matches = sorted(Path(p) for p in glob.glob(item_str))
+            dirs = [p for p in matches if p.is_dir()]
+            if not dirs:
+                raise FileNotFoundError(f"No Shar directories match pattern: {item_str}")
+            for d in dirs:
+                resolved.extend(_expand_partitioned_root(d, index_name=index_name))
+            continue
+
+        resolved.extend(_expand_partitioned_root(Path(item_str), index_name=index_name))
+
+    return sorted(dict.fromkeys(resolved))
+
+
+def _expand_partitioned_root(shar_path: Path, *, index_name: str) -> list[str]:
+    """Expand a root with node_*/shar_index.json children to leaf dirs."""
+    if not shar_path.is_dir():
+        return [str(shar_path)]
+
+    if (shar_path / index_name).is_file() or _shar_exists(str(shar_path)):
+        return [str(shar_path)]
+
+    child_dirs = sorted(
+        child
+        for child in shar_path.iterdir()
+        if child.is_dir() and (child / index_name).is_file()
+    )
+    if child_dirs:
+        return [str(child) for child in child_dirs]
+
+    return [str(shar_path)]
+
+
+def _resolve_index_paths(shar_root: Path, fields: dict[str, list]) -> dict[str, list]:
     """Resolve relative paths in shar_index fields against *shar_root*.
 
     Absolute index entries are rejected to keep SHAR fully relocatable.
     """
-    resolved: Dict[str, list] = {}
+    resolved: dict[str, list] = {}
     for field, paths in fields.items():
         out = []
         for p in paths:
@@ -48,14 +101,28 @@ def _resolve_index_paths(shar_root: Path, fields: Dict[str, list]) -> Dict[str, 
 # ---------------------------------------------------------------------------
 
 
-def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int, stats=None):
+def build_cutset(
+    spec: TokenizeSpec,
+    *,
+    input_shar_dirs: Sequence[str],
+    planned_shar_fields: dict[str, list[str]] | None,
+    rank: int,
+    world_size: int,
+    stats=None,
+):
     """Load prepared Shar into a CutSet and apply post-load filters."""
     _set_resampling_backend(rank)
 
-    cuts = _load_shar_cutset(cfg, rank, world_size)
+    cuts = _load_shar_cutset(
+        input_shar_dirs=input_shar_dirs,
+        planned_shar_fields=planned_shar_fields,
+        index_name=spec.output.shar_index_filename,
+        rank=rank,
+        world_size=world_size,
+    )
 
     # Drop low sample-rate audio before resampling (e.g., 8kHz -> 24kHz = garbage).
-    min_sr = cfg.get("min_sample_rate")
+    min_sr = spec.filter.min_sample_rate
     if min_sr is not None:
         min_sr = int(min_sr)
         cuts = cuts.filter(
@@ -64,12 +131,12 @@ def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int, stats=None):
         )
 
     # Lazy safety-net resample (no-op when SR already matches).
-    target_sr = cfg.get("target_sample_rate")
+    target_sr = spec.tokenizer.sampling_rate
     if target_sr:
         cuts = cuts.resample(int(target_sr))
 
-    min_dur = cfg.get("min_duration")
-    max_dur = cfg.get("max_duration")
+    min_dur = spec.filter.min_duration
+    max_dur = spec.filter.max_duration
     if min_dur is not None or max_dur is not None:
         def _dur_filter(cut) -> bool:
             d = cut.duration
@@ -82,8 +149,7 @@ def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int, stats=None):
         cuts = cuts.filter(_dur_filter)
 
     # In audio_text mode, drop cuts without text supervision.
-    mode = cfg.get("mode", "audio_only")
-    if mode == "audio_text":
+    if spec.mode == "audio_text":
         def _has_text(cut):
             if not cut.supervisions or not cut.supervisions[0].text:
                 if stats is not None:
@@ -94,13 +160,20 @@ def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int, stats=None):
         cuts = cuts.filter(_has_text)
 
     # Drop quiet audio using precomputed rms_db stored in cut.custom during
-    # Shar preparation.  Old Shar without the field passes through unfiltered.
-    min_rms_db = cfg.get("min_rms_db")
+    # SHAR preparation. Missing rms_db is a conversion error: rebuild the SHAR
+    # instead of silently changing the tokenization filter semantics.
+    min_rms_db = spec.filter.min_rms_db
     if min_rms_db is not None:
         _min_rms = float(min_rms_db)
 
         def _rms_filter(cut):
             val = (cut.custom or {}).get("rms_db")
+            if val is None:
+                raise ValueError(
+                    f"Cut {cut.id!r} is missing cut.custom['rms_db'] while "
+                    "min_rms_db filtering is enabled. Reconvert this SHAR so "
+                    "RMS metadata is written during conversion."
+                )
             if val is not None and val < _min_rms:
                 if stats is not None:
                     stats.rms_skipped += 1
@@ -117,27 +190,40 @@ def build_cutset(cfg: Dict[str, Any], rank: int, world_size: int, stats=None):
 # ---------------------------------------------------------------------------
 
 
-def _load_shar_cutset(cfg, rank, world_size=1):
+def _load_shar_cutset(
+    *,
+    input_shar_dirs: Sequence[str],
+    planned_shar_fields: dict[str, list[str]] | None,
+    index_name: str,
+    rank: int,
+    world_size: int = 1,
+):
     """Load a CutSet from one or more prepared Shar directories.
 
     ``shar_dir`` may be a single path (str) or a list of paths.  When
     multiple directories are given their shar indexes are merged so that
     ``CutSet.from_shar`` sees one unified pool of shards.
 
-    When ``world_size > 1``, shards are split across DDP ranks via
-    round-robin assignment so each rank loads only its subset.  This
-    avoids the O(world_size) overhead of Lhotse's strided distribution.
+    Multi-rank launches must pass ``planned_shar_fields`` from
+    ``stages/tokenize.py``. That plan assigns whole SHAR work units by
+    estimated duration before this loader is called.
     """
     from lhotse import CutSet
 
-    shar_dir = cfg.get("shar_dir")
-    if not shar_dir:
-        raise ValueError("Lhotse tokenization requires 'shar_dir' with prepared Shar data.")
+    if planned_shar_fields is not None:
+        planned_fields = {k: sorted(v) for k, v in planned_shar_fields.items()}
+        logger.info(
+            "[rank %s] Loading planned SHAR assignment: %s cut shard(s)",
+            rank,
+            len(planned_fields.get("cuts", [])),
+        )
+        return CutSet.from_shar(
+            fields=planned_fields,
+            split_for_dataloading=False,
+            shuffle_shards=True,
+        )
 
-    # Normalise to a list so single-dir and multi-dir use the same code path.
-    shar_dirs = shar_dir if isinstance(shar_dir, (list, tuple)) else [shar_dir]
-
-    index_name = cfg.get("shar_index_filename", SHAR_INDEX_FILENAME)
+    shar_dirs = resolve_shar_dirs(input_shar_dirs, index_name=index_name)
     merged_fields: dict[str, list[str]] = {}
 
     for sd in shar_dirs:
@@ -175,18 +261,14 @@ def _load_shar_cutset(cfg, rank, world_size=1):
         f"{total_shards} cut shards"
     )
 
-    # Split shards across DDP ranks (round-robin) so each rank's sampler
-    # only iterates its own subset — eliminates O(world_size) overhead.
     if world_size > 1:
-        for field in merged_fields:
-            merged_fields[field] = merged_fields[field][rank::world_size]
-        logger.info(
-            f"[rank {rank}] Shard split: "
-            f"{len(merged_fields['cuts'])}/{total_shards} shards"
+        raise RuntimeError(
+            "Multi-rank tokenization requires planned_shar_fields from the "
+            "tokenize stage; refusing to load the full SHAR on every rank."
         )
 
     # Intentionally keep split_for_dataloading disabled here.
-    # This pipeline assigns whole SHAR shards to ranks explicitly above so
+    # This pipeline assigns whole SHAR shards to ranks via planned fields so
     # checkpoint ownership and output ownership are both rank-local. Switching
     # to Lhotse's worker/node striding would blur that ownership boundary and
     # make recovery/output layout harder to reason about.

@@ -33,7 +33,6 @@ Used both as a library (`validate_shar_directory`) and a CLI:
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import logging
 import multiprocessing
@@ -45,12 +44,12 @@ from pathlib import Path
 from lhotse.serialization import decode_json_line, deserialize_item
 from lhotse.shar.utils import fill_shar_placeholder
 
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.prepare.runtime import resolve_num_workers
+from audio_tokenization.utils.io import open_compressed
 
 
 logger = logging.getLogger(__name__)
-
-SHAR_INDEX_FILE = "shar_index.json"
 
 
 class _StructuralReadError(RuntimeError):
@@ -121,8 +120,7 @@ def _shard_slices(
 
 
 def _count_jsonl_entries(path: Path) -> int:
-    opener = gzip.open if path.name.endswith(".gz") else open
-    with opener(path, "rt") as f:
+    with open_compressed(path, "rt") as f:
         return sum(1 for line in f if line.strip())
 
 
@@ -150,8 +148,7 @@ def _iter_jsonl_rows(path: Path):
     Wraps `json.JSONDecodeError` into `_StructuralReadError` with line context.
     The shared scaffolding for `_iter_cut_ids` and `_iter_jsonl_sidecar_ids`.
     """
-    opener = gzip.open if path.name.endswith(".gz") else open
-    with opener(path, "rt") as f:
+    with open_compressed(path, "rt") as f:
         for line_no, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -253,7 +250,11 @@ def _iter_tar_pair_stems(path: Path):
             tar_path = tarinfo.name
             if any(tar_path.endswith(suffix) for suffix in _META_SUFFIXES):
                 f = tar.extractfile(tarinfo)
-                meta_bytes = f.read() if f is not None else b""
+                if f is None:
+                    meta_bytes = b""
+                else:
+                    with f:
+                        meta_bytes = f.read()
             else:
                 meta_bytes = None
             pending.append((tar_path, meta_bytes))
@@ -467,7 +468,7 @@ def validate_shar_directory(
     shar_dir: Path,
     *,
     verbose: bool = False,
-    index_filename: str = SHAR_INDEX_FILE,
+    index_filename: str = SHAR_INDEX_FILENAME,
     num_workers: int | None = None,
 ) -> dict[str, int]:
     """Validate *shar_dir* and return per-shard cut counts.
@@ -521,10 +522,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shar-dir", type=Path, required=True)
     p.add_argument(
         "--index-filename",
-        default=SHAR_INDEX_FILE,
+        default=SHAR_INDEX_FILENAME,
         help=(
             "Name of the SHAR index file inside --shar-dir "
-            f"(default: {SHAR_INDEX_FILE}). Match this to "
+            f"(default: {SHAR_INDEX_FILENAME}). Match this to "
             "--shar_index_filename if the SHAR was prepared with a non-default value."
         ),
     )

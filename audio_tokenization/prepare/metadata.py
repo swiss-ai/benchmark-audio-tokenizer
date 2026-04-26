@@ -1,30 +1,14 @@
-"""Metadata loading and override helpers for prepare_data."""
+"""Metadata loading and override helpers for prepare scripts."""
 
 from __future__ import annotations
 
-import io
 import logging
 from collections import Counter
 from pathlib import Path
 from typing import Iterable, Mapping
 
 from audio_tokenization.prepare.constants import MetadataEntry
-
-
-def _open_compressed(path: Path, mode: str = "rb"):
-    """Open a file, transparently decompressing .gz or .zst."""
-    if path.suffix == ".gz":
-        import gzip
-
-        return gzip.open(path, mode)
-    if path.suffix == ".zst":
-        import zstandard
-
-        if "b" in mode:
-            raw = zstandard.open(path, mode)
-            return io.BufferedReader(raw)
-        return zstandard.open(path, mode)
-    return open(path, mode)
+from audio_tokenization.utils.io import open_compressed
 
 
 def _strip_compression_suffix(path: Path) -> str:
@@ -47,20 +31,40 @@ def load_external_metadata(
     result: dict[str, MetadataEntry] = {}
 
     if fmt == ".tsv":
-        with _open_compressed(p, "rt") as f:
+        import csv
+
+        with open_compressed(p, "rt") as f:
+            first_line = ""
             for line in f:
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                parts = line.split("\t", 1)
-                if len(parts) == 2:
-                    result[parts[0]] = (parts[1], {})
+                first_line = line
+                break
+            if first_line:
+                header = first_line.split("\t")
+                if id_field in header and text_field in header:
+                    reader = csv.DictReader(f, fieldnames=header, delimiter="\t")
+                    for row in reader:
+                        custom = {k: row[k] for k in (custom_fields or ()) if k in row}
+                        result[str(row[id_field])] = (row.get(text_field), custom)
+                else:
+                    parts = first_line.split("\t", 1)
+                    if len(parts) == 2:
+                        result[parts[0]] = (parts[1], {})
+                    for line in f:
+                        line = line.rstrip("\n")
+                        if not line:
+                            continue
+                        parts = line.split("\t", 1)
+                        if len(parts) == 2:
+                            result[parts[0]] = (parts[1], {})
 
     elif fmt == ".jsonl":
         import orjson
 
         skipped = 0
-        with _open_compressed(p, "rb") as f:
+        with open_compressed(p, "rb") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -80,7 +84,7 @@ def load_external_metadata(
     elif fmt == ".csv":
         import csv
 
-        with _open_compressed(p, "rt") as f:
+        with open_compressed(p, "rt") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 custom = {k: row[k] for k in (custom_fields or ()) if k in row}
@@ -157,4 +161,3 @@ def normalize_optional_path(path: str | Path | None) -> str | None:
     if path is None:
         return None
     return str(Path(path).expanduser().resolve())
-

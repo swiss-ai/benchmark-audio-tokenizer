@@ -1,12 +1,12 @@
-"""Audio Tokenization Pipeline for benchmark-audio-tokenizer.
+"""Production audio tokenization pipeline.
 
-This package provides a distributed tokenization pipeline for audio datasets,
-similar to vision_tokenization but optimized for audio tokenizers.
+The package provides dataset conversion, GPU audio tokenization, interleave
+materialization, validation, and operator tooling for large audio corpora.
 """
 
 __version__ = "0.1.0"
 
 def main():
     """Entry point for CLI."""
-    from .tokenize import main as _main
+    from .__main__ import main as _main
     return _main()

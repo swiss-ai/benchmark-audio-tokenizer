@@ -1,7 +1,0 @@
-dataset_name: coral_v3_read_aloud
-output_name: coral_v3_read_aloud
-
-shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/coral_v3_read_aloud_train
-
-num_buckets: 20

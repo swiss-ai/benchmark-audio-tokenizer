@@ -1,4 +1,4 @@
-"""Runtime and filesystem helpers for prepare_data."""
+"""Runtime and filesystem helpers for prepare scripts."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.prepare.constants import (
     CURRENT_PREPARE_STATE_VERSION,
     PREPARE_STATE_FILE,
@@ -19,9 +20,26 @@ from audio_tokenization.prepare.constants import (
     WORKER_ASSIGNMENT_FILE,
     WORKER_STATS_FILE,
 )
+from audio_tokenization.utils.io import atomic_streaming_write, atomic_write_json
+from audio_tokenization.utils.stats import load_json_records, max_field, sum_counter_fields
 
 
 logger = logging.getLogger(__name__)
+
+
+class PrepareStateLegacyError(RuntimeError):
+    """Raised by ``read_prepare_state`` for legacy prepare-state files.
+
+    Distinguishes the two legitimate "this SHAR predates the typed prepare-state
+    contract" cases (no ``version`` field, or a ``version`` older than this code
+    knows) from genuine bugs (future-version downgrade, malformed payload,
+    non-int version). Provenance readers in ``stages/_provenance.py`` opt into
+    legacy tolerance by catching this subclass; everything else still fails
+    loud as a generic ``RuntimeError``.
+    """
+
+
+_PREPARE_TOTAL_FIELDS = ("written", "skipped", "errors", "total_duration_sec")
 
 
 def validate_prepare_runtime(
@@ -76,44 +94,17 @@ def mark_partition_success(
     success_marker_name: str = SUCCESS_MARKER_FILE,
 ) -> None:
     """Atomically mark a partition as fully prepared."""
-    (part_dir / success_marker_name).write_text("ok\n")
-
-
-def _migrate_prepare_state_v0_to_v1(payload: dict) -> dict:
-    upgraded = dict(payload)
-    upgraded["version"] = 1
-    return upgraded
-
-
-_PREPARE_STATE_MIGRATIONS = {
-    (0, 1): _migrate_prepare_state_v0_to_v1,
-}
-
-
-def _atomic_write_state_json(state_path: Path, payload: dict) -> None:
-    """Write ``payload`` to ``state_path`` atomically, with fsync for durability.
-
-    Why fsync: cscs Lustre scratch can leave a zero-byte file after node
-    failure if the data isn't flushed before the metadata rename. Losing the
-    state file silently downgrades the next run to "first run" and re-prepares
-    the entire dataset.
-    """
-    tmp_path = state_path.with_suffix(state_path.suffix + ".tmp")
-    data = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    with open(tmp_path, "w") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, state_path)
+    with atomic_streaming_write(part_dir / success_marker_name, mode="w") as f:
+        f.write("ok\n")
 
 
 def read_prepare_state(state_path: Path) -> dict:
-    """Read a prepare state file, auto-upgrading v0 (unversioned) in place.
+    """Read a current-version prepare state file.
 
     Raises:
         FileNotFoundError: if ``state_path`` does not exist.
-        RuntimeError: if the file has an unknown future version, a payload
-            that isn't a dict, or a missing migration step.
+        RuntimeError: if the file has no version, the wrong version, or a
+            payload that is not a dict.
     """
     if not state_path.is_file():
         raise FileNotFoundError(state_path)
@@ -122,7 +113,13 @@ def read_prepare_state(state_path: Path) -> dict:
     if not isinstance(payload, dict):
         raise RuntimeError(f"Invalid prepare state format: {state_path}")
 
-    version = payload.get("version", 0)
+    if "version" not in payload:
+        raise PrepareStateLegacyError(
+            f"Prepare state at {state_path} has no version. Delete the output "
+            "directory and reconvert from raw inputs."
+        )
+
+    version = payload["version"]
     if not isinstance(version, int):
         raise RuntimeError(
             f"Invalid prepare state at {state_path}: 'version' must be an int, "
@@ -137,24 +134,11 @@ def read_prepare_state(state_path: Path) -> dict:
             "file to start a fresh prepare run."
         )
 
-    upgraded = False
-    while version < CURRENT_PREPARE_STATE_VERSION:
-        step = (version, version + 1)
-        migrate = _PREPARE_STATE_MIGRATIONS.get(step)
-        if migrate is None:
-            raise RuntimeError(
-                f"Missing prepare-state migration for {step}; this is a bug. "
-                f"State file: {state_path}"
-            )
-        payload = migrate(payload)
-        version += 1
-        upgraded = True
-
-    if upgraded:
-        _atomic_write_state_json(state_path, payload)
-        logger.info(
-            "Upgraded %s to prepare-state v%d (in place).",
-            state_path.name, CURRENT_PREPARE_STATE_VERSION,
+    if version < CURRENT_PREPARE_STATE_VERSION:
+        raise PrepareStateLegacyError(
+            f"Prepare state at {state_path} is stale version {version}; "
+            f"expected {CURRENT_PREPARE_STATE_VERSION}. Delete the output "
+            "directory and reconvert from raw inputs."
         )
 
     return payload
@@ -185,22 +169,21 @@ def validate_or_write_prepare_state(
     invariant_keys: Sequence[str],
     guidance: str,
 ) -> bool:
-    """Persist first-run state or assert resume invariants on later runs.
-
-    Backfill: if a key in ``invariant_keys`` is missing from the on-disk
-    payload (e.g. expanded invariant set on a v0 file), the current value is
-    accepted and persisted; subsequent runs then enforce strict equality.
-    Returns ``True`` on first write, ``False`` on validated resume.
-    """
+    """Persist first-run state or assert resume invariants on later runs."""
     if state_path.is_file():
         payload = read_prepare_state(state_path)
-        backfilled: list[str] = []
 
         for key in invariant_keys:
             if key not in payload:
-                payload[key] = expected.get(key)
-                backfilled.append(key)
-                continue
+                raise AssertionError(
+                    "Unsafe resume detected: persisted configuration is missing "
+                    "a required invariant.\n"
+                    f"State file: {state_path}\n"
+                    f"Key: {key}\n"
+                    f"Existing value: '<missing>'\n"
+                    f"Current value: {expected.get(key)!r}\n"
+                    f"{guidance}"
+                )
             prev = payload[key]
             cur = expected.get(key)
             if prev != cur:
@@ -212,17 +195,10 @@ def validate_or_write_prepare_state(
                     f"Current value: {cur!r}\n"
                     f"{guidance}"
                 )
-
-        if backfilled:
-            _atomic_write_state_json(state_path, payload)
-            logger.info(
-                "Backfilled prepare-state keys on first resume: %s",
-                sorted(backfilled),
-            )
         return False
 
     versioned = {"version": CURRENT_PREPARE_STATE_VERSION, **dict(expected)}
-    _atomic_write_state_json(state_path, versioned)
+    atomic_write_json(state_path, versioned)
     return True
 
 
@@ -321,7 +297,7 @@ def build_shar_index_from_parts(
         "fields": {k: sorted(v) for k, v in fields.items()},
     }
     index_path = shar_root / index_filename
-    index_path.write_text(json.dumps(payload, indent=2))
+    atomic_write_json(index_path, payload)
     return index_path, len(fields["cuts"])
 
 
@@ -349,7 +325,7 @@ def distribute_round_robin(items: Sequence, num_workers: int) -> list[list]:
 def build_shar_index(
     shar_root: Path,
     num_workers: int,
-    index_filename: str = "shar_index.json",
+    index_filename: str = SHAR_INDEX_FILENAME,
     worker_dir_fmt: str = "worker_{:02d}",
 ) -> None:
     """Build a merged ``shar_index.json`` from all ``worker_*`` directories."""
@@ -411,7 +387,7 @@ def write_worker_assignment(
         "num_workers": int(num_workers),
         items_key: list(resolved_items),
     }
-    path.write_text(json.dumps(payload, indent=2))
+    atomic_write_json(path, payload)
     return path
 
 
@@ -500,7 +476,7 @@ def write_worker_result(
         worker_stats.update(extra_stats)
 
     worker_stats_path = worker_dir / WORKER_STATS_FILE
-    worker_stats_path.write_text(json.dumps(worker_stats, indent=2) + "\n")
+    atomic_write_json(worker_stats_path, worker_stats, sort_keys=False)
 
     mark_partition_success(worker_dir, success_marker_name=SUCCESS_MARKER_FILE)
 
@@ -517,6 +493,64 @@ def write_worker_result(
     if extra_stats:
         result.update(extra_stats)
     return result
+
+
+def _effective_worker_value(result: dict, key: str) -> int | float:
+    """Read a worker value, falling back to persisted stats for reused workers."""
+    worker_stats = result.get("worker_stats") or {}
+    if result.get("reused"):
+        return worker_stats.get(key, result.get(key, 0)) or 0
+    value = result.get(key)
+    if key == "written" and value == -1:
+        return worker_stats.get(key, 0) or 0
+    return value or 0
+
+
+def build_prepare_summary(
+    results: list[dict],
+    *,
+    elapsed_sec: float,
+    num_workers: int,
+) -> dict:
+    """Aggregate prepare worker results into the durable summary schema."""
+    totals = {
+        key: sum(_effective_worker_value(result, key) for result in results)
+        for key in _PREPARE_TOTAL_FIELDS
+    }
+    reason_counts = sum_counter_fields(
+        results,
+        "reason_counts",
+        ("worker_stats", "reason_counts"),
+    )
+    runtime_counts = sum_counter_fields(results, ("worker_stats", "runtime_counts"))
+
+    return {
+        "version": 1,
+        "num_workers": num_workers,
+        "workers_reused": sum(1 for r in results if r.get("reused")),
+        "elapsed_sec": elapsed_sec,
+        "total_written": int(totals["written"]),
+        "total_skipped": int(totals["skipped"]),
+        "total_errors": int(totals["errors"]),
+        "total_duration_sec": float(totals["total_duration_sec"]),
+        "runtime_counts": runtime_counts,
+        "reason_counts": reason_counts,
+        "results": results,
+    }
+
+
+def build_prepare_rollup(summaries: list[dict]) -> dict:
+    """Aggregate node-level prepare summaries for operator reporting."""
+    return {
+        "num_nodes": len(summaries),
+        "total_written": int(sum(s.get("total_written", 0) for s in summaries)),
+        "total_skipped": int(sum(s.get("total_skipped", 0) for s in summaries)),
+        "total_errors": int(sum(s.get("total_errors", 0) for s in summaries)),
+        "total_duration_sec": float(sum(s.get("total_duration_sec", 0.0) for s in summaries)),
+        "max_elapsed_sec": max_field(summaries, "elapsed_sec"),
+        "reason_counts": sum_counter_fields(summaries, "reason_counts"),
+        "runtime_counts": sum_counter_fields(summaries, "runtime_counts"),
+    }
 
 
 def ensure_worker_assignment(
@@ -583,18 +617,17 @@ def run_pool_and_finalize(
         results = pool.map(worker_fn, worker_args)
 
     elapsed = _time.time() - t0
-    total_written = sum(r["written"] for r in results if r["written"] >= 0)
-    total_skipped = sum(r["skipped"] for r in results)
-    total_errors = sum(r["errors"] for r in results)
-    total_reused = sum(1 for r in results if r.get("reused"))
-    total_duration_sec = sum(r.get("total_duration_sec", 0.0) for r in results)
-    total_reason_counts: Counter = Counter()
-    total_runtime_counts: Counter = Counter()
-    for r in results:
-        total_reason_counts.update(r.get("reason_counts", {}))
-        total_runtime_counts.update(
-            (r.get("worker_stats") or {}).get("runtime_counts", {})
-        )
+    summary = build_prepare_summary(
+        results,
+        elapsed_sec=elapsed,
+        num_workers=num_workers,
+    )
+    total_written = summary["total_written"]
+    total_skipped = summary["total_skipped"]
+    total_errors = summary["total_errors"]
+    total_duration_sec = summary["total_duration_sec"]
+    total_reason_counts = summary["reason_counts"]
+    total_runtime_counts = summary["runtime_counts"]
 
     logger.info(
         f"All workers done in {elapsed:.1f}s — "
@@ -606,21 +639,8 @@ def run_pool_and_finalize(
     if total_runtime_counts:
         logger.info(f"Runtime counters (global): {dict(total_runtime_counts)}")
 
-    summary = {
-        "version": 1,
-        "num_workers": num_workers,
-        "workers_reused": total_reused,
-        "elapsed_sec": elapsed,
-        "total_written": total_written,
-        "total_skipped": total_skipped,
-        "total_errors": total_errors,
-        "total_duration_sec": total_duration_sec,
-        "runtime_counts": dict(total_runtime_counts),
-        "reason_counts": dict(total_reason_counts),
-        "results": results,
-    }
     summary_path = Path(shar_dir) / PREPARE_SUMMARY_FILE
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    atomic_write_json(summary_path, summary, sort_keys=False)
     logger.info(f"Wrote prepare summary: {summary_path}")
 
     build_shar_index(Path(shar_dir), num_workers=num_workers)
@@ -652,45 +672,30 @@ def run_aggregate(shar_root: Path) -> None:
                 f"No node_*/ dirs (or {PREPARE_SUMMARY_FILE}) found under {shar_root}"
             )
 
-    summaries = []
+    summary_paths = []
     for nd in node_dirs:
         sp = nd / PREPARE_SUMMARY_FILE
         if not sp.is_file():
             logger.warning(f"Missing {sp}, skipping")
             continue
-        summaries.append(json.loads(sp.read_text()))
+        summary_paths.append(sp)
+    summaries = load_json_records(summary_paths, logger=logger)
 
     if not summaries:
         raise FileNotFoundError(f"No {PREPARE_SUMMARY_FILE} found in any node dir")
 
-    total_written = 0
-    total_skipped = 0
-    total_errors = 0
-    total_duration_sec = 0.0
-    total_elapsed_sec = 0.0
-    agg_reason: Counter = Counter()
-    agg_runtime: Counter = Counter()
-
-    for s in summaries:
-        total_written += s.get("total_written", 0)
-        total_skipped += s.get("total_skipped", 0)
-        total_errors += s.get("total_errors", 0)
-        total_duration_sec += s.get("total_duration_sec", 0.0)
-        total_elapsed_sec = max(total_elapsed_sec, s.get("elapsed_sec", 0.0))
-        agg_reason.update(s.get("reason_counts", {}))
-        agg_runtime.update(s.get("runtime_counts", {}))
-
-    total_hours = total_duration_sec / 3600.0
+    rollup = build_prepare_rollup(summaries)
+    total_hours = rollup["total_duration_sec"] / 3600.0
 
     print()
     print(f"=== Aggregate stats from {len(summaries)} node(s) under {shar_root} ===")
-    print(f"  Samples written:  {total_written:>12d}")
-    print(f"  Samples skipped:  {total_skipped:>12d}")
-    print(f"  Errors:           {total_errors:>12d}")
+    print(f"  Samples written:  {rollup['total_written']:>12d}")
+    print(f"  Samples skipped:  {rollup['total_skipped']:>12d}")
+    print(f"  Errors:           {rollup['total_errors']:>12d}")
     print(f"  Total hours:      {total_hours:>12.1f}")
-    print(f"  Max wall-time:    {total_elapsed_sec:>12.1f}s")
-    if agg_reason:
-        print(f"  VAD reasons:      {dict(agg_reason)}")
-    if agg_runtime:
-        print(f"  Runtime counters: {dict(agg_runtime)}")
+    print(f"  Max wall-time:    {rollup['max_elapsed_sec']:>12.1f}s")
+    if rollup["reason_counts"]:
+        print(f"  VAD reasons:      {rollup['reason_counts']}")
+    if rollup["runtime_counts"]:
+        print(f"  Runtime counters: {rollup['runtime_counts']}")
     print()

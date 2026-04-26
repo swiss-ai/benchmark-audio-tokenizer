@@ -39,7 +39,6 @@ Usage (external metadata mode — e.g. GigaSpeech2):
 import argparse
 from collections import Counter
 from dataclasses import dataclass
-import glob
 import logging
 import time
 from pathlib import Path
@@ -48,6 +47,7 @@ from typing import Any, Optional, Tuple
 from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
+    write_cut_to_shar,
 )
 from audio_tokenization.prepare.cli import (
     add_audio_processing_args,
@@ -55,11 +55,12 @@ from audio_tokenization.prepare.cli import (
     add_parallelism_args,
     add_shar_output_args,
     add_text_tokenizer_args,
+    expand_path_patterns,
 )
 from audio_tokenization.prepare.identity import (
     add_input_clip_id_parser_arg,
     resolve_input_source_and_clip_num,
-    set_universal_cut_id,
+    set_interleave_metadata,
 )
 from audio_tokenization.prepare.metadata import (
     load_external_metadata,
@@ -457,7 +458,7 @@ def _convert_worker(args_tuple):
                     if sample_lang is not None:
                         out_cut.custom = out_cut.custom or {}
                         out_cut.custom["lang"] = sample_lang
-                    out_cut, skip = apply_audio_pipeline(
+                    out_cut, skip, decoded_audio = apply_audio_pipeline(
                         out_cut,
                         target_sr=None,  # already resampled before VAD
                         mono_downmix=mono_downmix,
@@ -472,13 +473,18 @@ def _convert_worker(args_tuple):
                         chunk_idx=chunk_idx,
                         input_clip_id_parser=input_clip_id_parser,
                     )
-                    set_universal_cut_id(
+                    set_interleave_metadata(
                         out_cut,
                         source_id,
                         clip_num,
                         clip_start=(out_cut.custom or {}).get("global_offset_sec", 0.0),
                     )
-                    writer.write(out_cut)
+                    write_cut_to_shar(
+                        writer,
+                        out_cut,
+                        audio=decoded_audio,
+                        runtime_counts=runtime_counts,
+                    )
                     written += 1
                     total_duration_sec += out_cut.duration
                     runtime_counts["cuts_written"] += 1
@@ -564,9 +570,9 @@ def run(spec):
     if not i.wds_shards:
         raise ValueError("prepare.input.wds_shards is required")
 
-    resolved = sorted(set(p for pattern in i.wds_shards for p in glob.glob(pattern)))
+    resolved = expand_path_patterns(i.wds_shards)
     if not resolved:
-        raise FileNotFoundError(f"No files match patterns: {i.wds_shards}")
+        raise FileNotFoundError(f"No files match patterns: {list(i.wds_shards)}")
 
     validate_prepare_runtime(
         resampling_backend=o.resampling_backend,
@@ -638,7 +644,7 @@ def run(spec):
         logger.info("Using fork start method for COW sharing of external metadata")
     else:
         _METADATA_PROVIDER = None
-        mp_start_method = "forkserver"
+        mp_start_method = o.mp_start_method
 
     text_tokenizer = load_text_tokenizer(o.text_tokenizer)
 

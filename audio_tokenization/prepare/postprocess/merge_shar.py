@@ -20,6 +20,9 @@ import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
+from audio_tokenization.utils.io import atomic_streaming_write, atomic_write_json
+
 LOG = logging.getLogger("merge_shar")
 SHAR_NAME_RE = re.compile(r"^(?P<field>.+)\.(?P<idx>\d{6})(?P<suffix>\..+)$")
 
@@ -282,7 +285,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--index-filename",
         type=str,
-        default="shar_index.json",
+        default=SHAR_INDEX_FILENAME,
         help="Input/output SHAR index filename (default: shar_index.json).",
     )
     parser.add_argument("--target-shards", type=int, required=True)
@@ -380,12 +383,13 @@ def main() -> None:
                     LOG.info("Merged %d/%d output shards", done, len(tasks))
 
     index_path = output_dir / args.index_filename
-    index_path.write_text(json.dumps({"version": 1, "fields": out_index}, indent=2) + "\n")
+    atomic_write_json(index_path, {"version": 1, "fields": out_index})
 
     if args.copy_sidecars:
         _copy_sidecars(input_dir, output_dir, args.copy_sidecars)
 
-    (output_dir / "_SUCCESS").write_text("ok\n")
+    with atomic_streaming_write(output_dir / "_SUCCESS", mode="w") as f:
+        f.write("ok\n")
     LOG.info("Wrote %s", index_path)
     LOG.info("Done: %s", output_dir)
 

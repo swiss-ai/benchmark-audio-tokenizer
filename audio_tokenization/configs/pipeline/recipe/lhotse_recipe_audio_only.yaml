@@ -1,0 +1,89 @@
+recipe:
+  mode: audio_only
+  source_type: lhotse_recipe
+  tokenize: true
+  materialize_interleave: false
+
+source:
+  type: lhotse_recipe
+  recipe: null
+  path: null
+  split: null
+  recipe_kwargs: "{}"
+  min_sample_rate: null
+  trim_to_supervisions: false
+  shar_index_filename: shar_index.json
+
+columns:
+  audio: audio
+  text: null
+  duration: null
+  id: null
+  language_column: null
+  external_metadata: null
+  id_prefix: null
+  custom_fields: []
+  id_field: id
+  text_field: text
+  keep: []
+  constant: {}
+  derived: {}
+  text_tokenize: []
+
+timeline:
+  type: none
+  parser: null
+  source_id: null
+  clip_num: null
+  clip_start: null
+  clip_end: null
+  clip_duration: null
+
+conversion:
+  enabled: true
+  shard_size: 5000
+  shar_format: flac
+  target_sr: 24000
+  text_tokenizer: null
+  num_workers: null
+  resampling_backend: soxr
+  mp_start_method: forkserver
+  read_batch_size: 256
+
+tokenization:
+  input_shar_dir: null
+  partitioning: null
+  audio_text_task: transcribe
+  min_duration: 1.0
+  max_duration: 200.0
+  min_sample_rate: 16000
+  min_rms_db: -50
+  normalize_peak_db: -3
+  num_workers: 32
+  prefetch_factor: 4
+  max_batch_duration: 2000.0
+  max_batch_cuts: null
+  checkpoint_interval_batches: 1000
+  num_buckets: 20
+  bucket_buffer_size: 20000
+  sampler_shuffle: true
+  sampler_seed: 42
+  quadratic_duration: null
+  shar_index_filename: shar_index.json
+  wandb:
+    enabled: true
+
+materialization:
+  interleave:
+    enabled: false
+    strategy: shift_by_one
+    cache_dir: null
+    output_dir: null
+    tokenizer_path: null
+    max_seq_len: 262144
+    max_gap_sec: null
+    seq_threshold: null
+    transcribe_ratio: null
+    num_workers: null
+    tmp_dir: null
+  sft: {}

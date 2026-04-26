@@ -1,9 +1,0 @@
-# CoRal v3 conversation train split — audio-text interleaved tokenization.
-
-dataset_name: coral_v3_conversation
-output_name: coral_v3_conversation_train_interleaved_normalized
-
-shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/coral_v3_conversation_train
-
-min_duration: 0.1

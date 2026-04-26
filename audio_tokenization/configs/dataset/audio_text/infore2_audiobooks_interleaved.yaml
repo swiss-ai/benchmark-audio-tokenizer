@@ -1,9 +1,0 @@
-# Infore2 audiobooks — Vietnamese audiobooks, interleaved tokenization.
-# ~315K segments, ~415h. Consecutive clip_nums are interleavable.
-dataset_name: infore2_audiobooks
-output_name: infore2_audiobooks_interleaved
-
-shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/infore2_audiobooks_train
-
-num_buckets: 80

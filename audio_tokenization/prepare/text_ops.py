@@ -1,4 +1,4 @@
-"""Text tokenizer helpers for prepare_data."""
+"""Text tokenizer helpers for prepare scripts."""
 
 from __future__ import annotations
 
@@ -45,4 +45,3 @@ def make_text_tokenize_fn(tokenizer, extra_custom_columns=None):
         return cut
 
     return _tokenize_text
-

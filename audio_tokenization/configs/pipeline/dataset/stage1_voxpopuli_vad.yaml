@@ -1,0 +1,39 @@
+defaults:
+  - /recipe/audio_dir_audio_only@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - /profile/cscs@_here_
+  - _self_
+
+# Stage-1 VoxPopuli VAD rebuild. Conversion is Slurm-array partitioned;
+# tokenization expands node_* SHAR dirs under outputs.shar_dir.
+
+name: stage1_voxpopuli_vad
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/voxpopuli/raw_audios
+  manifests:
+    - /capstor/store/cscs/swissai/infra01/audio-datasets/raw/voxpopuli/vad_results_merged/per_lang_year_dedup/*.jsonl
+  audio_ext: .ogg
+  min_sr: 16000
+  vad:
+    max_chunk_sec: 200.0
+    min_chunk_sec: 5.0
+    sample_rate: 16000
+    max_merge_gap_sec: 2.0
+    max_duration_sec: 200.0
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1_rebuild/voxpopuli_shar_v2
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/stage_1_rebuild
+  name: voxpopuli_vad_v2
+
+conversion:
+  enabled: false
+  shard_size: 2000
+  num_workers: 288
+
+tokenization:
+  min_duration: 5.0
+  max_duration: 200.0
+  max_batch_duration: 1000.0
+  checkpoint_interval_batches: 2000

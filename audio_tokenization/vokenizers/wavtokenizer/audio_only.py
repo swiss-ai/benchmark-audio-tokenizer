@@ -180,7 +180,9 @@ class WavTokenizerAudioOnly:
             audios: List/array/tensor of audio samples, all same length
             sample_rate: Sample rate of all audio samples
             orig_audio_samples: Original (unpadded) sample lengths per audio
-            pad_audio_samples: Padding length in samples (used to trim padded tails)
+            pad_audio_samples: Padding length in samples. Kept for API
+                compatibility; trimming is based on each original length, not
+                on whether that sample was the longest item in this batch.
 
         Returns:
             List of token tensors, each: [BOS, audio_start, audio_tokens..., audio_end, EOS]
@@ -223,14 +225,11 @@ class WavTokenizerAudioOnly:
                 if batch_audio.device != self.device:
                     batch_audio = batch_audio.to(self.device, non_blocking=True)
 
-        # Encode entire batch at once (handles resampling internally)
-        batch_tokens, _ = self.wavtokenizer.encode(batch_audio, sr=sample_rate)
-        # batch_tokens shape: (B, N) where N is number of audio tokens per sample
-
-        # Get dimensions
-        device = batch_tokens.device
-
         if orig_audio_samples is None:
+            # Encode entire batch at once (handles resampling internally).
+            batch_tokens, _ = self.wavtokenizer.encode(batch_audio, sr=sample_rate)
+            # batch_tokens shape: (B, N) where N is number of audio tokens per sample
+            device = batch_tokens.device
             num_audio_tokens = batch_tokens.shape[1]
 
             # Pre-allocate output for entire batch
@@ -261,14 +260,19 @@ class WavTokenizerAudioOnly:
 
         orig_array = np.asarray(orig_audio_samples, dtype=np.int64)
         ds = int(self.wavtokenizer.downsample_rate)
+
+        # Encode entire batch at once (handles resampling internally).
+        batch_tokens, _ = self.wavtokenizer.encode(batch_audio, sr=sample_rate)
+        # batch_tokens shape: (B, N) where N is number of audio tokens per sample
+        device = batch_tokens.device
         token_counts = (orig_array + ds - 1) // ds
 
-        if self.trim_last_tokens and pad_audio_samples is not None:
-            pad_val = int(pad_audio_samples)
-            mask = orig_array < pad_val
-            if mask.any():
-                token_counts = token_counts - (self.trim_last_tokens * mask.astype(np.int64))
-                token_counts = np.maximum(token_counts, 0)
+        if self.trim_last_tokens:
+            # This trim must be per-cut deterministic, not batch-dependent.
+            # A cut can be the longest item in one local batch and padded in
+            # another distributed run; conditioning on batch padding would make
+            # cut_id -> tokens vary with world size and sampler locality.
+            token_counts = np.maximum(token_counts - self.trim_last_tokens, 0)
 
         max_count = int(token_counts.max()) if token_counts.size else 0
         total_size = 1 + 1 + max_count + 1 + 1

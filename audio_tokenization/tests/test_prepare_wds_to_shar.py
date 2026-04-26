@@ -5,6 +5,7 @@ import types
 from collections import Counter
 
 import audio_tokenization.prepare.prepare_wds_to_shar as prepare_wds_to_shar
+from audio_tokenization.config.schema import PrepareSpec
 from audio_tokenization.prepare.prepare_wds_to_shar import (
     SidecarMetadataProvider,
     TarScanResult,
@@ -235,7 +236,7 @@ def test_convert_worker_preserves_presegmented_clip_number_with_parser(monkeypat
     monkeypatch.setattr(
         prepare_wds_to_shar,
         "apply_audio_pipeline",
-        lambda cut, **kwargs: (cut, False),
+        lambda cut, **kwargs: (cut, False, None),
     )
     monkeypatch.setattr(
         prepare_wds_to_shar,
@@ -294,11 +295,48 @@ def test_convert_worker_preserves_presegmented_clip_number_with_parser(monkeypat
     )
 
     assert result["written"] == 1
-    assert written_cuts[0].id == "conv_07f9708fc0b8316a9dea85d473db112b@000005"
+    assert written_cuts[0].id == "conv_07f9708fc0b8316a9dea85d473db112b_00005"
     assert written_cuts[0].supervisions[0].id == written_cuts[0].id
     assert written_cuts[0].custom == {
-        "source_id": "conv_07f9708fc0b8316a9dea85d473db112b",
-        "clip_num": 5,
-        "clip_start": 0.0,
-        "legacy_cut_id": "conv_07f9708fc0b8316a9dea85d473db112b_00005",
+        "interleave": {
+            "source_id": "conv_07f9708fc0b8316a9dea85d473db112b",
+            "clip_num": 5,
+            "clip_start": 0.0,
+            "clip_duration": 1.25,
+        },
     }
+
+
+def test_run_uses_configured_mp_start_method_without_external_metadata(monkeypatch, tmp_path):
+    captured = {}
+    spec = PrepareSpec.from_mapping(
+        {
+            "family": "wds",
+            "input": {"wds_shards": ["/data/*.tar"]},
+            "output": {
+                "shar_dir": str(tmp_path / "shar"),
+                "shard_size": 100,
+                "text_tokenizer": None,
+                "mp_start_method": "fork",
+            },
+        }
+    )
+
+    monkeypatch.setattr(prepare_wds_to_shar, "expand_path_patterns", lambda _patterns: ["/data/a.tar"])
+    monkeypatch.setattr(prepare_wds_to_shar, "validate_prepare_runtime", lambda **_kwargs: None)
+    monkeypatch.setattr(prepare_wds_to_shar, "write_prepare_state_for_spec", lambda _spec: None)
+    monkeypatch.setattr(
+        prepare_wds_to_shar,
+        "ensure_worker_assignment",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(prepare_wds_to_shar, "load_text_tokenizer", lambda _path: None)
+
+    def fake_run_pool(_worker, _worker_args, _shar_dir, _num_workers, *, mp_start_method):
+        captured["mp_start_method"] = mp_start_method
+
+    monkeypatch.setattr(prepare_wds_to_shar, "run_pool_and_finalize", fake_run_pool)
+
+    prepare_wds_to_shar.run(spec)
+
+    assert captured["mp_start_method"] == "fork"

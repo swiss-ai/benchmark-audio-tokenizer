@@ -2,6 +2,13 @@ import sys
 import types
 
 import pytest
+from audio_tokenization.prepare.columnar import (
+    ColumnarWorkerArgs,
+    derive_timestamp_clip_num,
+    extract_row_metadata,
+    extract_clip_timestamps,
+    extract_interleave_identity,
+)
 from audio_tokenization.prepare import (
     prepare_hf_to_shar,
     prepare_parquet_to_shar,
@@ -46,6 +53,9 @@ class _FakeArrowBatch:
 
     def to_pylist(self):
         return list(self._rows)
+
+    def slice(self, start, length):
+        return _FakeArrowBatch(self._rows[start:start + length])
 
     def to_table(self):
         return self
@@ -130,7 +140,7 @@ def _install_common_worker_patches(monkeypatch, module, helper_calls):
     monkeypatch.setattr(
         module,
         "apply_audio_pipeline",
-        lambda cut, **kwargs: (cut, False),
+        lambda cut, **kwargs: (cut, False, None),
     )
     monkeypatch.setattr(
         module,
@@ -173,6 +183,98 @@ def _install_common_worker_patches(monkeypatch, module, helper_calls):
     monkeypatch.setattr(module, "build_recording_from_audio_bytes", fake_build_recording)
 
 
+def test_extract_row_metadata_prefix_and_derived_custom():
+    row_id, text, lang, custom = extract_row_metadata(
+        {
+            "video_id": "abc123",
+            "text": "ignored",
+            "labels": ["/m/foo"],
+        },
+        id_column="video_id",
+        id_prefix="audioset_unbal_train",
+        text_column=None,
+        custom_columns=("video_id", "labels"),
+        constant_custom={"dataset": "audioset"},
+        derived_custom={"source_url": "https://www.youtube.com/watch?v={video_id}"},
+    )
+
+    assert row_id == "audioset_unbal_train_abc123"
+    assert text is None
+    assert lang is None
+    assert custom == {
+        "dataset": "audioset",
+        "video_id": "abc123",
+        "labels": ["/m/foo"],
+        "source_url": "https://www.youtube.com/watch?v=abc123",
+    }
+
+
+def _hf_worker_args(tmp_path, **overrides):
+    payload = dict(
+        worker_id=0,
+        input_paths=("dataset.arrow",),
+        shar_dir=str(tmp_path / "shar"),
+        target_sr=None,
+        shard_size=100,
+        shar_format="flac",
+        id_column="id",
+        id_prefix=None,
+        audio_column="audio",
+        text_column="text",
+        duration_column=None,
+        language_column=None,
+        language=None,
+        custom_columns=None,
+        constant_custom=None,
+        derived_custom=None,
+        text_tokenize_custom_columns=None,
+        text_tokenizer_path=None,
+        resampling_backend=None,
+        input_clip_id_parser_name=None,
+        source_id_column=None,
+        clip_num_column=None,
+        clip_start_column=None,
+        clip_end_column=None,
+        clip_duration_column=None,
+        read_batch_size=8,
+    )
+    payload.update(overrides)
+    return ColumnarWorkerArgs(**payload)
+
+
+def _parquet_worker_args(tmp_path, **overrides):
+    payload = dict(
+        worker_id=0,
+        input_paths=("dataset.parquet",),
+        shar_dir=str(tmp_path / "shar"),
+        target_sr=None,
+        shard_size=100,
+        shar_format="flac",
+        id_column="id",
+        id_prefix=None,
+        audio_column="audio",
+        text_column="text",
+        duration_column="duration",
+        language_column=None,
+        language=None,
+        custom_columns=None,
+        constant_custom=None,
+        derived_custom=None,
+        text_tokenize_custom_columns=None,
+        text_tokenizer_path=None,
+        resampling_backend=None,
+        input_clip_id_parser_name=None,
+        source_id_column=None,
+        clip_num_column=None,
+        clip_start_column=None,
+        clip_end_column=None,
+        clip_duration_column=None,
+        read_batch_size=8,
+    )
+    payload.update(overrides)
+    return ColumnarWorkerArgs(**payload)
+
+
 def test_prepare_hf_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_path):
     written_cuts = []
     helper_calls = []
@@ -189,27 +291,7 @@ def test_prepare_hf_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_path)
     )
     _install_common_worker_patches(monkeypatch, prepare_hf_to_shar, helper_calls)
 
-    result = prepare_hf_to_shar._convert_worker(
-        (
-            0,
-            ["dataset.arrow"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            "id",
-            "audio",
-            "text",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            8,
-        )
-    )
+    result = prepare_hf_to_shar._convert_worker(_hf_worker_args(tmp_path))
 
     assert helper_calls == [
         {
@@ -220,9 +302,50 @@ def test_prepare_hf_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_path)
     assert result["written"] == 1
     assert result["worker_stats"]["runtime_counts"]["recording_from_bytes"] == 1
     assert len(written_cuts) == 1
-    assert written_cuts[0].id == "clip-1@000000"
-    assert written_cuts[0].supervisions[0].id == "clip-1@000000"
+    assert written_cuts[0].id == "clip-1"
+    assert written_cuts[0].supervisions[0].id == "clip-1"
     assert written_cuts[0].supervisions[0].text == "hello from hf"
+
+
+def test_prepare_hf_worker_parser_uses_row_ids_not_row_index_as_chunks(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["row00000_seg003", "row00000_seg004"],
+                "audio": [{"bytes": b"first"}, {"bytes": b"second"}],
+                "text": ["first text", "second text"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_hf_to_shar, helper_calls)
+
+    result = prepare_hf_to_shar._convert_worker(
+        _hf_worker_args(
+            tmp_path,
+            input_clip_id_parser_name="spc",
+        )
+    )
+
+    assert result["written"] == 2
+    assert result["errors"] == 0
+    assert [cut.custom["interleave"] for cut in written_cuts] == [
+        {
+            "source_id": "row00000",
+            "clip_num": 3,
+            "clip_start": None,
+            "clip_duration": None,
+        },
+        {
+            "source_id": "row00000",
+            "clip_num": 4,
+            "clip_start": None,
+            "clip_duration": None,
+        },
+    ]
 
 
 def test_prepare_hf_worker_external_metadata_overrides_text(monkeypatch, tmp_path):
@@ -247,35 +370,68 @@ def test_prepare_hf_worker_external_metadata_overrides_text(monkeypatch, tmp_pat
     )
 
     result = prepare_hf_to_shar._convert_worker(
-        (
-            0,
-            ["dataset.arrow"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            "id",
-            "audio",
-            "text",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            8,
+        _hf_worker_args(tmp_path, id_prefix="audioset_bal_train")
+    )
+
+    assert result["written"] == 1
+    assert written_cuts[0].id == "audioset_bal_train_clip-1"
+    assert written_cuts[0].supervisions[0].text == "external text"
+    assert written_cuts[0].custom == {
+        "speaker": "ext",
+        "interleave": {
+            "source_id": "audioset_bal_train_clip-1",
+            "clip_num": 0,
+            "clip_start": None,
+            "clip_duration": None,
+        },
+    }
+
+
+def test_prepare_hf_worker_loads_text_tokenizer_from_worker_args(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    seen = {}
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["clip-1"],
+                "audio": [{"bytes": b"arrow-bytes"}],
+                "text": ["row text"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_hf_to_shar, helper_calls)
+
+    tokenizer = object()
+    tokenize_fn = object()
+    monkeypatch.setattr(prepare_hf_to_shar, "load_text_tokenizer", lambda path: seen.setdefault("path", path) and tokenizer)
+    monkeypatch.setattr(
+        prepare_hf_to_shar,
+        "make_text_tokenize_fn",
+        lambda tok, extra=None: seen.update({"tokenizer": tok, "extra": extra}) or tokenize_fn,
+    )
+    monkeypatch.setattr(
+        prepare_hf_to_shar,
+        "apply_audio_pipeline",
+        lambda cut, **kwargs: (seen.setdefault("tokenize_fn", kwargs["tokenize_fn"]), (cut, False, None))[1],
+    )
+
+    result = prepare_hf_to_shar._convert_worker(
+        _hf_worker_args(
+            tmp_path,
+            text_tokenizer_path="/tmp/tokenizer.json",
+            text_tokenize_custom_columns=("speaker",),
         )
     )
 
     assert result["written"] == 1
-    assert written_cuts[0].supervisions[0].text == "external text"
-    assert written_cuts[0].custom == {
-        "speaker": "ext",
-        "source_id": "clip-1",
-        "clip_num": 0,
-        "clip_start": 0.0,
-        "legacy_cut_id": "clip-1",
+    assert seen == {
+        "path": "/tmp/tokenizer.json",
+        "tokenizer": tokenizer,
+        "extra": ("speaker",),
+        "tokenize_fn": tokenize_fn,
     }
 
 
@@ -299,25 +455,10 @@ def test_prepare_parquet_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_
     _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
 
     result = prepare_parquet_to_shar._convert_worker(
-        (
-            0,
-            ["dataset.parquet"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            "id",
-            "audio",
-            "text",
-            "duration",
-            "lang",
-            None,
-            ("speaker",),
-            None,
-            None,
-            None,
-            None,
-            8,
+        _parquet_worker_args(
+            tmp_path,
+            language_column="lang",
+            custom_columns=("speaker",),
         )
     )
 
@@ -330,16 +471,18 @@ def test_prepare_parquet_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_
     assert result["written"] == 1
     assert result["worker_stats"]["runtime_counts"]["recording_from_bytes"] == 1
     assert len(written_cuts) == 1
-    assert written_cuts[0].id == "row-1@000000"
-    assert written_cuts[0].supervisions[0].id == "row-1@000000"
+    assert written_cuts[0].id == "row-1"
+    assert written_cuts[0].supervisions[0].id == "row-1"
     assert written_cuts[0].supervisions[0].text == "hello from parquet"
     assert written_cuts[0].supervisions[0].language == "tr"
     assert written_cuts[0].custom == {
         "speaker": "narrator",
-        "source_id": "row-1",
-        "clip_num": 0,
-        "clip_start": 0.0,
-        "legacy_cut_id": "row-1",
+        "interleave": {
+            "source_id": "row-1",
+            "clip_num": 0,
+            "clip_start": None,
+            "clip_duration": None,
+        },
     }
 
 
@@ -368,25 +511,10 @@ def test_prepare_parquet_worker_external_metadata_overrides_text_and_custom(monk
     )
 
     result = prepare_parquet_to_shar._convert_worker(
-        (
-            0,
-            ["dataset.parquet"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            "id",
-            "audio",
-            "text",
-            "duration",
-            "lang",
-            None,
-            ("speaker",),
-            None,
-            None,
-            None,
-            None,
-            8,
+        _parquet_worker_args(
+            tmp_path,
+            language_column="lang",
+            custom_columns=("speaker",),
         )
     )
 
@@ -395,10 +523,61 @@ def test_prepare_parquet_worker_external_metadata_overrides_text_and_custom(monk
     assert written_cuts[0].custom == {
         "speaker": "ext-speaker",
         "topic": "budget",
-        "source_id": "row-1",
-        "clip_num": 0,
-        "clip_start": 0.0,
-        "legacy_cut_id": "row-1",
+        "interleave": {
+            "source_id": "row-1",
+            "clip_num": 0,
+            "clip_start": None,
+            "clip_duration": None,
+        },
+    }
+
+
+def test_prepare_parquet_worker_loads_text_tokenizer_from_worker_args(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    seen = {}
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["row-1"],
+                "audio": [{"bytes": b"parquet-bytes"}],
+                "text": ["row text"],
+                "duration": [1.5],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    tokenizer = object()
+    tokenize_fn = object()
+    monkeypatch.setattr(prepare_parquet_to_shar, "load_text_tokenizer", lambda path: seen.setdefault("path", path) and tokenizer)
+    monkeypatch.setattr(
+        prepare_parquet_to_shar,
+        "make_text_tokenize_fn",
+        lambda tok, extra=None: seen.update({"tokenizer": tok, "extra": extra}) or tokenize_fn,
+    )
+    monkeypatch.setattr(
+        prepare_parquet_to_shar,
+        "apply_audio_pipeline",
+        lambda cut, **kwargs: (seen.setdefault("tokenize_fn", kwargs["tokenize_fn"]), (cut, False, None))[1],
+    )
+
+    result = prepare_parquet_to_shar._convert_worker(
+        _parquet_worker_args(
+            tmp_path,
+            text_tokenizer_path="/tmp/tokenizer.json",
+            text_tokenize_custom_columns=("speaker",),
+        )
+    )
+
+    assert result["written"] == 1
+    assert seen == {
+        "path": "/tmp/tokenizer.json",
+        "tokenizer": tokenizer,
+        "extra": ("speaker",),
+        "tokenize_fn": tokenize_fn,
     }
 
 
@@ -420,38 +599,68 @@ def test_prepare_parquet_worker_applies_input_clip_id_parser(monkeypatch, tmp_pa
     _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
 
     result = prepare_parquet_to_shar._convert_worker(
-        (
-            0,
-            ["dataset.parquet"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            "segment_id",
-            "audio",
-            "text",
-            "duration",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            "spc",
-            8,
+        _parquet_worker_args(
+            tmp_path,
+            id_column="segment_id",
+            input_clip_id_parser_name="spc",
         )
     )
 
     assert result["written"] == 1
     assert helper_calls[0]["recording_id"] == "row00000_seg003"
-    assert written_cuts[0].id == "row00000@000003"
-    assert written_cuts[0].supervisions[0].id == "row00000@000003"
+    assert written_cuts[0].id == "row00000_seg003"
+    assert written_cuts[0].supervisions[0].id == "row00000_seg003"
     assert written_cuts[0].custom == {
-        "source_id": "row00000",
-        "clip_num": 3,
-        "clip_start": 0.0,
-        "legacy_cut_id": "row00000_seg003",
+        "interleave": {
+            "source_id": "row00000",
+            "clip_num": 3,
+            "clip_start": None,
+            "clip_duration": None,
+        },
     }
+
+
+def test_prepare_parquet_worker_parser_uses_row_ids_not_row_index_as_chunks(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "segment_id": ["row00000_seg003", "row00000_seg004"],
+                "audio": [{"bytes": b"first"}, {"bytes": b"second"}],
+                "text": ["first text", "second text"],
+                "duration": [1.5, 1.5],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        _parquet_worker_args(
+            tmp_path,
+            id_column="segment_id",
+            input_clip_id_parser_name="spc",
+        )
+    )
+
+    assert result["written"] == 2
+    assert result["errors"] == 0
+    assert [cut.custom["interleave"] for cut in written_cuts] == [
+        {
+            "source_id": "row00000",
+            "clip_num": 3,
+            "clip_start": None,
+            "clip_duration": None,
+        },
+        {
+            "source_id": "row00000",
+            "clip_num": 4,
+            "clip_start": None,
+            "clip_duration": None,
+        },
+    ]
 
 
 def test_prepare_parquet_worker_nested_audio_path_with_basename_parser(monkeypatch, tmp_path):
@@ -476,25 +685,13 @@ def test_prepare_parquet_worker_nested_audio_path_with_basename_parser(monkeypat
     _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
 
     result = prepare_parquet_to_shar._convert_worker(
-        (
-            0,
-            ["dataset.parquet"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            "audio.path",       # dotted id_column
-            "audio",
-            "transcription",
-            None,               # duration_column
-            None,               # language_column
-            "fa",               # language (global)
-            None,               # custom_columns
-            None,               # text_tokenize_custom_columns
-            None,               # text_tokenizer
-            None,               # resampling_backend
-            "trailing_number_basename",  # input_clip_id_parser
-            8,
+        _parquet_worker_args(
+            tmp_path,
+            id_column="audio.path",
+            text_column="transcription",
+            duration_column=None,
+            language="fa",
+            input_clip_id_parser_name="trailing_number_basename",
         )
     )
 
@@ -503,17 +700,212 @@ def test_prepare_parquet_worker_nested_audio_path_with_basename_parser(monkeypat
     assert helper_calls[0]["audio_bytes"] == b"farsi-bytes"
     # recording_id is the full audio.path string (path/foo_042.wav)
     assert helper_calls[0]["recording_id"] == "radio_program/foo_042.wav"
-    # cut.id has source_id derived from basename (no "/"), clip_num from trailing number
-    assert written_cuts[0].id == "foo@000042"
-    assert "/" not in written_cuts[0].id
+    # cut.id stays as the original row id; interleave identity is nested in custom.
+    assert written_cuts[0].id == "radio_program/foo_042.wav"
     assert written_cuts[0].supervisions[0].text == "سلام دنیا"
     assert written_cuts[0].supervisions[0].language == "fa"
     assert written_cuts[0].custom == {
-        "source_id": "foo",
-        "clip_num": 42,
-        "clip_start": 0.0,
-        "legacy_cut_id": "radio_program/foo_042.wav",
+        "interleave": {
+            "source_id": "foo",
+            "clip_num": 42,
+            "clip_start": None,
+            "clip_duration": None,
+        },
     }
+
+
+def test_prepare_parquet_worker_populates_clip_timestamps_from_metadata_columns(
+    monkeypatch, tmp_path
+):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "audio": [{"bytes": b"podcast-bytes", "path": "podcasts/episode_007.wav"}],
+                "transcription": ["hello"],
+                "parent_start": [12.5],
+                "parent_end": [18.25],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        _parquet_worker_args(
+            tmp_path,
+            id_column="audio.path",
+            text_column="transcription",
+            duration_column=None,
+            language="en",
+            input_clip_id_parser_name="trailing_number_basename",
+            clip_start_column="parent_start",
+            clip_end_column="parent_end",
+        )
+    )
+
+    assert result["written"] == 1
+    assert helper_calls[0]["recording_id"] == "podcasts/episode_007.wav"
+    assert written_cuts[0].custom == {
+        "interleave": {
+            "source_id": "episode",
+            "clip_num": 7,
+            "clip_start": 12.5,
+            "clip_duration": 5.75,
+        },
+    }
+
+
+def test_prepare_parquet_worker_uses_source_column_with_timestamp_order(
+    monkeypatch, tmp_path
+):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["clip-a"],
+                "audio": [{"bytes": b"audio-bytes"}],
+                "text": ["hello"],
+                "original_audio_id": ["episode-1"],
+                "parent_start": [12.5],
+                "parent_end": [18.25],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        _parquet_worker_args(
+            tmp_path,
+            source_id_column="original_audio_id",
+            clip_start_column="parent_start",
+            clip_end_column="parent_end",
+        )
+    )
+
+    assert result["written"] == 1
+    assert written_cuts[0].id == "clip-a"
+    expected_clip_num = derive_timestamp_clip_num(
+        row_id="clip-a",
+        clip_start=12.5,
+        clip_duration=5.75,
+    )
+    assert written_cuts[0].custom == {
+        "interleave": {
+            "source_id": "episode-1",
+            "clip_num": expected_clip_num,
+            "clip_start": 12.5,
+            "clip_duration": 5.75,
+        },
+    }
+
+
+def test_extract_interleave_identity_derives_stable_timestamp_tie_breaker():
+    row = {"original_audio_id": "episode-1"}
+
+    first = extract_interleave_identity(
+        row,
+        row_id="clip-a",
+        source_id_column="original_audio_id",
+        clip_start=12.5,
+        clip_duration=5.75,
+    )
+    second = extract_interleave_identity(
+        row,
+        row_id="clip-a",
+        source_id_column="original_audio_id",
+        clip_start=12.5,
+        clip_duration=5.75,
+    )
+    different_row = extract_interleave_identity(
+        row,
+        row_id="clip-b",
+        source_id_column="original_audio_id",
+        clip_start=12.5,
+        clip_duration=5.75,
+    )
+
+    assert first == second
+    assert first[0] == "episode-1"
+    assert isinstance(first[1], int)
+    assert 0 <= first[1] < (1 << 63)
+    assert different_row[1] != first[1]
+
+
+def test_extract_interleave_identity_rejects_source_column_without_clip_num_or_timestamp():
+    with pytest.raises(ValueError, match="requires clip_start_column"):
+        extract_interleave_identity(
+            {"original_audio_id": "episode-1"},
+            row_id="clip-a",
+            source_id_column="original_audio_id",
+        )
+
+
+def test_extract_clip_timestamps_rejects_non_positive_clip_duration():
+    with pytest.raises(ValueError, match="must be > 0"):
+        extract_clip_timestamps(
+            {"parent_start": 12.5, "segment_duration": 0.0},
+            clip_start_column="parent_start",
+            clip_duration_column="segment_duration",
+        )
+
+
+def test_extract_clip_timestamps_rejects_clip_end_before_clip_start():
+    with pytest.raises(ValueError, match="must be >="):
+        extract_clip_timestamps(
+            {"parent_start": 12.5, "parent_end": 11.0},
+            clip_start_column="parent_start",
+            clip_end_column="parent_end",
+        )
+
+
+def test_extract_clip_timestamps_rejects_non_finite_values():
+    with pytest.raises(ValueError, match="must be finite"):
+        extract_clip_timestamps(
+            {"parent_start": float("nan")},
+            clip_start_column="parent_start",
+        )
+
+
+def test_prepare_parquet_worker_rejects_invalid_clip_interval(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "audio": [{"bytes": b"podcast-bytes", "path": "podcasts/episode_007.wav"}],
+                "transcription": ["hello"],
+                "parent_start": [12.5],
+                "parent_end": [11.0],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        _parquet_worker_args(
+            tmp_path,
+            id_column="audio.path",
+            text_column="transcription",
+            duration_column=None,
+            language="en",
+            input_clip_id_parser_name="trailing_number_basename",
+            clip_start_column="parent_start",
+            clip_end_column="parent_end",
+        )
+    )
+
+    assert result["written"] == 0
+    assert result["errors"] == 1
+    assert result["worker_stats"]["runtime_counts"]["processing_errors"] == 1
+    assert written_cuts == []
 
 
 def test_prepare_parquet_worker_missing_optional_duration_column(monkeypatch, tmp_path):
@@ -533,32 +925,19 @@ def test_prepare_parquet_worker_missing_optional_duration_column(monkeypatch, tm
     _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
 
     result = prepare_parquet_to_shar._convert_worker(
-        (
-            0,
-            ["dataset.parquet"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            "audio.path",
-            "audio",
-            "transcription",
-            "duration",         # column is configured but absent in the row
-            None,
-            "vi",
-            None,
-            None,
-            None,
-            None,
-            "trailing_number_basename",
-            8,
+        _parquet_worker_args(
+            tmp_path,
+            id_column="audio.path",
+            text_column="transcription",
+            language="vi",
+            input_clip_id_parser_name="trailing_number_basename",
         )
     )
 
     assert result["written"] == 1
     assert result["errors"] == 0
     assert helper_calls[0]["recording_id"] == "books/chapter_022.wav"
-    assert written_cuts[0].id == "chapter@000022"
+    assert written_cuts[0].id == "books/chapter_022.wav"
 
 
 def test_prepare_parquet_worker_non_numeric_duration_counts_as_error(monkeypatch, tmp_path):
@@ -578,25 +957,12 @@ def test_prepare_parquet_worker_non_numeric_duration_counts_as_error(monkeypatch
     _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
 
     result = prepare_parquet_to_shar._convert_worker(
-        (
-            0,
-            ["dataset.parquet"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            "audio.path",
-            "audio",
-            "transcription",
-            "duration",
-            None,
-            "vi",
-            None,
-            None,
-            None,
-            None,
-            "trailing_number_basename",
-            8,
+        _parquet_worker_args(
+            tmp_path,
+            id_column="audio.path",
+            text_column="transcription",
+            language="vi",
+            input_clip_id_parser_name="trailing_number_basename",
         )
     )
 

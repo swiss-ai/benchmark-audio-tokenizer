@@ -1,9 +1,0 @@
-# HUI Audio Corpus German (clean) — audio-text direct tokenization.
-
-dataset_name: hui_audio_corpus_german_clean
-output_name: hui_audio_corpus_german_clean
-
-shar_dir:
-  - /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/hui_audio_corpus_german_clean
-
-max_batch_duration: 1500.0

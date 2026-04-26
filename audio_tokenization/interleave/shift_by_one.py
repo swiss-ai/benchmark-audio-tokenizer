@@ -24,6 +24,7 @@ Usage::
         --output-dir /path/to/output \\
         --tokenizer-path /path/to/tokenizer \\
         --max-seq-len 262144 \\
+        --max-gap-sec 5.0 \\
         --seq-threshold 8192 \\
         --transcribe-ratio 0.5 \\
         --dry-run
@@ -39,6 +40,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+from audio_tokenization.utils.io import atomic_write_json
 
 from .common import (
     TR_KEY,
@@ -281,6 +284,7 @@ def _shift_run_chunk(
 def _dry_run_shift(
     df,
     max_seq_len: int,
+    max_gap_sec: float | None,
     bos_id: int,
     eos_id: int,
     stt_continue_id: int,
@@ -296,7 +300,7 @@ def _dry_run_shift(
     df = prepare_length_metadata(df)
 
     print("Detecting consecutive runs ...")
-    df, run_starts, run_lengths = _detect_runs(df)
+    df, run_starts, run_lengths = _detect_runs(df, max_gap_sec=max_gap_sec)
     audio_lens = df["_alen"].to_numpy()
     text_lens = df["_tlen"].to_numpy()
 
@@ -467,6 +471,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--tokenizer-path", type=str, required=True)
     parser.add_argument("--max-seq-len", type=int, default=262144)
+    parser.add_argument(
+        "--max-gap-sec",
+        type=float,
+        default=None,
+        help="Break a run when clip_start - previous (clip_start + clip_duration) exceeds this many seconds.",
+    )
     parser.add_argument("--seq-threshold", type=int, default=None,
                         help="Route sequences <= threshold to stage2/, longer to lct/.")
     parser.add_argument("--dry-run", action="store_true")
@@ -493,7 +503,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         df, _cache_reader = load_interleave_cache(partition_dirs[0])
         _dry_run_shift(
-            df, args.max_seq_len, bos_id, eos_id,
+            df, args.max_seq_len, args.max_gap_sec, bos_id, eos_id,
             stt_continue_id, stt_transcribe_id, tts_continue_id,
             dtype, partition_dirs[0],
             transcribe_ratio=args.transcribe_ratio,
@@ -514,7 +524,9 @@ def main(argv: list[str] | None = None) -> None:
         for partition_dir in partition_dirs:
             df, _cache_reader = load_interleave_cache(partition_dir)
             length_df = prepare_length_metadata(df)
-            _sorted_df, _run_starts, run_lengths = _detect_runs(length_df)
+            _sorted_df, _run_starts, run_lengths = _detect_runs(
+                length_df, max_gap_sec=args.max_gap_sec
+            )
             il_per_run, tr_per_run = _compute_per_run_stats_shift(run_lengths)
             all_il_per_run.append(il_per_run)
             all_tr_per_run.append(tr_per_run)
@@ -561,7 +573,11 @@ def main(argv: list[str] | None = None) -> None:
             print(f"\nProcessing partition {part_idx + 1}/{len(partition_dirs)}: {partition_dir.name}")
             df, cache_reader = load_interleave_cache(partition_dir)
             cache, run_starts, run_lengths, n_clips, n_sources = (
-                prepare_interleave_cache_and_runs(df, cache_reader)
+                prepare_interleave_cache_and_runs(
+                    df,
+                    cache_reader,
+                    max_gap_sec=args.max_gap_sec,
+                )
             )
             audio_token_total = int(cache.audio_lengths.sum())
             text_token_total = int(cache.text_lengths.sum())
@@ -658,6 +674,7 @@ def main(argv: list[str] | None = None) -> None:
         "stt_transcribe_id": stt_transcribe_id,
         "tts_continue_id": tts_continue_id,
         "max_seq_len": args.max_seq_len,
+        "max_gap_sec": args.max_gap_sec,
         "seq_threshold": args.seq_threshold,
         "transcribe_ratio": args.transcribe_ratio,
         "runs_converted_to_transcribe": runs_converted_to_transcribe,
@@ -671,10 +688,7 @@ def main(argv: list[str] | None = None) -> None:
         },
     }
     metadata_path = output_dir / "metadata.json"
-    with open(metadata_path, "w") as f:
-        import json
-
-        json.dump(metadata, f, indent=2)
+    atomic_write_json(metadata_path, metadata)
     print(f"\nMetadata written to {metadata_path}")
 
 

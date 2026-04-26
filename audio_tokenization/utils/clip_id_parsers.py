@@ -275,23 +275,9 @@ _PARSERS = {
 }
 
 
-# Clip-num to seconds conversion for parsers that use non-second units.
-# Parsers not listed here have clip_num in arbitrary sequential units (no time meaning).
-_CLIP_NUM_TO_SEC = {
-    "ytc": 0.001,          # clip_num is start_ms
-    "eurospeech": 0.001,   # clip_num is start_ms
-    "parlaspeech": 0.1,    # clip_num is start_deciseconds
-}
-
-
 def available_clip_id_parsers() -> Tuple[str, ...]:
     """Return the registered clip-ID parser names in stable order."""
     return tuple(sorted(_PARSERS))
-
-
-def get_clip_num_to_sec(name: str) -> float | None:
-    """Return the scale factor to convert clip_num to seconds, or None if not applicable."""
-    return _CLIP_NUM_TO_SEC.get(name)
 
 
 def get_clip_id_parser(name: str):

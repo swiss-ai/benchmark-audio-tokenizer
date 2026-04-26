@@ -1,4 +1,0 @@
-materialize:
-  interleave:
-    enabled: true
-    strategy: shift_by_one

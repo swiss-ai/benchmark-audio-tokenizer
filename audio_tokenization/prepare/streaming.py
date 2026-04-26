@@ -48,13 +48,12 @@ def iter_arrow_rows(
     reader = ipc.open_stream(arrow_path)
     for batch in reader:
         if batch.num_rows > batch_size:
-            table = batch.to_table()
             try:
-                for subbatch in table.to_batches(max_chunksize=batch_size):
+                for start in range(0, batch.num_rows, batch_size):
+                    subbatch = batch.slice(start, batch_size)
                     rows = subbatch.to_pylist()
                     yield from _yield_materialized_rows(rows, subbatch)
             finally:
-                del table
                 del batch
                 gc.collect()
         else:

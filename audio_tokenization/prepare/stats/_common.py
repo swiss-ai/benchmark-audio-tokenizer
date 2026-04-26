@@ -1,4 +1,4 @@
-"""Shared helpers for prepare_data stats scripts."""
+"""Shared helpers for prepare stats scripts."""
 
 from typing import List, Optional, Sequence, Tuple
 

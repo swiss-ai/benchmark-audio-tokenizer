@@ -3,9 +3,22 @@ import types
 from collections import Counter
 import gzip
 
+import numpy as np
 import pytest
 
-from audio_tokenization.prepare import common
+from audio_tokenization.prepare.audio_ops import (
+    apply_audio_pipeline,
+    build_recording_from_audio_bytes,
+)
+from audio_tokenization.prepare.columnar import _projected_columns, extract_row_metadata
+from audio_tokenization.prepare.identity import (
+    resolve_input_source_and_clip_num,
+    set_interleave_metadata,
+)
+from audio_tokenization.prepare.metadata import (
+    load_external_metadata,
+    resolve_sample_text_and_custom,
+)
 
 
 def test_build_recording_from_audio_bytes_uses_raw_bytes(monkeypatch):
@@ -23,7 +36,7 @@ def test_build_recording_from_audio_bytes_uses_raw_bytes(monkeypatch):
     monkeypatch.setitem(sys.modules, "lhotse", fake_lhotse)
 
     stats = Counter()
-    recording = common.build_recording_from_audio_bytes(
+    recording = build_recording_from_audio_bytes(
         b"RIFFpayload",
         "clip-1",
         runtime_counts=stats,
@@ -49,7 +62,7 @@ def test_build_recording_from_audio_bytes_stringifies_recording_id(monkeypatch):
     monkeypatch.setitem(sys.modules, "lhotse", fake_lhotse)
 
     stats = Counter()
-    recording = common.build_recording_from_audio_bytes(
+    recording = build_recording_from_audio_bytes(
         b"audio-bytes",
         123,
         runtime_counts=stats,
@@ -59,14 +72,14 @@ def test_build_recording_from_audio_bytes_stringifies_recording_id(monkeypatch):
     assert calls == {"data": b"audio-bytes", "recording_id": "123"}
     assert stats["recording_from_bytes"] == 1
 def test_resolve_input_source_and_clip_num_defaults_to_raw_id_and_chunk_idx():
-    assert common.resolve_input_source_and_clip_num("clip-1", chunk_idx=3) == (
+    assert resolve_input_source_and_clip_num("clip-1", chunk_idx=3) == (
         "clip-1",
         3,
     )
 
 
-def test_resolve_input_source_and_clip_num_uses_legacy_parser():
-    parsed = common.resolve_input_source_and_clip_num(
+def test_resolve_input_source_and_clip_num_uses_explicit_parser():
+    parsed = resolve_input_source_and_clip_num(
         "conv_07f9708fc0b8316a9dea85d473db112b_00005",
         input_clip_id_parser=lambda clip_id: (clip_id.rsplit("_", 1)[0], 5),
     )
@@ -74,9 +87,9 @@ def test_resolve_input_source_and_clip_num_uses_legacy_parser():
     assert parsed == ("conv_07f9708fc0b8316a9dea85d473db112b", 5)
 
 
-def test_resolve_input_source_and_clip_num_rejects_chunked_legacy_parser():
+def test_resolve_input_source_and_clip_num_rejects_chunked_parser_mode():
     try:
-        common.resolve_input_source_and_clip_num(
+        resolve_input_source_and_clip_num(
             "row00000_seg003",
             chunk_idx=1,
             input_clip_id_parser=lambda clip_id: ("row00000", 3),
@@ -87,20 +100,56 @@ def test_resolve_input_source_and_clip_num_rejects_chunked_legacy_parser():
         raise AssertionError("expected ValueError for chunked parser mode")
 
 
-def test_set_universal_cut_id_updates_cut_and_supervision_ids():
+def test_set_interleave_metadata_preserves_cut_and_supervision_ids():
     supervision = types.SimpleNamespace(id="old-sup")
-    cut = types.SimpleNamespace(id="old-cut", supervisions=[supervision], custom=None)
+    cut = types.SimpleNamespace(id="old-cut", duration=2.0, supervisions=[supervision], custom=None)
 
-    common.set_universal_cut_id(cut, "source", 7, clip_start=1.25)
+    set_interleave_metadata(cut, "source", 7, clip_start=1.25)
 
-    assert cut.id == "source@000007"
-    assert supervision.id == "source@000007"
+    assert cut.id == "old-cut"
+    assert supervision.id == "old-sup"
     assert cut.custom == {
-        "source_id": "source",
-        "clip_num": 7,
-        "clip_start": 1.25,
-        "legacy_cut_id": "old-cut",
+        "interleave": {
+            "source_id": "source",
+            "clip_num": 7,
+            "clip_start": 1.25,
+            "clip_duration": 2.0,
+        },
     }
+
+
+def test_set_interleave_metadata_records_optional_clip_duration():
+    cut = types.SimpleNamespace(id="old-cut", duration=3.0, supervisions=[], custom=None)
+
+    set_interleave_metadata(cut, "source", 1, clip_start=1.0, clip_duration=1.5)
+
+    assert cut.custom["interleave"]["clip_start"] == 1.0
+    assert cut.custom["interleave"]["clip_duration"] == 1.5
+
+
+def test_apply_audio_pipeline_can_return_decoded_audio_for_shar_write():
+    audio = np.full((1, 16000), 0.1, dtype=np.float32)
+    calls = Counter()
+
+    class Cut:
+        sampling_rate = 16000
+        num_channels = 1
+        custom = None
+
+        def load_audio(self):
+            calls["load_audio"] += 1
+            return audio
+
+    cut, skip, decoded_audio = apply_audio_pipeline(
+        Cut(),
+        target_sr=None,
+        runtime_counts=Counter(),
+    )
+
+    assert skip is False
+    assert calls["load_audio"] == 1
+    assert decoded_audio is audio
+    assert cut.custom["rms_db"] == pytest.approx(-20.0)
 
 
 def test_load_external_metadata_reads_jsonl_gz(tmp_path):
@@ -111,7 +160,7 @@ def test_load_external_metadata_reads_jsonl_gz(tmp_path):
             b'{"id":"clip-2","text":"bye","speaker":"bob"}\n'
         )
 
-    metadata = common.load_external_metadata(
+    metadata = load_external_metadata(
         str(path),
         ("speaker",),
         id_field="id",
@@ -124,8 +173,30 @@ def test_load_external_metadata_reads_jsonl_gz(tmp_path):
     }
 
 
+def test_load_external_metadata_reads_headered_tsv(tmp_path):
+    path = tmp_path / "meta.tsv"
+    path.write_text(
+        "audio_id\tspeaker_id\tduration\tnormalized_text\n"
+        "utt-1\tspk-a\t1.2\thalló\n"
+        "utt-2\tspk-b\t2.3\tbless\n",
+        encoding="utf-8",
+    )
+
+    metadata = load_external_metadata(
+        str(path),
+        ("speaker_id", "duration"),
+        id_field="audio_id",
+        text_field="normalized_text",
+    )
+
+    assert metadata == {
+        "utt-1": ("halló", {"speaker_id": "spk-a", "duration": "1.2"}),
+        "utt-2": ("bless", {"speaker_id": "spk-b", "duration": "2.3"}),
+    }
+
+
 def test_resolve_sample_text_and_custom_prefers_external_metadata():
-    text, custom = common.resolve_sample_text_and_custom(
+    text, custom = resolve_sample_text_and_custom(
         "clip-1",
         default_text="row text",
         default_custom={"speaker": "row", "lang": "yue"},
@@ -145,7 +216,7 @@ def test_resolve_sample_text_and_custom_prefers_external_metadata():
 
 def test_extract_row_metadata_basic():
     row = {"id": "abc", "text": "hello world", "lang": "en", "speaker": "alice"}
-    row_id, text, lang, custom = common.extract_row_metadata(
+    row_id, text, lang, custom = extract_row_metadata(
         row,
         id_column="id",
         text_column="text",
@@ -160,7 +231,7 @@ def test_extract_row_metadata_basic():
 
 def test_extract_row_metadata_fallback_id_when_no_column():
     row = {"text": "hello"}
-    row_id, _, _, _ = common.extract_row_metadata(
+    row_id, _, _, _ = extract_row_metadata(
         row,
         id_column=None,
         text_column="text",
@@ -171,7 +242,7 @@ def test_extract_row_metadata_fallback_id_when_no_column():
 
 def test_extract_row_metadata_multi_column_id_joined_with_underscore():
     row = {"session": 19, "seg": 108}
-    row_id, _, _, _ = common.extract_row_metadata(
+    row_id, _, _, _ = extract_row_metadata(
         row,
         id_column=["session", "seg"],
     )
@@ -180,14 +251,14 @@ def test_extract_row_metadata_multi_column_id_joined_with_underscore():
 
 def test_extract_row_metadata_id_is_always_string():
     row = {"id": 42}
-    row_id, _, _, _ = common.extract_row_metadata(row, id_column="id")
+    row_id, _, _, _ = extract_row_metadata(row, id_column="id")
     assert row_id == "42"
     assert isinstance(row_id, str)
 
 
 def test_extract_row_metadata_language_column_takes_precedence_over_global():
     row = {"lang": "de"}
-    _, _, lang, _ = common.extract_row_metadata(
+    _, _, lang, _ = extract_row_metadata(
         row,
         language_column="lang",
         language="fr",  # global fallback, should be overridden
@@ -197,7 +268,7 @@ def test_extract_row_metadata_language_column_takes_precedence_over_global():
 
 def test_extract_row_metadata_language_falls_back_to_global_when_column_missing():
     row = {"text": "bonjour"}
-    _, _, lang, _ = common.extract_row_metadata(
+    _, _, lang, _ = extract_row_metadata(
         row,
         language_column="lang",  # column not in row
         language="fr",
@@ -207,7 +278,7 @@ def test_extract_row_metadata_language_falls_back_to_global_when_column_missing(
 
 def test_extract_row_metadata_language_global_when_no_column_specified():
     row = {"text": "hello"}
-    _, _, lang, _ = common.extract_row_metadata(
+    _, _, lang, _ = extract_row_metadata(
         row,
         language="en",
     )
@@ -216,13 +287,13 @@ def test_extract_row_metadata_language_global_when_no_column_specified():
 
 def test_extract_row_metadata_text_none_when_no_column():
     row = {"id": "abc"}
-    _, text, _, _ = common.extract_row_metadata(row, id_column="id")
+    _, text, _, _ = extract_row_metadata(row, id_column="id")
     assert text is None
 
 
 def test_extract_row_metadata_custom_skips_none_values():
     row = {"id": "abc", "speaker": "alice", "age": None, "dialect": "us"}
-    _, _, _, custom = common.extract_row_metadata(
+    _, _, _, custom = extract_row_metadata(
         row,
         id_column="id",
         custom_columns=["speaker", "age", "dialect"],
@@ -232,13 +303,13 @@ def test_extract_row_metadata_custom_skips_none_values():
 
 def test_extract_row_metadata_custom_empty_when_no_columns():
     row = {"id": "abc"}
-    _, _, _, custom = common.extract_row_metadata(row, id_column="id")
+    _, _, _, custom = extract_row_metadata(row, id_column="id")
     assert custom == {}
 
 
 def test_extract_row_metadata_custom_empty_when_all_values_none():
     row = {"id": "abc", "speaker": None}
-    _, _, _, custom = common.extract_row_metadata(
+    _, _, _, custom = extract_row_metadata(
         row,
         id_column="id",
         custom_columns=["speaker"],
@@ -252,7 +323,7 @@ def test_extract_row_metadata_dotted_path():
         "meta": {"text": "hello", "lang": "fa"},
         "speaker": {"info": {"name": "alice"}},
     }
-    row_id, text, lang, custom = common.extract_row_metadata(
+    row_id, text, lang, custom = extract_row_metadata(
         row,
         id_column="audio.path",
         text_column="meta.text",
@@ -268,7 +339,7 @@ def test_extract_row_metadata_dotted_path():
 def test_extract_row_metadata_missing_required_id_raises():
     row = {"audio": {}}
     with pytest.raises(ValueError, match="audio.path"):
-        common.extract_row_metadata(
+        extract_row_metadata(
             row,
             id_column="audio.path",
         )
@@ -277,7 +348,7 @@ def test_extract_row_metadata_missing_required_id_raises():
 def test_extract_row_metadata_null_required_id_raises():
     row = {"audio": {"path": None}}
     with pytest.raises(ValueError, match="audio.path"):
-        common.extract_row_metadata(
+        extract_row_metadata(
             row,
             id_column="audio.path",
         )
@@ -286,7 +357,7 @@ def test_extract_row_metadata_null_required_id_raises():
 def test_extract_row_metadata_multi_column_id_any_null_raises():
     row = {"audio": {"path": "x.wav"}, "meta": {"seg": None}}
     with pytest.raises(ValueError, match="meta.seg"):
-        common.extract_row_metadata(
+        extract_row_metadata(
             row,
             id_column=["audio.path", "meta.seg"],
         )
@@ -294,7 +365,7 @@ def test_extract_row_metadata_multi_column_id_any_null_raises():
 
 def test_extract_row_metadata_dotted_path_missing_intermediate_is_graceful():
     row = {"audio": {}}
-    row_id, text, lang, custom = common.extract_row_metadata(
+    row_id, text, lang, custom = extract_row_metadata(
         row,
         id_column=None,
         text_column="audio.path",
@@ -310,16 +381,16 @@ def test_extract_row_metadata_dotted_path_missing_intermediate_is_graceful():
 
 
 def test_projected_columns_keeps_dotted_leaf_when_no_ancestor():
-    assert common._projected_columns("audio.path") == ["audio.path"]
+    assert _projected_columns("audio.path") == ["audio.path"]
 
 
 def test_projected_columns_drops_leaf_when_ancestor_present():
-    assert common._projected_columns("audio", "audio.path") == ["audio"]
+    assert _projected_columns("audio", "audio.path") == ["audio"]
 
 
 def test_projected_columns_deduplicates():
-    assert common._projected_columns("audio.path", "audio.path") == ["audio.path"]
+    assert _projected_columns("audio.path", "audio.path") == ["audio.path"]
 
 
 def test_projected_columns_handles_list_id_column():
-    assert common._projected_columns(["audio.path"], "text") == ["audio.path", "text"]
+    assert _projected_columns(["audio.path"], "text") == ["audio.path", "text"]

@@ -1,9 +1,9 @@
 """Canonical dataset-spec schema for the config-driven audio pipeline.
 
 Side-effect free: loading a spec must not import heavy prepare modules or
-touch global state. Schema is authoritative for config semantics; legacy
-CLI argparse defaults are an isolated property of the legacy invocation
-path and are not consulted here.
+touch global state. Schema is authoritative for config semantics; standalone
+prepare-script argparse defaults are an isolated property of those CLIs and
+are not consulted here.
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from pydantic import (
     model_validator,
 )
 
+from audio_tokenization.config.authoring import resolve_authoring_config
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.prepare.metadata import normalize_optional_path
 
 
@@ -251,7 +253,7 @@ class PrepareLhotseRecipeInputSpec(SchemaModel):
     recipe_kwargs: NonEmptyStr = "{}"
     min_sample_rate: OptIntLike = None
     trim_to_supervisions: StrictBool = False
-    shar_index_filename: NonEmptyStr = "shar_index.json"
+    shar_index_filename: NonEmptyStr = SHAR_INDEX_FILENAME
 
     def fingerprint_payload(self) -> dict[str, Any]:
         return {
@@ -294,16 +296,55 @@ class PrepareMetadataSpec(SchemaModel):
     audio_column: NonEmptyStr = "audio"
     text_column: str | None = None
     duration_column: str | None = None
+    source_id_column: str | None = None
+    clip_num_column: str | None = None
+    clip_start_column: str | None = None
+    clip_end_column: str | None = None
+    clip_duration_column: str | None = None
     id_column: IdColumn = None
+    id_prefix: str | None = None
     language_column: str | None = None
     language: str | None = None
     custom_columns: StrList = Field(default_factory=list)
+    constant_custom: dict[str, Any] = Field(default_factory=dict)
+    derived_custom: dict[str, str] = Field(default_factory=dict)
     text_tokenize_custom_columns: StrList = Field(default_factory=list)
     input_clip_id_parser: str | None = None
     external_metadata: str | None = None
     custom_fields: StrList = Field(default_factory=list)
     id_field: NonEmptyStr = "id"
     text_field: NonEmptyStr = "text"
+
+    @model_validator(mode="after")
+    def _validate_clip_timestamps(self):
+        if self.clip_num_column and not self.source_id_column:
+            raise ValueError(
+                "clip_num_column requires source_id_column"
+            )
+        if self.input_clip_id_parser and (
+            self.source_id_column or self.clip_num_column
+        ):
+            raise ValueError(
+                "set either source_id_column / clip_num_column or input_clip_id_parser, not both"
+            )
+        if (self.clip_end_column or self.clip_duration_column) and not self.clip_start_column:
+            raise ValueError(
+                "clip_end_column / clip_duration_column require clip_start_column"
+            )
+        if self.clip_end_column and self.clip_duration_column:
+            raise ValueError(
+                "set exactly one of clip_end_column or clip_duration_column, not both"
+            )
+        if (
+            self.source_id_column
+            and not self.clip_num_column
+            and not self.clip_start_column
+        ):
+            raise ValueError(
+                "source_id_column without clip_num_column requires clip_start_column "
+                "so prepare can derive a stable timestamp tie-breaker"
+            )
+        return self
 
 
 class PrepareSpec(SchemaModel):
@@ -360,7 +401,7 @@ class TokenizeFilterSpec(SchemaModel):
     max_duration: FloatLike = 200.0
     min_sample_rate: IntLike = 16000
     min_rms_db: IntLike = -50
-    normalize_rms_db: IntLike = -3
+    normalize_peak_db: IntLike = -3
 
 
 class TokenizeDataloaderSpec(SchemaModel):
@@ -383,7 +424,54 @@ class TokenizeOutputSpec(SchemaModel):
 
     output_dir: NonEmptyStr
     output_name: str | None = None
-    shar_index_filename: NonEmptyStr = "shar_index.json"
+    shar_index_filename: NonEmptyStr = SHAR_INDEX_FILENAME
+
+
+def _normalize_interleave_partitioning(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not value:
+        return {"type": "hash", "field": "source_id", "num_buckets": 16}
+
+    ptype = str(value.get("type", "hash"))
+    if ptype == "hash":
+        field = str(value.get("field", "source_id"))
+        num_buckets = _coerce_int_like(value.get("num_buckets", 16))
+        if num_buckets is None or num_buckets <= 0:
+            raise ValueError("tokenize.partitioning.num_buckets must be > 0")
+        return {"type": "hash", "field": field, "num_buckets": num_buckets}
+
+    if ptype == "field":
+        field = value.get("field")
+        if not isinstance(field, str) or not field:
+            raise ValueError("tokenize.partitioning.field is required for field partitioning")
+        return {"type": "field", "field": field}
+
+    raise ValueError(f"Unsupported tokenize.partitioning.type: {ptype!r}")
+
+
+def _normalize_wandb_config(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not value:
+        return {"enabled": False}
+    enabled = bool(value.get("enabled", False))
+    tags = value.get("tags", [])
+    if tags is None:
+        tags = []
+    if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+        raise TypeError("tokenize.wandb.tags must be a list of strings")
+    log_interval = _coerce_float_like(value.get("log_interval_seconds", 10.0))
+    if log_interval is None or log_interval <= 0:
+        raise ValueError("tokenize.wandb.log_interval_seconds must be > 0")
+    out = {
+        "enabled": enabled,
+        "project": str(value.get("project", "audio-tokenization")),
+        "entity": value.get("entity"),
+        "name": value.get("name"),
+        "tags": list(tags),
+        "log_interval_seconds": float(log_interval),
+    }
+    for key in ("entity", "name"):
+        if out[key] is not None and not isinstance(out[key], str):
+            raise TypeError(f"tokenize.wandb.{key} must be a string or null")
+    return out
 
 
 class TokenizeSpec(SchemaModel):
@@ -395,6 +483,7 @@ class TokenizeSpec(SchemaModel):
     audio_text_format: AudioTextFormat = "direct"
     audio_text_task: AudioTextTask = "transcribe"
     input_shar_dir: OptStrList = None
+    partitioning: dict[str, Any] | None = None
     filter: TokenizeFilterSpec = Field(default_factory=TokenizeFilterSpec)
     dataloader: TokenizeDataloaderSpec = Field(default_factory=TokenizeDataloaderSpec)
     wandb: dict[str, Any] = Field(default_factory=dict)
@@ -406,10 +495,18 @@ class TokenizeSpec(SchemaModel):
             return value
         data = dict(value)
         if data.get("wandb") is None:
-            data["wandb"] = {}
+            data["wandb"] = {"enabled": False}
         elif "wandb" in data and not isinstance(data["wandb"], Mapping):
             raise TypeError("tokenize.wandb must be a mapping or null")
         return data
+
+    @model_validator(mode="after")
+    def _normalize_runtime_dicts(self):
+        update: dict[str, Any] = {"wandb": _normalize_wandb_config(self.wandb)}
+        is_interleaved = self.mode == "audio_text" and self.audio_text_format == "interleaved"
+        if is_interleaved or self.partitioning is not None:
+            update["partitioning"] = _normalize_interleave_partitioning(self.partitioning)
+        return self.model_copy(update=update)
 
     def fingerprint_payload(self) -> dict[str, Any]:
         """Output-shaping subset of the spec, for resume-safety checks."""
@@ -422,6 +519,11 @@ class TokenizeSpec(SchemaModel):
             "mode": self.mode,
             "audio_text_format": self.audio_text_format,
             "audio_text_task": self.audio_text_task,
+            "partitioning": (
+                self.partitioning
+                if self.mode == "audio_text" and self.audio_text_format == "interleaved"
+                else None
+            ),
             "input_shar_dir": sorted(self.input_shar_dir) if self.input_shar_dir else None,
             "output_name": self.output.output_name,
             "shar_index_filename": self.output.shar_index_filename,
@@ -429,7 +531,7 @@ class TokenizeSpec(SchemaModel):
             "filter_max_duration": f.max_duration,
             "filter_min_sample_rate": f.min_sample_rate,
             "filter_min_rms_db": f.min_rms_db,
-            "filter_normalize_rms_db": f.normalize_rms_db,
+            "filter_normalize_peak_db": f.normalize_peak_db,
             "num_buckets": d.num_buckets,
             "bucket_buffer_size": d.bucket_buffer_size,
             "sampler_seed": d.sampler_seed,
@@ -447,6 +549,7 @@ class InterleaveProductSpec(SchemaModel):
     strategy: NonEmptyStr = "shift_by_one"
     tokenizer_path: str | None = None
     max_seq_len: IntLike = 262144
+    max_gap_sec: OptFloatLike = None
     seq_threshold: OptIntLike = None
     transcribe_ratio: OptFloatLike = None
     num_workers: OptIntLike = None
@@ -461,8 +564,43 @@ class InterleaveProductSpec(SchemaModel):
             "strategy": self.strategy,
             "tokenizer_path": normalize_optional_path(self.tokenizer_path),
             "max_seq_len": self.max_seq_len,
+            "max_gap_sec": self.max_gap_sec,
             "seq_threshold": self.seq_threshold,
             "transcribe_ratio": self.transcribe_ratio,
+        }
+
+
+class SftProductSpec(SchemaModel):
+    """Post-tokenize SFT sequence product.
+
+    SFT assembly is a materialization product because it combines model-specific
+    text template rendering with already-tokenized audio components. The actual
+    assembler is intentionally wired separately from the schema so partial
+    configs can be validated before the implementation lands.
+    """
+
+    enabled: StrictBool = False
+    doc_manifest: str | None = None
+    audio_token_cache_dir: str | None = None
+    audio_token_cache_manifest: str | None = None
+    output_dir: str | None = None
+    tokenizer_path: str | None = None
+    chat_template: str | None = None
+    max_seq_len: IntLike = 262144
+    num_workers: OptIntLike = None
+    tmp_dir: str | None = None
+
+    def fingerprint_payload(self) -> dict[str, Any]:
+        """Output-shaping subset: excludes num_workers / tmp_dir."""
+        return {
+            "enabled": self.enabled,
+            "doc_manifest": normalize_optional_path(self.doc_manifest),
+            "audio_token_cache_dir": normalize_optional_path(self.audio_token_cache_dir),
+            "audio_token_cache_manifest": normalize_optional_path(self.audio_token_cache_manifest),
+            "output_dir": normalize_optional_path(self.output_dir),
+            "tokenizer_path": normalize_optional_path(self.tokenizer_path),
+            "chat_template": self.chat_template,
+            "max_seq_len": self.max_seq_len,
         }
 
 
@@ -470,11 +608,12 @@ class ProductMatrixSpec(SchemaModel):
     """Post-tokenize materializations."""
 
     interleave: InterleaveProductSpec = Field(default_factory=InterleaveProductSpec)
+    sft: SftProductSpec = Field(default_factory=SftProductSpec)
 
 
 class DatasetSpec(SchemaModel):
     name: NonEmptyStr
-    convert: PrepareSpec
+    convert: PrepareSpec | None = None
     tokenize: TokenizeSpec | None = None
     materialize: ProductMatrixSpec = Field(default_factory=ProductMatrixSpec)
 
@@ -505,7 +644,12 @@ class DatasetSpec(SchemaModel):
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "DatasetSpec":
         data = dict(payload)
-        data["convert"] = PrepareSpec.from_mapping(_require_mapping(payload, "convert"))
+        convert_payload = payload.get("convert")
+        data["convert"] = (
+            PrepareSpec.from_mapping(convert_payload)
+            if convert_payload is not None
+            else None
+        )
         tokenize_payload = payload.get("tokenize")
         data["tokenize"] = (
             TokenizeSpec.model_validate(tokenize_payload)
@@ -518,7 +662,7 @@ class DatasetSpec(SchemaModel):
 
 def load_dataset_spec(cfg: DictConfig | Mapping[str, Any]) -> DatasetSpec:
     """Load and validate a canonical dataset spec from Hydra/OmegaConf config."""
-    plain = _as_plain_mapping(cfg)
+    plain = resolve_authoring_config(_as_plain_mapping(cfg))
     try:
         return DatasetSpec.from_mapping(plain)
     except ValidationError as e:
@@ -550,10 +694,18 @@ def _prepare_metadata_fingerprint(
             "metadata.audio_column": metadata.audio_column,
             "metadata.text_column": metadata.text_column,
             "metadata.duration_column": metadata.duration_column,
+            "metadata.source_id_column": metadata.source_id_column,
+            "metadata.clip_num_column": metadata.clip_num_column,
+            "metadata.clip_start_column": metadata.clip_start_column,
+            "metadata.clip_end_column": metadata.clip_end_column,
+            "metadata.clip_duration_column": metadata.clip_duration_column,
             "metadata.id_column": _normalize_id_column_arg(metadata.id_column),
+            "metadata.id_prefix": metadata.id_prefix,
             "metadata.language_column": metadata.language_column,
             "metadata.language": metadata.language,
             "metadata.custom_columns": _normalize_list_arg(metadata.custom_columns),
+            "metadata.constant_custom": dict(sorted(metadata.constant_custom.items())),
+            "metadata.derived_custom": dict(sorted(metadata.derived_custom.items())),
             "metadata.text_tokenize_custom_columns": _normalize_list_arg(metadata.text_tokenize_custom_columns),
             "metadata.input_clip_id_parser": metadata.input_clip_id_parser,
             "metadata.external_metadata": normalize_optional_path(metadata.external_metadata),
@@ -565,10 +717,18 @@ def _prepare_metadata_fingerprint(
         return {
             "metadata.audio_column": metadata.audio_column,
             "metadata.text_column": metadata.text_column,
+            "metadata.source_id_column": metadata.source_id_column,
+            "metadata.clip_num_column": metadata.clip_num_column,
+            "metadata.clip_start_column": metadata.clip_start_column,
+            "metadata.clip_end_column": metadata.clip_end_column,
+            "metadata.clip_duration_column": metadata.clip_duration_column,
             "metadata.id_column": _normalize_id_column_arg(metadata.id_column),
+            "metadata.id_prefix": metadata.id_prefix,
             "metadata.language_column": metadata.language_column,
             "metadata.language": metadata.language,
             "metadata.custom_columns": _normalize_list_arg(metadata.custom_columns),
+            "metadata.constant_custom": dict(sorted(metadata.constant_custom.items())),
+            "metadata.derived_custom": dict(sorted(metadata.derived_custom.items())),
             "metadata.text_tokenize_custom_columns": _normalize_list_arg(metadata.text_tokenize_custom_columns),
             "metadata.input_clip_id_parser": metadata.input_clip_id_parser,
             "metadata.external_metadata": normalize_optional_path(metadata.external_metadata),

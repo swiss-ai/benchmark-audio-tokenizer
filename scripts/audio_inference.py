@@ -214,7 +214,7 @@ def load_parquet_dataset(parquet_dir: str, audio_column: str, num_samples: int):
                 break
             audio_struct = row[audio_column]
             audio_bytes = audio_struct["bytes"]
-            sr_parquet = audio_struct["sampling_rate"]
+            sr_parquet = audio_struct.get("sampling_rate")
 
             if not audio_bytes:
                 n_skipped += 1
@@ -224,8 +224,8 @@ def load_parquet_dataset(parquet_dir: str, audio_column: str, num_samples: int):
             except Exception:
                 n_skipped += 1
                 continue
-            if sr != sr_parquet:
-                sr = sr_parquet  # trust parquet metadata
+            if sr_parquet is not None and sr != sr_parquet:
+                sr = sr_parquet  # trust parquet metadata when present
 
             samples.append({
                 "audio_array": audio_array,
@@ -400,6 +400,7 @@ def main() -> None:
             tokenizer=tokenizer_path,
             trust_remote_code=True,
             dtype="bfloat16",
+            max_model_len=16384,
         )
 
     print(f"  Model loaded in {time.time() - t0:.1f}s")

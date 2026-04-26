@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
+import os
 import shutil
 import time
 from pathlib import Path
@@ -55,6 +56,7 @@ from audio_tokenization.interleave.common import (
     TR_KEY,
     DType,
     IndexedDatasetBuilder,
+    _detect_runs,
     _merge_shards,
     _partition_runs,
     _write_idx_file,
@@ -69,6 +71,7 @@ from audio_tokenization.interleave.common import (
     prepare_interleave_cache_and_runs,
     prepare_length_metadata,
 )
+from audio_tokenization.utils.io import atomic_write_json
 
 # ---------------------------------------------------------------------------
 # Module-level globals for fork-based sharing (set before Pool creation)
@@ -82,44 +85,6 @@ _shared_transcribe_only_runs: set[int] = set()
 
 # Both directions are always produced (separate bin/idx each).
 DIRECTIONS = ["AT", "TA"]
-
-# ---------------------------------------------------------------------------
-# Core accumulation logic
-# ---------------------------------------------------------------------------
-
-
-def _build_accumulated_seq(
-    run_audio: list[list[int]],
-    run_text: list[list[int]],
-    direction: str,
-    start: int,
-    count: int,
-    bos_id: int,
-    eos_id: int,
-    stt_continue_id: int,
-    tts_continue_id: int,
-) -> list[int]:
-    """Build an accumulated sequence from *count* clips starting at *start*.
-
-    Helper used when we need to rebuild after trimming an odd-count sequence.
-    """
-    seq: list[int] = [bos_id]
-    prev_mode: str | None = None
-    for j in range(count):
-        pos_in_window = j % len(direction)
-        mode = direction[pos_in_window]
-        clip_tokens = run_audio[start + j] if mode == "A" else run_text[start + j]
-
-        if mode == "A" and prev_mode == "T":
-            seq.append(tts_continue_id)
-        elif mode == "T" and prev_mode == "A":
-            seq.append(stt_continue_id)
-
-        seq.extend(clip_tokens)
-        prev_mode = mode
-    seq.append(eos_id)
-    return seq
-
 
 def _accumulate_sequences(
     run_audio: list[list[int]],
@@ -192,10 +157,11 @@ def _accumulate_sequences(
             if last_even_clips >= 2:
                 # Revert to last even checkpoint — remaining clips
                 # (from seq_start + last_even_clips onward) will be
-                # re-processed by the outer loop.
+                # re-processed by the outer loop. Truncate in place to
+                # avoid reallocating the kept prefix on every revert.
                 i = seq_start + last_even_clips
                 clips_in_seq = last_even_clips
-                seq = seq[:last_even_len]
+                del seq[last_even_len:]
             else:
                 # 1 clip (or 0 even checkpoint) → route to transcribe
                 single_clip_indices.append(seq_start)
@@ -1094,8 +1060,7 @@ def main() -> None:
         print(f"  {key}: {c['seqs']:,} sequences, {c['tokens']:,} tokens")
 
     metadata_path = output_dir / "metadata.json"
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+    atomic_write_json(metadata_path, metadata)
     print(f"\nMetadata written to {metadata_path}")
     print("Done.")
 

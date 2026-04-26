@@ -69,6 +69,74 @@ def try_skip_if_complete(
     }
 
 
+def prepare_output_for_work(
+    *,
+    output_dir: Path,
+    state_filename: str,
+    fingerprint: Mapping[str, Any],
+    guidance: str,
+    stage_label: StageLabel,
+    resume: bool,
+    logger: logging.Logger,
+) -> dict[str, Any] | None:
+    """Run the pre-work half of the dual-marker resume protocol.
+
+    Returns a ``{"skipped": True, ...}`` payload when the stage can be
+    safely short-circuited; returns ``None`` after wiping any partial output,
+    creating a fresh output directory, and publishing a state file matching
+    *fingerprint*. Raises (via ``validate_or_write_prepare_state``) on
+    config drift against pre-existing state.
+
+    Single source of truth for the skip-then-wipe-then-publish-state dance
+    that both single-rank ``run_with_resume`` and rank-0 multi-rank entry
+    points share.
+    """
+    skipped = try_skip_if_complete(
+        output_dir=output_dir,
+        state_filename=state_filename,
+        fingerprint=fingerprint,
+        stage_label=stage_label,
+        resume=resume,
+        logger=logger,
+    )
+    if skipped is not None:
+        return skipped
+
+    state_path = output_dir / state_filename
+    if not resume and output_dir.is_dir():
+        logger.warning(
+            "Stage %r restarting at %s with resume=false; removing pre-existing output.",
+            stage_label,
+            output_dir,
+        )
+        shutil.rmtree(output_dir)
+    elif state_path.is_file():
+        # Pre-existing state must pass drift check before we wipe and rerun.
+        validate_or_write_prepare_state(
+            state_path,
+            expected=dict(fingerprint),
+            invariant_keys=tuple(fingerprint.keys()),
+            guidance=guidance,
+        )
+
+    if output_dir.is_dir():
+        logger.warning(
+            "Stage %r restarting at %s; removing pre-existing partial output.",
+            stage_label,
+            output_dir,
+        )
+        shutil.rmtree(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    validate_or_write_prepare_state(
+        state_path,
+        expected=dict(fingerprint),
+        invariant_keys=tuple(fingerprint.keys()),
+        guidance=guidance,
+    )
+    return None
+
+
 def run_with_resume(
     *,
     output_dir: Path,
@@ -85,46 +153,19 @@ def run_with_resume(
     Returns ``{"skipped": True, ...}`` when both marker and state exist
     and the fingerprint matches; otherwise validates/writes state, runs
     *work*, marks success, and returns ``{"skipped": False, **work_result, ...}``.
-    Raises ``AssertionError`` (via ``validate_or_write_prepare_state``) on
-    config drift.
+    Raises (via ``validate_or_write_prepare_state``) on config drift.
     """
-    state_path = output_dir / state_filename
-
-    skipped = try_skip_if_complete(
+    skipped = prepare_output_for_work(
         output_dir=output_dir,
         state_filename=state_filename,
         fingerprint=fingerprint,
+        guidance=guidance,
         stage_label=stage_label,
         resume=resume,
         logger=logger,
     )
     if skipped is not None:
         return skipped
-    # Fall through: any pre-existing state must still pass drift check
-    # (validate_or_write_prepare_state raises) before we wipe and rerun.
-    if state_path.is_file():
-        validate_or_write_prepare_state(
-            state_path,
-            expected=fingerprint,
-            invariant_keys=tuple(fingerprint.keys()),
-            guidance=guidance,
-        )
-
-    if output_dir.is_dir():
-        logger.warning(
-            "Stage %r restarting at %s; removing pre-existing partial output.",
-            stage_label,
-            output_dir,
-        )
-        shutil.rmtree(output_dir)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    validate_or_write_prepare_state(
-        state_path,
-        expected=fingerprint,
-        invariant_keys=tuple(fingerprint.keys()),
-        guidance=guidance,
-    )
 
     result = work() or {}
     mark_partition_success(output_dir)

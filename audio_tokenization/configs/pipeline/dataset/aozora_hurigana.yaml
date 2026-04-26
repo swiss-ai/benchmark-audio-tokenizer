@@ -1,29 +1,29 @@
 defaults:
-  - _common/pipeline@_here_
-  - _common/source_parquet@_here_
-  - _common/materialize_interleave@_here_
+  - /recipe/parquet_audio_text_interleaved@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - /profile/cscs@_here_
   - _self_
 
 name: aozora_hurigana
+language: ja
 
-convert:
-  input:
-    parquet_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/ndl___aozora_hurigana_speech_v2/parquet
-    parquet_glob: train-*.parquet
-  output:
-    shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/aozora_hurigana_train
-  metadata:
-    text_column: transcription
-    id_column: sample_id
-    language: ja
-    input_clip_id_parser: trailing_number
-    custom_columns:
-      - author
-      - work
-      - rendition
-      - line_num
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/ndl___aozora_hurigana_speech_v2/parquet
+  files: train-*.parquet
 
-materialize:
-  interleave:
-    cache_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/interleave_cache/aozora_hurigana_v2
-    output_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/aozora_hurigana_interleaved
+columns:
+  text: transcription
+  duration: null
+  id: sample_id
+  keep: [sample_id, author, work, rendition, line_num]
+
+timeline:
+  type: clip_num
+  source_id: source_id
+  clip_num: clip_num
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/aozora_hurigana_train
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: aozora_hurigana
+  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/aozora_hurigana_interleaved

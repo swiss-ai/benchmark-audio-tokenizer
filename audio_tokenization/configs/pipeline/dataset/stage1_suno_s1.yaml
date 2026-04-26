@@ -1,0 +1,29 @@
+defaults:
+  - /recipe/wds_audio_only@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - /profile/cscs@_here_
+  - _self_
+
+# Stage-1 Suno S1 audio-only rebuild.
+
+name: stage1_suno_s1
+
+source:
+  shards:
+    - /capstor/store/cscs/swissai/infra01/audio-datasets/raw/suno/shards_s1/*.tar
+  min_sr: 16000
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1_rebuild/suno_s1_shar_rmsdb_v1
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/stage_1_rebuild
+  name: suno_train_S1_rmsdb_v1
+
+conversion:
+  num_workers: 128
+
+tokenization:
+  min_duration: 5.0
+  max_duration: 200.0
+  num_workers: 8
+  max_batch_duration: 1000.0
+  checkpoint_interval_batches: 2000

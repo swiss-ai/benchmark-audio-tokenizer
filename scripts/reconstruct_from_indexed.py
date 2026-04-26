@@ -19,7 +19,8 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
 
-_INDEX_HEADER = b"MMIDIDX\x00\x00"
+from audio_tokenization.utils.indexed_dataset.constants import MEGATRON_INDEX_HEADER
+
 _DTYPE_MAP = {
     1: np.uint8, 2: np.int8, 3: np.int16, 4: np.int32,
     5: np.int64, 6: np.float64, 7: np.float32, 8: np.uint16,
@@ -29,7 +30,7 @@ _TOKENIZER_PATH = "/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_em
 
 def read_idx(idx_path):
     with open(idx_path, "rb") as f:
-        assert f.read(9) == _INDEX_HEADER
+        assert f.read(len(MEGATRON_INDEX_HEADER)) == MEGATRON_INDEX_HEADER
         f.read(8)  # version
         dtype = _DTYPE_MAP[struct.unpack("<B", f.read(1))[0]]
         seq_count = struct.unpack("<Q", f.read(8))[0]

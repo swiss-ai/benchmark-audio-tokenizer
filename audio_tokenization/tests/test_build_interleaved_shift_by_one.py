@@ -2,6 +2,8 @@ from pathlib import Path
 
 import json
 import numpy as np
+import polars as pl
+import pytest
 import sys
 
 from audio_tokenization.interleave import shift_by_one as sbo
@@ -185,6 +187,7 @@ def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
             "source_id": "s1",
             "clip_num": 0,
             "clip_start": 0.0,
+            "clip_duration": None,
             "speaker": "",
             "duration": 1.0,
             "text": "a",
@@ -197,6 +200,7 @@ def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
             "source_id": "s1",
             "clip_num": 1,
             "clip_start": 1.0,
+            "clip_duration": None,
             "speaker": "",
             "duration": 1.0,
             "text": "b",
@@ -209,6 +213,7 @@ def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
             "source_id": "s1",
             "clip_num": 2,
             "clip_start": 2.0,
+            "clip_duration": None,
             "speaker": "",
             "duration": 1.0,
             "text": "c",
@@ -257,6 +262,82 @@ def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
     assert result["transcribe"]["seqs"] == 1
 
 
+def test_detect_runs_keeps_small_timestamp_gap_in_same_run() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1"],
+            "clip_num": [1000, 3000],
+            "clip_start": [0.0, 3.0],
+            "clip_duration": [2.5, 2.0],
+        }
+    )
+
+    _, starts, lengths = sbo._detect_runs(df, max_gap_sec=5.0)
+
+    assert starts.tolist() == [0]
+    assert lengths.tolist() == [2]
+
+
+def test_detect_runs_sorts_by_timestamp_when_gap_detection_enabled() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1", "s1"],
+            "clip_num": [2, 0, 1],
+            "clip_start": [2.0, 0.0, 1.0],
+            "clip_duration": [1.0, 1.0, 1.0],
+        }
+    )
+
+    sorted_df, starts, lengths = sbo._detect_runs(df, max_gap_sec=5.0)
+
+    assert sorted_df["clip_start"].to_list() == [0.0, 1.0, 2.0]
+    assert starts.tolist() == [0]
+    assert lengths.tolist() == [3]
+
+
+def test_detect_runs_breaks_run_on_large_timestamp_gap() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1"],
+            "clip_num": [0, 1],
+            "clip_start": [0.0, 12.0],
+            "clip_duration": [2.0, 1.0],
+        }
+    )
+
+    _, starts, lengths = sbo._detect_runs(df, max_gap_sec=5.0)
+
+    assert starts.tolist() == [0, 1]
+    assert lengths.tolist() == [1, 1]
+
+
+def test_detect_runs_requires_clip_duration_for_gap_detection() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1"],
+            "clip_num": [0, 1],
+            "clip_start": [0.0, 12.0],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="requires tokenize cache timing columns"):
+        sbo._detect_runs(df, max_gap_sec=5.0)
+
+
+def test_detect_runs_requires_non_null_timestamps_for_gap_detection() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1"],
+            "clip_num": [0, 1],
+            "clip_start": [0.0, 12.0],
+            "clip_duration": [2.0, None],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="requires non-null clip_start and clip_duration"):
+        sbo._detect_runs(df, max_gap_sec=5.0)
+
+
 def test_shift_main_builds_from_partitioned_root(monkeypatch, tmp_path: Path) -> None:
     writer = StructuredCacheChunkWriter(
         str(tmp_path),
@@ -270,6 +351,7 @@ def test_shift_main_builds_from_partitioned_root(monkeypatch, tmp_path: Path) ->
             "source_id": "en",
             "clip_num": 0,
             "clip_start": 0.0,
+            "clip_duration": None,
             "speaker": "",
             "duration": 1.0,
             "text": "a",
@@ -283,6 +365,7 @@ def test_shift_main_builds_from_partitioned_root(monkeypatch, tmp_path: Path) ->
             "source_id": "en",
             "clip_num": 1,
             "clip_start": 1.0,
+            "clip_duration": None,
             "speaker": "",
             "duration": 1.0,
             "text": "b",
@@ -296,6 +379,7 @@ def test_shift_main_builds_from_partitioned_root(monkeypatch, tmp_path: Path) ->
             "source_id": "fr",
             "clip_num": 0,
             "clip_start": 0.0,
+            "clip_duration": None,
             "speaker": "",
             "duration": 1.0,
             "text": "c",
@@ -309,6 +393,7 @@ def test_shift_main_builds_from_partitioned_root(monkeypatch, tmp_path: Path) ->
             "source_id": "fr",
             "clip_num": 1,
             "clip_start": 1.0,
+            "clip_duration": None,
             "speaker": "",
             "duration": 1.0,
             "text": "d",

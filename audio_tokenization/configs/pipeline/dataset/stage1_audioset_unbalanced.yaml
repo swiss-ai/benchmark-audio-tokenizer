@@ -1,0 +1,38 @@
+defaults:
+  - /recipe/hf_audio_only@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - /profile/cscs@_here_
+  - _self_
+
+# Stage-1 AudioSet unbalanced rebuild from the local HF Arrow cache.
+
+name: stage1_audioset_unbalanced
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/audioset_cache/agkphysics___audio_set/full/0.0.0/0c609e8302cf139307f639c57652032af0a88041
+  files: audio_set-unbal_train-*.arrow
+
+columns:
+  id: video_id
+  id_prefix: audioset_unbal_train
+  keep: [video_id, audio.path, labels, human_labels]
+  constant:
+    dataset: audioset
+    split: unbal_train
+  derived:
+    source_url: https://www.youtube.com/watch?v={video_id}
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1_rebuild/audioset_unbalanced
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/stage_1_rebuild
+  name: audioset_unbalanced
+
+conversion:
+  shard_size: 5000
+  read_batch_size: 64
+
+tokenization:
+  min_duration: 2.0
+  max_duration: 200.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000
