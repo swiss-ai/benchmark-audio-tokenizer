@@ -1018,7 +1018,8 @@ def test_audio_dir_run_uses_shared_audio_index_with_fork(tmp_path, monkeypatch):
 
     assert captured["mp_start_method"] == "fork"
     assert len(captured["worker_args"]) == 1
-    assert len(captured["worker_args"][0]) == 15
+    assert len(captured["worker_args"][0]) == 16
+    assert captured["worker_args"][0][13] is None  # vad_min_rms_db default
     assert prepare_audio_dir_to_shar._AUDIO_INDEX is None
 
 

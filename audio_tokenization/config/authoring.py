@@ -253,6 +253,7 @@ def _source_input(family: str, source: Mapping[str, Any]) -> dict[str, Any]:
             "vad_sample_rate": _get(vad, "sample_rate"),
             "vad_max_merge_gap_sec": _get(vad, "max_merge_gap_sec"),
             "vad_max_duration_sec": _get(vad, "max_duration_sec"),
+            "vad_min_rms_db": _get(vad, "min_rms_db"),
         }
     if family == "audio_dir":
         vad = _mapping(source.get("vad"), "source.vad")
@@ -267,6 +268,7 @@ def _source_input(family: str, source: Mapping[str, Any]) -> dict[str, Any]:
             "vad_sample_rate": _get(vad, "sample_rate"),
             "vad_max_merge_gap_sec": _get(vad, "max_merge_gap_sec"),
             "vad_max_duration_sec": _get(vad, "max_duration_sec"),
+            "vad_min_rms_db": _get(vad, "min_rms_db"),
         }
     if family == "lhotse_recipe":
         return {

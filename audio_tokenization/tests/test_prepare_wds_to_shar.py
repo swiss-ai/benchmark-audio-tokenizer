@@ -289,6 +289,7 @@ def test_convert_worker_preserves_presegmented_clip_number_with_parser(monkeypat
             None,
             None,
             None,
+            None,
             "trailing_number",
             None,
         )

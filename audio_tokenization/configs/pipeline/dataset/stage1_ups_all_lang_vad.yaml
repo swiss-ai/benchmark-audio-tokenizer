@@ -22,6 +22,7 @@ source:
     sample_rate: 16000
     max_merge_gap_sec: 2.0
     max_duration_sec: 200.0
+    min_rms_db: -50.0
 
 outputs:
   shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1_rebuild/ups_all_lang_shar_v3

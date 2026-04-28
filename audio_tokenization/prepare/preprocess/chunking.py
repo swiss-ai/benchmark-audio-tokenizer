@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -37,6 +38,7 @@ class VADChunkingConfig:
     sample_rate: int = 16000
     max_merge_gap_sec: float = 0.5
     max_duration_sec: float | None = None
+    min_rms_db: float | None = None
 
 
 def canonical_sample_key(key: str) -> str:
@@ -331,6 +333,83 @@ def merge_and_pack_vad(
     return [(offset, dur) for offset, dur in chunks if dur >= min_chunk_sec]
 
 
+def filter_vad_timestamps_by_rms(
+    *,
+    cut: Any,
+    timestamps: Sequence[Tuple[int, int]],
+    sample_rate: int,
+    min_rms_db: float | None,
+    runtime_counts: Counter | None = None,
+) -> List[Tuple[int, int]]:
+    """Drop VAD spans whose own audio RMS is below *min_rms_db*.
+
+    This intentionally decodes span subcuts rather than slicing the full
+    recording. VAD timestamps are in the VAD sample-rate domain, while cuts
+    may already be resampled for SHAR output; Lhotse's truncate keeps that
+    time-to-sample mapping correct without loading an entire long recording.
+    """
+    if min_rms_db is None:
+        return list(timestamps)
+
+    from audio_tokenization.prepare.audio_ops import (
+        below_rms_threshold,
+        rms_db_from_audio,
+    )
+
+    duration = float(getattr(cut, "duration", 0.0) or 0.0)
+    if duration <= 0:
+        return []
+
+    threshold = float(min_rms_db)
+    sr = float(sample_rate)
+    kept: List[Tuple[int, int]] = []
+
+    for start_i, end_i in timestamps:
+        if end_i <= start_i:
+            if runtime_counts is not None:
+                runtime_counts["vad_spans_rms_invalid"] += 1
+            continue
+
+        offset = max(0.0, float(start_i) / sr)
+        end_sec = min(duration, float(end_i) / sr)
+        span_duration = end_sec - offset
+        if span_duration <= 0:
+            if runtime_counts is not None:
+                runtime_counts["vad_spans_rms_invalid"] += 1
+            continue
+
+        try:
+            try:
+                span_cut = cut.truncate(
+                    offset=offset,
+                    duration=span_duration,
+                    preserve_id=True,
+                )
+            except TypeError:
+                span_cut = cut.truncate(offset=offset, duration=span_duration)
+            rms_db = rms_db_from_audio(span_cut.load_audio())
+        except Exception:
+            if runtime_counts is not None:
+                runtime_counts["vad_spans_rms_errors"] += 1
+            raise
+
+        if runtime_counts is not None:
+            runtime_counts["vad_spans_rms_checked"] += 1
+
+        if below_rms_threshold(rms_db, threshold):
+            if runtime_counts is not None:
+                runtime_counts["vad_spans_rms_dropped"] += 1
+            continue
+
+        if runtime_counts is not None:
+            runtime_counts["vad_spans_rms_kept"] += 1
+        kept.append((start_i, end_i))
+
+    if runtime_counts is not None and timestamps and not kept:
+        runtime_counts["vad_cuts_all_spans_rms_dropped"] += 1
+    return kept
+
+
 def split_cut_by_vad(
     *,
     cut: Any,
@@ -338,6 +417,7 @@ def split_cut_by_vad(
     vad_lookup: Dict[str, List[Tuple[int, int]]],
     cfg: VADChunkingConfig,
     sr_lookup: Optional[Dict[str, int]] = None,
+    runtime_counts: Counter | None = None,
 ) -> Tuple[List[Any], str]:
     """Split one recording cut with VAD-aware chunking.
 
@@ -377,6 +457,35 @@ def split_cut_by_vad(
     )
     if not has_valid_span:
         return [], "invalid_vad_after_clamp"
+
+    if cfg.min_rms_db is not None:
+        max_duration_sec = (
+            cfg.max_duration_sec
+            if cfg.max_duration_sec is not None
+            else cfg.max_chunk_sec
+        )
+        before_count = len(timestamps)
+        timestamps = [
+            (s, e)
+            for s, e in timestamps
+            if min(duration, e / sr) - max(0.0, s / sr) <= max_duration_sec
+        ]
+        if runtime_counts is not None:
+            runtime_counts["vad_spans_rms_skipped_max_duration"] += (
+                before_count - len(timestamps)
+            )
+        if not timestamps:
+            return [], "chunks_below_min_duration"
+
+        timestamps = filter_vad_timestamps_by_rms(
+            cut=cut,
+            timestamps=timestamps,
+            sample_rate=sr,
+            min_rms_db=cfg.min_rms_db,
+            runtime_counts=runtime_counts,
+        )
+        if not timestamps:
+            return [], "spans_below_min_rms"
 
     ranges = merge_and_pack_vad(
         timestamps=timestamps,

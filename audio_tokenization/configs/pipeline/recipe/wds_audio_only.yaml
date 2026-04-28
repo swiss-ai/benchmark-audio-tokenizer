@@ -16,6 +16,7 @@ source:
     sample_rate: 16000
     max_merge_gap_sec: 0.5
     max_duration_sec: null
+    min_rms_db: null
 
 columns:
   audio: audio

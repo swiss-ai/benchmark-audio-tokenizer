@@ -365,6 +365,7 @@ def _convert_worker(args_tuple):
         vad_sample_rate,
         vad_max_merge_gap_sec,
         vad_max_duration_sec,
+        vad_min_rms_db,
         text_tokenizer,
         resampling_backend,
         input_clip_id_parser_name,
@@ -389,6 +390,7 @@ def _convert_worker(args_tuple):
             sample_rate=int(vad_sample_rate),
             max_merge_gap_sec=float(vad_max_merge_gap_sec),
             max_duration_sec=float(vad_max_duration_sec) if vad_max_duration_sec is not None else None,
+            min_rms_db=float(vad_min_rms_db) if vad_min_rms_db is not None else None,
         )
         vad_lookup, sr_lookup, lang_lookup = load_vad_from_per_shard_dir(
             Path(vad_per_shard_dir), tar_paths, with_lang=True, logger=logger,
@@ -440,6 +442,7 @@ def _convert_worker(args_tuple):
                         vad_lookup=vad_lookup,
                         cfg=vad_cfg,
                         sr_lookup=sr_lookup,
+                        runtime_counts=runtime_counts,
                     )
                     reason_counts[reason] += 1
                 else:
@@ -558,6 +561,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vad-max-duration-sec", type=float, default=None,
                         help="Drop atomic speech segments longer than this "
                              "(default: same as --vad-max-chunk-sec)")
+    parser.add_argument("--vad-min-rms-db", type=float, default=None,
+                        help="Drop VAD spans below this RMS before merge/pack")
 
     return parser
 
@@ -666,6 +671,7 @@ def run(spec):
             i.vad_sample_rate,
             i.vad_max_merge_gap_sec,
             i.vad_max_duration_sec,
+            i.vad_min_rms_db,
             text_tokenizer,
             o.resampling_backend,
             m.input_clip_id_parser,
@@ -695,6 +701,7 @@ def _args_to_spec(args):
             "vad_sample_rate": args.vad_sample_rate,
             "vad_max_merge_gap_sec": args.vad_max_merge_gap_sec,
             "vad_max_duration_sec": args.vad_max_duration_sec,
+            "vad_min_rms_db": args.vad_min_rms_db,
         },
         "output": {
             "shar_dir": str(args.shar_dir) if args.shar_dir else None,

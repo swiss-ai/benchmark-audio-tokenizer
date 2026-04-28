@@ -45,8 +45,9 @@ from audio_tokenization.prepare.runtime import (
     write_worker_result,
 )
 from audio_tokenization.prepare.preprocess.chunking import (
+    VADChunkingConfig,
     _parse_vad_jsonl_line,
-    merge_and_pack_vad,
+    split_cut_by_vad,
 )
 
 logging.basicConfig(
@@ -69,7 +70,27 @@ def _convert_worker(args_tuple):
     Each worker writes to its own ``worker_XX/`` directory to avoid contention.
     Resume is considered complete only when ``worker_XX/_SUCCESS`` exists.
     """
-    if len(args_tuple) == 16:
+    if len(args_tuple) == 17:
+        (
+            worker_id,
+            jsonl_paths,
+            audio_index,
+            shar_dir,
+            target_sr,
+            shard_size,
+            shar_format,
+            min_sr,
+            mono_downmix,
+            vad_max_chunk_sec,
+            vad_min_chunk_sec,
+            vad_sample_rate,
+            vad_max_merge_gap_sec,
+            vad_max_duration_sec,
+            vad_min_rms_db,
+            audio_ext,
+            resampling_backend,
+        ) = args_tuple
+    elif len(args_tuple) == 16 and isinstance(args_tuple[2], dict):
         (
             worker_id,
             jsonl_paths,
@@ -88,6 +109,7 @@ def _convert_worker(args_tuple):
             audio_ext,
             resampling_backend,
         ) = args_tuple
+        vad_min_rms_db = None
     else:
         (
             worker_id,
@@ -103,6 +125,7 @@ def _convert_worker(args_tuple):
             vad_sample_rate,
             vad_max_merge_gap_sec,
             vad_max_duration_sec,
+            vad_min_rms_db,
             audio_ext,
             resampling_backend,
         ) = args_tuple
@@ -129,6 +152,22 @@ def _convert_worker(args_tuple):
     t0 = time.time()
     written = skipped = errors = 0
     total_duration_sec = 0.0
+    vad_cfg = VADChunkingConfig(
+        max_chunk_sec=float(vad_max_chunk_sec),
+        min_chunk_sec=float(vad_min_chunk_sec),
+        sample_rate=int(vad_sample_rate),
+        max_merge_gap_sec=float(vad_max_merge_gap_sec),
+        max_duration_sec=(
+            float(vad_max_duration_sec)
+            if vad_max_duration_sec is not None
+            else None
+        ),
+        min_rms_db=(
+            float(vad_min_rms_db)
+            if vad_min_rms_db is not None
+            else None
+        ),
+    )
 
     with SharWriter(
         output_dir=str(worker_dir),
@@ -181,44 +220,30 @@ def _convert_worker(args_tuple):
                         cut = cut.resample(target_sr)
                         runtime_counts["resampled"] += 1
 
-                    # VAD chunking
-                    if not timestamps:
-                        reason_counts["empty_vad"] += 1
+                    try:
+                        out_cuts, reason = split_cut_by_vad(
+                            cut=cut,
+                            sample_key=key,
+                            vad_lookup={key: timestamps},
+                            cfg=vad_cfg,
+                            runtime_counts=runtime_counts,
+                        )
+                    except Exception as e:
+                        errors += 1
+                        runtime_counts["processing_errors"] += 1
+                        if errors <= 5:
+                            logger.warning(
+                                f"Worker {worker_id} error chunking {key}: {e}"
+                            )
+                        continue
+                    reason_counts[reason] += 1
+                    if not out_cuts:
                         skipped += 1
                         continue
 
-                    ranges = merge_and_pack_vad(
-                        timestamps=timestamps,
-                        audio_duration_sec=float(cut.duration),
-                        sample_rate=vad_sample_rate,
-                        max_merge_gap_sec=vad_max_merge_gap_sec,
-                        max_chunk_sec=vad_max_chunk_sec,
-                        min_chunk_sec=vad_min_chunk_sec,
-                        max_duration_sec=vad_max_duration_sec,
-                    )
-
-                    if not ranges:
-                        reason_counts["chunks_below_min_duration"] += 1
-                        skipped += 1
-                        continue
-
-                    reason_counts["chunked"] += 1
-
-                    for chunk_idx, (offset, chunk_duration) in enumerate(ranges):
+                    for chunk_idx, subcut in enumerate(out_cuts):
                         try:
-                            try:
-                                subcut = cut.truncate(
-                                    offset=offset,
-                                    duration=chunk_duration,
-                                    preserve_id=False,
-                                )
-                            except TypeError:
-                                subcut = cut.truncate(
-                                    offset=offset, duration=chunk_duration
-                                )
-
                             subcut.custom = subcut.custom or {}
-                            subcut.custom["global_offset_sec"] = offset
                             subcut.custom["lang"] = lang
                             subcut, skip, decoded_audio = apply_audio_pipeline(
                                 subcut,
@@ -234,7 +259,9 @@ def _convert_worker(args_tuple):
                                 subcut,
                                 key,
                                 chunk_idx,
-                                clip_start=offset,
+                                clip_start=subcut.custom.get(
+                                    "global_offset_sec", 0.0,
+                                ),
                             )
 
                             write_cut_to_shar(
@@ -250,6 +277,9 @@ def _convert_worker(args_tuple):
                             errors += 1
                             runtime_counts["processing_errors"] += 1
                             if errors <= 5:
+                                offset = (subcut.custom or {}).get(
+                                    "global_offset_sec", 0.0,
+                                )
                                 logger.warning(
                                     f"Worker {worker_id} error on chunk "
                                     f"{key}@{offset:.1f}: {e}"
@@ -325,6 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vad-max-duration-sec", type=float, default=None,
                         help="Drop atomic speech segments longer than this "
                              "(default: same as --vad-max-chunk-sec)")
+    parser.add_argument("--vad-min-rms-db", type=float, default=None,
+                        help="Drop VAD spans below this RMS before merge/pack")
 
     # Parallelism
     parser.add_argument("--num-workers", type=int, default=None,
@@ -405,6 +437,7 @@ def run(spec):
             i.vad_sample_rate,
             i.vad_max_merge_gap_sec,
             i.vad_max_duration_sec,
+            i.vad_min_rms_db,
             i.audio_ext,
             o.resampling_backend,
         )
@@ -441,6 +474,7 @@ def _args_to_spec(args):
             "vad_sample_rate": args.vad_sample_rate,
             "vad_max_merge_gap_sec": args.vad_max_merge_gap_sec,
             "vad_max_duration_sec": args.vad_max_duration_sec,
+            "vad_min_rms_db": args.vad_min_rms_db,
         },
         "output": {
             "shar_dir": str(args.shar_dir) if args.shar_dir else None,

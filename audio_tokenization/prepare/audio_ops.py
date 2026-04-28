@@ -124,9 +124,14 @@ def write_cut_to_shar(writer, cut, *, audio=None, runtime_counts: Counter | None
         writer.write(cut)
 
 
+def below_rms_threshold(rms_val: float, threshold: float) -> bool:
+    """Return True when an RMS value is invalid or below a threshold."""
+    return math.isnan(rms_val) or rms_val < threshold
+
+
 def should_skip_quiet(rms_val: float) -> bool:
     """Return True if the sample should be skipped (silent/empty audio)."""
-    return math.isnan(rms_val) or rms_val < MIN_RMS_DB
+    return below_rms_threshold(rms_val, MIN_RMS_DB)
 
 
 def make_rms_filter_fn():
