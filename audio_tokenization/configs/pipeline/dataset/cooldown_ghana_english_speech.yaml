@@ -1,0 +1,46 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# Ghana English Speech is a standalone utterance ASR corpus. The parquet rows
+# contain audio bytes, corrected text, and duration, but no stable audio.path or
+# source-timeline metadata; use generated row IDs and direct ASR.
+#
+# 406,094 train clips, ~620 hours, English, 24 kHz audio bytes.
+
+name: cooldown_ghana_english_speech
+language: en
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___ghananlpcommunity___ghana-english-speech-600hrs/data
+  files: train-*.parquet
+
+columns:
+  audio: audio
+  text: corrected_text
+  duration: duration_ss
+  id: null
+  id_prefix: ghana_english_speech
+  constant:
+    dataset: ghana_english_speech_600hrs
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/ghana_english_speech
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: ghana_english_speech
+
+conversion:
+  num_workers: 204
+  # Convert-time has no CUDA or active dataloader threads; fork avoids
+  # re-importing torch/lhotse in every worker on this CPU-only conversion.
+  mp_start_method: fork
+
+tokenization:
+  # 2 s floor matches the cooldown-wide default (cleaner than the
+  # recipe's 1 s; drops ~24% of cuts but only ~9% of hours since the tail
+  # is short clips).
+  min_duration: 2.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000

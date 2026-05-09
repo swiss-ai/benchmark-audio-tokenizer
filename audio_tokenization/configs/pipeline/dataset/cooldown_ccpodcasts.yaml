@@ -1,0 +1,38 @@
+defaults:
+  - /recipe/parquet_audio_text_interleaved@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# CCpodcasts — TWiV / TWiEVO / TWiP / TWiM science podcasts (English).
+# 416,758 segments × ~25s avg, 2,124 parent episodes, ~2,793 hours.
+# Cooldown-stage audio_text_interleaved dataset.
+
+name: cooldown_ccpodcasts
+language: en
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/ccpodcasts_parquet
+  files: train-*.parquet
+
+columns:
+  text: text
+  duration: duration
+  id: [source_id, segment_idx]
+  keep: [parent_audio, parent_start, parent_end]
+
+timeline:
+  type: id_parser
+  parser: trailing_number
+  clip_start: parent_start
+  clip_end: parent_end
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/ccpodcasts
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: ccpodcasts
+  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/ccpodcasts_interleaved
+
+materialization:
+  transcribe_ratio: 0.5
+  max_seq_len: 8192
+  max_gap_sec: 5.0

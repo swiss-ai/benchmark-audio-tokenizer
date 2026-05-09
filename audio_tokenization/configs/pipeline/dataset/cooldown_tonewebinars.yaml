@@ -1,0 +1,53 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# Vikhrmodels/ToneWebinars — Russian webinar ASR pairs. Already VAD-sliced
+# upstream with a 30 s max-chunk cap (median 27 s, p90 30 s); boundaries
+# mostly land on silence but ~14% hit the cap mid-speech. The HF packaging
+# dropped per-webinar provenance (audio.path is None, no source_id), so the
+# pipeline treats rows as independent (audio, text) pairs — direct ASR, not
+# interleave.
+#
+# 352 train shards, 286,787 rows, mean clip ~26 s, ~2,089 h. Source rate
+# 48 kHz (sample_rate column in source); recipe target is 24 kHz (resampled
+# at convert by soxr).
+
+name: cooldown_tonewebinars
+language: ru
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___Vikhrmodels___ToneWebinars/data
+  files: train-*.parquet
+
+columns:
+  audio: audio
+  text: text
+  duration: null
+  id: null
+  language_column: null
+  id_prefix: tonewebinars
+  keep:
+    - sample_rate
+  constant:
+    dataset: tonewebinars
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/tonewebinars
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: tonewebinars
+
+conversion:
+  enabled: true
+  num_workers: 64
+  shard_size: 5000
+  read_batch_size: 16
+  mp_start_method: fork
+
+tokenization:
+  # min 5 s drops ~4% of clips (the very-short tail under VAD's 5 s lower bound).
+  min_duration: 5.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000

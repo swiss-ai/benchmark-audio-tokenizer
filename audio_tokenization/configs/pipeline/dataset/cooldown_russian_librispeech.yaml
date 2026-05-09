@@ -1,0 +1,62 @@
+defaults:
+  - /recipe/parquet_audio_text_interleaved@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# istupakov/russian_librispeech — Russian audiobook ASR (Tolstoy / Pushkin /
+# Chekhov etc.), pre-segmented at sentence-level. audio.path encodes
+# `<book_volume_chapter_title>_<clipnum>.wav`, so source_id + clip_num are
+# parsable via trailing_number_basename → interleavable like infore2.
+#
+# Train split only (test held out). 24 train shards, 54,472 rows, mean 7.3 s,
+# ~110 h. Both `text` (normalized) and `text_no_preprocessing` (cased,
+# punctuated) are present — using `text` for ASR.
+
+name: cooldown_russian_librispeech
+language: ru
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___istupakov___russian_librispeech/data
+  files: train-*.parquet
+
+columns:
+  audio: audio
+  text: text
+  duration: duration
+  id: audio.path
+  language_column: null
+  id_prefix: russian_librispeech
+  keep:
+    - text_no_preprocessing
+    - score
+    - audio_filepath
+  constant:
+    dataset: russian_librispeech
+
+timeline:
+  type: id_parser
+  parser: trailing_number_basename
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/russian_librispeech
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: russian_librispeech
+  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/russian_librispeech_interleaved
+
+conversion:
+  enabled: true
+  num_workers: 24
+  shard_size: 5000
+  read_batch_size: 64
+  mp_start_method: fork
+
+tokenization:
+  min_duration: 1.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 1000
+
+materialization:
+  # 8 k tokens per sequence — cooldown-wide standard for interleave.
+  max_seq_len: 8192
+  transcribe_ratio: 0.5

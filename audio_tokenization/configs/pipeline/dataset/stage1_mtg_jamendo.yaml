@@ -1,0 +1,35 @@
+defaults:
+  - /recipe/wds_audio_only@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# Stage-1 MTG-Jamendo train audio-only rebuild.
+
+name: stage1_mtg_jamendo
+
+source:
+  shards:
+    - /capstor/store/cscs/swissai/infra01/audio-datasets/raw/mtg-jamendo/data/train/*.tar
+  min_sr: 16000
+
+columns:
+  external_metadata: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/mtg-jamendo/train.tsv
+  id_field: id
+  text_field: __unused_text__
+  custom_fields: [artist_id, album_id, durationInSec, genres, instruments, moods, chunk_nr]
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1_rebuild/mtg_jamendo_train
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/stage_1_rebuild
+  name: mtg_jamendo_train
+
+conversion:
+  num_workers: 128
+  shard_size: 5000
+
+tokenization:
+  min_duration: 5.0
+  max_duration: 200.0
+  num_workers: 32
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000

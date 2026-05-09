@@ -1,0 +1,48 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# Cooldown ASR pairs from OpenSLR-108 MediaSpeech (4 languages: AR, ES, FR, TR).
+# Built one-shot from raw .flac + .txt sidecar pairs by
+# `multimodal-data/01-dataset-download/audio/openslr108-mediaspeech/convert_to_parquet.py`,
+# producing one parquet per language with embedded audio bytes + transcription
+# + duration + locale columns. ~10k clips, ~40 h total.
+
+name: cooldown_mediaspeech
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/openslr108_mediaspeech/data
+  files: "*.parquet"
+
+columns:
+  audio: audio
+  text: transcription
+  duration: duration_ss
+  id: null
+  language_column: locale
+  id_prefix: mediaspeech
+  keep: []
+  constant:
+    dataset: openslr108_mediaspeech
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/openslr108_mediaspeech
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: openslr108_mediaspeech
+
+conversion:
+  enabled: true
+  num_workers: 4
+  shard_size: 5000
+  read_batch_size: 64
+  mp_start_method: fork
+
+tokenization:
+  # 2 s floor matches the cooldown-wide default. MediaSpeech is uniform
+  # ~14.4 s per clip, so this filter is a no-op in practice (no clips
+  # under 2 s).
+  min_duration: 2.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 500
