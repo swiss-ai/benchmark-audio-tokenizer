@@ -14,7 +14,6 @@ input:
   vad_sample_rate: 16000
   vad_max_merge_gap_sec: 0.5
   vad_max_duration_sec: null
-  vad_min_rms_db: null
 output:
   # Site override: pin the Alps wheelhouse tokenizer for in-cluster runs.
   text_tokenizer: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json

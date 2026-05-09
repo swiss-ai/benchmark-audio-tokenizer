@@ -187,7 +187,6 @@ class PrepareWdsInputSpec(SchemaModel):
     vad_sample_rate: IntLike = 16000
     vad_max_merge_gap_sec: FloatLike = 0.5
     vad_max_duration_sec: OptFloatLike = None
-    vad_min_rms_db: OptFloatLike = None
 
     @model_validator(mode="after")
     def _require_wds_shards(self):
@@ -207,7 +206,6 @@ class PrepareWdsInputSpec(SchemaModel):
             "vad_sample_rate": self.vad_sample_rate,
             "vad_max_merge_gap_sec": self.vad_max_merge_gap_sec,
             "vad_max_duration_sec": self.vad_max_duration_sec,
-            "vad_min_rms_db": self.vad_min_rms_db,
         }
 
 
@@ -224,7 +222,6 @@ class PrepareAudioDirInputSpec(SchemaModel):
     vad_sample_rate: IntLike = 16000
     vad_max_merge_gap_sec: FloatLike = 1.0
     vad_max_duration_sec: OptFloatLike = None
-    vad_min_rms_db: OptFloatLike = None
 
     @model_validator(mode="after")
     def _require_jsonls(self):
@@ -244,7 +241,6 @@ class PrepareAudioDirInputSpec(SchemaModel):
             "vad_sample_rate": self.vad_sample_rate,
             "vad_max_merge_gap_sec": self.vad_max_merge_gap_sec,
             "vad_max_duration_sec": self.vad_max_duration_sec,
-            "vad_min_rms_db": self.vad_min_rms_db,
         }
 
 

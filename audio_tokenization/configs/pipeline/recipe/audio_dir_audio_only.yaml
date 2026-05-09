@@ -15,7 +15,6 @@ source:
     sample_rate: 16000
     max_merge_gap_sec: 1.0
     max_duration_sec: null
-    min_rms_db: null
 
 columns:
   audio: audio
@@ -49,7 +48,7 @@ conversion:
   target_sr: 24000
   text_tokenizer: null
   num_workers: null
-  resampling_backend: torchaudio
+  resampling_backend: soxr
   mp_start_method: fork
   read_batch_size: 256
 

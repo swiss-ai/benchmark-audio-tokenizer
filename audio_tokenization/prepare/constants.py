@@ -12,9 +12,27 @@ SUCCESS_MARKER_FILE = "_SUCCESS"
 MIN_RMS_DB = -50.0
 PREPARE_STATE_FILE = "_PREPARE_STATE.json"
 
-# On-disk schema version for _PREPARE_STATE.json. Stale or unversioned state
+# Generic stage-state schema version used by tokenize/materialize state files.
+CURRENT_STAGE_STATE_VERSION = 1
+
+# On-disk schema version for _PREPARE_STATE.json. Stale or unversioned prepare
 # files are rejected; rebuild from raw inputs instead of migrating in place.
-CURRENT_PREPARE_STATE_VERSION = 1
+# Bumped to 2 when vad_min_rms_db was removed: V1 prepare states fingerprint
+# that field, so a partial-resume from a V1 prepare directory would produce
+# mixed SHAR (RMS-filtered chunks from completed workers, unfiltered from new
+# ones). This version is intentionally prepare-specific; it must not invalidate
+# tokenize/materialize outputs.
+CURRENT_PREPARE_STATE_VERSION = 2
+
+
+def state_version_for_filename(filename: str) -> int:
+    """Schema version expected for a given state file name."""
+    return (
+        CURRENT_PREPARE_STATE_VERSION
+        if filename == PREPARE_STATE_FILE
+        else CURRENT_STAGE_STATE_VERSION
+    )
+
 
 MetadataEntry = tuple[Optional[str], dict]
 _MISSING = object()

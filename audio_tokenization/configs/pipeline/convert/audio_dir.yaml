@@ -14,7 +14,6 @@ input:
   vad_sample_rate: 16000
   vad_max_merge_gap_sec: 1.0
   vad_max_duration_sec: null
-  vad_min_rms_db: null
 output:
   # audio_dir is audio-only ingest with no transcripts to tokenize, so
   # text_tokenizer stays null (matches schema default in _common).

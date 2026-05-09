@@ -1,7 +1,6 @@
 defaults:
   - /recipe/wds_audio_only@_here_
   - /tokenizer/apertus_wavtok@_here_
-  - /profile/cscs@_here_
   - _self_
 
 # Stage-1 UPS all-language VAD rebuild. Conversion is Slurm-array partitioned;
@@ -17,12 +16,11 @@ source:
   vad:
     enabled: true
     per_shard_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/unsupervised_peoples_speech_commercial_wds/vad_results_all_per_shard
-    max_chunk_sec: 200.0
+    max_chunk_sec: 202.0
     min_chunk_sec: 5.0
     sample_rate: 16000
     max_merge_gap_sec: 2.0
-    max_duration_sec: 200.0
-    min_rms_db: -50.0
+    max_duration_sec: 202.0
 
 outputs:
   shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1_rebuild/ups_all_lang_shar_v3
@@ -31,10 +29,12 @@ outputs:
 
 conversion:
   enabled: false
+  shard_size: 5000
   num_workers: 288
+  mp_start_method: fork
 
 tokenization:
   min_duration: 5.0
-  max_duration: 200.0
-  max_batch_duration: 1000.0
+  max_duration: 202.0
+  max_batch_duration: 2000.0
   checkpoint_interval_batches: 2000

@@ -38,7 +38,6 @@ class VADChunkingConfig:
     sample_rate: int = 16000
     max_merge_gap_sec: float = 0.5
     max_duration_sec: float | None = None
-    min_rms_db: float | None = None
 
 
 def canonical_sample_key(key: str) -> str:
@@ -156,21 +155,15 @@ def load_vad_from_per_shard_dir(
     *,
     with_lang: bool = False,
     logger: Optional[logging.Logger] = None,
-) -> Dict[str, List[Tuple[int, int]]] | Tuple[Dict[str, List[Tuple[int, int]]], ...]:
+) -> Dict[str, List[Tuple[int, int]]] | Tuple[Dict[str, List[Tuple[int, int]]], Dict[str, str]]:
     """Load VAD entries from per-shard JSONL files for the given tar shards.
 
     Each worker calls this with its own tar_paths and gets only the
     relevant VAD entries. No pre-build step or cache needed.
 
-    Always returns ``(vad_lookup, sr_lookup, ...)`` where ``sr_lookup``
-    maps normalized sample keys to per-recording sample rates (int).
-    When *with_lang* is True, also returns ``lang_lookup``.
-
-    Returns:
-        ``(vad_lookup, sr_lookup)`` or ``(vad_lookup, sr_lookup, lang_lookup)``
+    Returns ``vad_lookup`` (or ``(vad_lookup, lang_lookup)`` if *with_lang*).
     """
     lookup: Dict[str, List[Tuple[int, int]]] = {}
-    sr_lookup: Dict[str, int] = {}
     lang_lookup: Dict[str, str] = {}
     files_read = 0
     for tar_path in tar_paths:
@@ -194,26 +187,17 @@ def load_vad_from_per_shard_dir(
                 if not isinstance(raw_value, dict):
                     continue
                 key = canonical_sample_key(str(raw_key))
-                timestamps = _normalize_raw_timestamps(raw_value.get("timestamps", []))
-                lookup[key] = timestamps
-                # Per-recording sample rate
-                sr_raw = raw_value.get("sample_rate")
-                if sr_raw is not None:
-                    try:
-                        sr_lookup[key] = int(sr_raw)
-                    except (TypeError, ValueError):
-                        pass
+                lookup[key] = _normalize_raw_timestamps(raw_value.get("timestamps", []))
                 if with_lang:
                     lang_lookup[key] = raw_value.get("lang", "unknown")
     if logger is not None:
         logger.info(
             f"Loaded {len(lookup)} VAD entries from "
-            f"{files_read}/{len(tar_paths)} shard files "
-            f"({len(sr_lookup)} with per-recording sample rate)"
+            f"{files_read}/{len(tar_paths)} shard files"
         )
     if with_lang:
-        return lookup, sr_lookup, lang_lookup
-    return lookup, sr_lookup
+        return lookup, lang_lookup
+    return lookup
 
 
 # ---------------------------------------------------------------------------
@@ -333,105 +317,23 @@ def merge_and_pack_vad(
     return [(offset, dur) for offset, dur in chunks if dur >= min_chunk_sec]
 
 
-def filter_vad_timestamps_by_rms(
-    *,
-    cut: Any,
-    timestamps: Sequence[Tuple[int, int]],
-    sample_rate: int,
-    min_rms_db: float | None,
-    runtime_counts: Counter | None = None,
-) -> List[Tuple[int, int]]:
-    """Drop VAD spans whose own audio RMS is below *min_rms_db*.
-
-    This intentionally decodes span subcuts rather than slicing the full
-    recording. VAD timestamps are in the VAD sample-rate domain, while cuts
-    may already be resampled for SHAR output; Lhotse's truncate keeps that
-    time-to-sample mapping correct without loading an entire long recording.
-    """
-    if min_rms_db is None:
-        return list(timestamps)
-
-    from audio_tokenization.prepare.audio_ops import (
-        below_rms_threshold,
-        rms_db_from_audio,
-    )
-
-    duration = float(getattr(cut, "duration", 0.0) or 0.0)
-    if duration <= 0:
-        return []
-
-    threshold = float(min_rms_db)
-    sr = float(sample_rate)
-    kept: List[Tuple[int, int]] = []
-
-    for start_i, end_i in timestamps:
-        if end_i <= start_i:
-            if runtime_counts is not None:
-                runtime_counts["vad_spans_rms_invalid"] += 1
-            continue
-
-        offset = max(0.0, float(start_i) / sr)
-        end_sec = min(duration, float(end_i) / sr)
-        span_duration = end_sec - offset
-        if span_duration <= 0:
-            if runtime_counts is not None:
-                runtime_counts["vad_spans_rms_invalid"] += 1
-            continue
-
-        try:
-            try:
-                span_cut = cut.truncate(
-                    offset=offset,
-                    duration=span_duration,
-                    preserve_id=True,
-                )
-            except TypeError:
-                span_cut = cut.truncate(offset=offset, duration=span_duration)
-            rms_db = rms_db_from_audio(span_cut.load_audio())
-        except Exception:
-            if runtime_counts is not None:
-                runtime_counts["vad_spans_rms_errors"] += 1
-            raise
-
-        if runtime_counts is not None:
-            runtime_counts["vad_spans_rms_checked"] += 1
-
-        if below_rms_threshold(rms_db, threshold):
-            if runtime_counts is not None:
-                runtime_counts["vad_spans_rms_dropped"] += 1
-            continue
-
-        if runtime_counts is not None:
-            runtime_counts["vad_spans_rms_kept"] += 1
-        kept.append((start_i, end_i))
-
-    if runtime_counts is not None and timestamps and not kept:
-        runtime_counts["vad_cuts_all_spans_rms_dropped"] += 1
-    return kept
-
-
 def split_cut_by_vad(
     *,
     cut: Any,
-    sample_key: str,
-    vad_lookup: Dict[str, List[Tuple[int, int]]],
+    timestamps: Optional[Sequence[Tuple[int, int]]],
     cfg: VADChunkingConfig,
-    sr_lookup: Optional[Dict[str, int]] = None,
     runtime_counts: Counter | None = None,
 ) -> Tuple[List[Any], str]:
     """Split one recording cut with VAD-aware chunking.
 
-    All recordings are VAD-processed uniformly (no special treatment by
-    duration).  Adjacent speech segments are merged when the gap is <=
-    ``max_merge_gap_sec``, then packed into chunks up to ``max_chunk_sec``.
-
-    If *sr_lookup* is provided, the per-recording sample rate is used
-    to interpret VAD timestamps. Otherwise falls back to ``cfg.sample_rate``.
+    Adjacent speech segments are merged when the gap is <= ``max_merge_gap_sec``,
+    then packed into chunks up to ``max_chunk_sec``. VAD timestamps are always
+    in cfg.sample_rate (16 kHz, Silero's internal domain).
 
     Policy:
     - duration < min_chunk_sec: drop
-    - missing VAD entry: drop
-    - empty VAD timestamps: drop (non-speech)
+    - timestamps is None (no VAD entry for this recording): drop
+    - empty timestamps: drop (non-speech)
     - all timestamps invalid after clamping to cut duration: drop
     - otherwise: produce speech chunks <= max_chunk_sec and >= min_chunk_sec
     """
@@ -439,16 +341,10 @@ def split_cut_by_vad(
     if duration < cfg.min_chunk_sec:
         return [], "too_short"
 
-    key = canonical_sample_key(sample_key)
-    timestamps = vad_lookup.get(key)
-
     if timestamps is None:
         return [], "missing_vad"
     if not timestamps:
         return [], "empty_vad"
-    # VAD timestamps are always in the 16 kHz domain (Silero resamples
-    # internally). The per-recording sample_rate stored in the JSONL is the
-    # *original* recording SR, NOT the VAD domain — so always use cfg.sample_rate.
     sr = cfg.sample_rate
     has_valid_span = any(
         min(duration, e / sr) > max(0.0, s / sr)
@@ -457,35 +353,6 @@ def split_cut_by_vad(
     )
     if not has_valid_span:
         return [], "invalid_vad_after_clamp"
-
-    if cfg.min_rms_db is not None:
-        max_duration_sec = (
-            cfg.max_duration_sec
-            if cfg.max_duration_sec is not None
-            else cfg.max_chunk_sec
-        )
-        before_count = len(timestamps)
-        timestamps = [
-            (s, e)
-            for s, e in timestamps
-            if min(duration, e / sr) - max(0.0, s / sr) <= max_duration_sec
-        ]
-        if runtime_counts is not None:
-            runtime_counts["vad_spans_rms_skipped_max_duration"] += (
-                before_count - len(timestamps)
-            )
-        if not timestamps:
-            return [], "chunks_below_min_duration"
-
-        timestamps = filter_vad_timestamps_by_rms(
-            cut=cut,
-            timestamps=timestamps,
-            sample_rate=sr,
-            min_rms_db=cfg.min_rms_db,
-            runtime_counts=runtime_counts,
-        )
-        if not timestamps:
-            return [], "spans_below_min_rms"
 
     ranges = merge_and_pack_vad(
         timestamps=timestamps,
