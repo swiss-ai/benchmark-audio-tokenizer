@@ -266,7 +266,6 @@ class AudioTextHandler:
             self._idx,
             self._cut_ids,
         )
-        done = self._chunk_id
         self._chunk_id += 1
         self.chunk_samples = 0
         self.chunks_written += 1
@@ -281,13 +280,13 @@ class AudioTextHandler:
             self._cut_ids_path,
         ) = \
             open_chunk_writer(self._output_dir, self._rank, self._chunk_id, self._vocab_size)
-        return done
+        return self._chunk_id
 
     def _checkpoint_writer_interleaved(self):
         done_id = self._writer.finalize()
         self.chunk_samples = 0
         self.chunks_written += len(done_id)
-        return done_id
+        return self._writer.get_state()
 
     def get_writer_state(self):
         if self.audio_text_format == "direct":
@@ -311,6 +310,7 @@ class AudioTextHandler:
                 self._cut_ids,
             )
             self.chunks_written += 1
+            self._chunk_id += 1
         else:
             self._cut_ids.abort()
             for p in (self._tmp_bin, self._tmp_idx):

@@ -43,7 +43,7 @@ def load_external_metadata(
                 break
             if first_line:
                 header = first_line.split("\t")
-                if id_field in header and text_field in header:
+                if id_field in header:
                     reader = csv.DictReader(f, fieldnames=header, delimiter="\t")
                     for row in reader:
                         custom = {k: row[k] for k in (custom_fields or ()) if k in row}
@@ -90,10 +90,41 @@ def load_external_metadata(
                 custom = {k: row[k] for k in (custom_fields or ()) if k in row}
                 result[str(row[id_field])] = (row.get(text_field), custom)
 
+    elif fmt == ".parquet":
+        import pyarrow.parquet as pq
+
+        parquet_file = pq.ParquetFile(p)
+        schema_names = set(parquet_file.schema_arrow.names)
+        if id_field not in schema_names:
+            raise ValueError(
+                f"External metadata {p} is missing required id field {id_field!r}"
+            )
+
+        selected = [id_field]
+        if text_field in schema_names:
+            selected.append(text_field)
+        selected.extend(
+            field
+            for field in (custom_fields or ())
+            if field in schema_names and field not in selected
+        )
+
+        for batch in parquet_file.iter_batches(columns=selected, batch_size=65536):
+            for row in batch.to_pylist():
+                row_id = row[id_field]
+                if row_id is None:
+                    continue
+                custom = {
+                    k: row[k]
+                    for k in (custom_fields or ())
+                    if k in row and row[k] is not None
+                }
+                result[str(row_id)] = (row.get(text_field), custom)
+
     else:
         raise ValueError(
             f"Unsupported external metadata format: {p.name} "
-            "(expected .tsv, .csv, or .jsonl, optionally with .gz/.zst compression)"
+            "(expected .tsv, .csv, .jsonl, or .parquet, optionally with .gz/.zst compression)"
         )
 
     logging.getLogger(__name__).info(

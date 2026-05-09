@@ -486,6 +486,48 @@ def test_prepare_parquet_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_
     }
 
 
+def test_prepare_parquet_worker_accepts_binary_audio_column(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "clip_id": ["common_voice_en_1.mp3"],
+                "audio_bytes": [b"mp3-bytes"],
+                "sentence": ["hello from common voice"],
+                "locale": ["en"],
+                "split": ["train"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        _parquet_worker_args(
+            tmp_path,
+            audio_column="audio_bytes",
+            id_column="clip_id",
+            text_column="sentence",
+            duration_column=None,
+            language_column="locale",
+            custom_columns=("split",),
+        )
+    )
+
+    assert helper_calls == [
+        {
+            "audio_bytes": b"mp3-bytes",
+            "recording_id": "common_voice_en_1.mp3",
+        }
+    ]
+    assert result["written"] == 1
+    assert written_cuts[0].supervisions[0].text == "hello from common voice"
+    assert written_cuts[0].supervisions[0].language == "en"
+    assert written_cuts[0].custom["split"] == "train"
+
+
 def test_prepare_parquet_worker_external_metadata_overrides_text_and_custom(monkeypatch, tmp_path):
     written_cuts = []
     helper_calls = []

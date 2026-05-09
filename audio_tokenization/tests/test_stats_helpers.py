@@ -1,5 +1,8 @@
 import json
+import multiprocessing as mp
 
+from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
+from audio_tokenization.prepare import runtime as prepare_runtime
 from audio_tokenization.pipelines.lhotse.stats_reducer import (
     build_aggregate,
     load_rank_stats,
@@ -7,6 +10,14 @@ from audio_tokenization.pipelines.lhotse.stats_reducer import (
     write_rank_stats,
 )
 from audio_tokenization.prepare.runtime import build_prepare_rollup, build_prepare_summary
+
+
+class _CaptureLogger:
+    def __init__(self):
+        self.infos = []
+
+    def info(self, message, *args):
+        self.infos.append(message % args if args else message)
 
 
 def _tokenize_rank_stats(rank: int, *, success: bool) -> dict:
@@ -149,3 +160,143 @@ def test_prepare_rollup_sums_node_summaries():
     assert rollup["max_elapsed_sec"] == 4.0
     assert rollup["runtime_counts"] == {"decoded": 5}
     assert rollup["reason_counts"] == {"quiet": 2}
+
+
+def test_prepare_worker_progress_logs_when_written_crosses_threshold(monkeypatch):
+    logger = _CaptureLogger()
+    monkeypatch.setattr(prepare_runtime.time, "time", lambda: 20.0)
+
+    next_log_at = prepare_runtime.maybe_log_worker_progress(
+        logger=logger,
+        worker_id=3,
+        written=1007,
+        skipped=2,
+        errors=1,
+        t0=10.0,
+        next_log_at=1000,
+    )
+
+    assert next_log_at == 2000
+    assert logger.infos == [
+        "Worker 3: 1007 written, 2 skipped, 1 errors (100.7 samples/s)"
+    ]
+
+
+def test_prepare_pool_reports_workers_as_they_finish(monkeypatch, tmp_path):
+    class _FakePool:
+        def __init__(self, processes):
+            self.processes = processes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def map(self, *_args, **_kwargs):
+            raise AssertionError("run_pool_and_finalize must not block on pool.map")
+
+        def imap_unordered(self, fn, worker_args):
+            for arg in reversed(worker_args):
+                yield fn(arg)
+
+    class _FakeContext:
+        def Pool(self, processes):
+            return _FakePool(processes)
+
+    monkeypatch.setattr(mp, "get_all_start_methods", lambda: ["fork"])
+    monkeypatch.setattr(mp, "get_context", lambda _method: _FakeContext())
+    monkeypatch.setattr(
+        prepare_runtime, "build_shar_index_for_worker_dirs", lambda *_args, **_kwargs: None
+    )
+
+    import audio_tokenization.prepare.validate_shar as validate_shar
+
+    monkeypatch.setattr(validate_shar, "validate_shar_directory", lambda _path: {})
+
+    logger = _CaptureLogger()
+    monkeypatch.setattr(prepare_runtime, "logger", logger)
+
+    def worker(worker_id):
+        return {
+            "worker_id": worker_id,
+            "written": worker_id + 1,
+            "skipped": 0,
+            "errors": 0,
+            "elapsed": 1.0,
+            "total_duration_sec": 10.0,
+            "reused": False,
+            "worker_stats": {"runtime_counts": {}},
+        }
+
+    results = prepare_runtime.run_pool_and_finalize(
+        worker,
+        [0, 1],
+        tmp_path,
+        num_workers=2,
+        mp_start_method="fork",
+    )
+
+    assert [result["worker_id"] for result in results] == [1, 0]
+    assert "Worker 1 finished (1/2)" in logger.infos
+    assert "Worker 0 finished (2/2)" in logger.infos
+
+
+def test_prepare_pool_indexes_actual_worker_dirs_for_sparse_ids(monkeypatch, tmp_path):
+    """Empty assignment buckets should not make finalize expect missing workers."""
+
+    class _FakePool:
+        def __init__(self, processes):
+            self.processes = processes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def imap_unordered(self, fn, worker_args):
+            for arg in worker_args:
+                yield fn(arg)
+
+    class _FakeContext:
+        def Pool(self, processes):
+            return _FakePool(processes)
+
+    monkeypatch.setattr(mp, "get_all_start_methods", lambda: ["fork"])
+    monkeypatch.setattr(mp, "get_context", lambda _method: _FakeContext())
+    indexed_dirs = []
+
+    def _capture_index(_shar_dir, worker_dirs, **_kwargs):
+        indexed_dirs.extend(path.name for path in worker_dirs)
+
+    monkeypatch.setattr(prepare_runtime, "build_shar_index_for_worker_dirs", _capture_index)
+
+    import audio_tokenization.prepare.validate_shar as validate_shar
+
+    monkeypatch.setattr(validate_shar, "validate_shar_directory", lambda _path: {})
+
+    def worker(worker_id):
+        worker_dir = tmp_path / f"worker_{worker_id:02d}"
+        worker_dir.mkdir()
+        (worker_dir / SUCCESS_MARKER_FILE).write_text("ok\n")
+        return {
+            "worker_id": worker_id,
+            "written": 1,
+            "skipped": 0,
+            "errors": 0,
+            "elapsed": 1.0,
+            "total_duration_sec": 10.0,
+            "reused": False,
+            "worker_stats": {"runtime_counts": {}},
+        }
+
+    prepare_runtime.run_pool_and_finalize(
+        worker,
+        [0, 2],
+        tmp_path,
+        num_workers=3,
+        mp_start_method="fork",
+    )
+
+    assert indexed_dirs == ["worker_00", "worker_02"]

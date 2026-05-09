@@ -25,6 +25,19 @@ export PYTHONPATH="${LHOTSE_DIR}:${REPO_DIR}:${PYTHONPATH:-}"
 export PATH="${FFMPEG_ROOT}/bin:${PATH}"
 export LD_LIBRARY_PATH="${FFMPEG_ROOT}/lib:${LD_LIBRARY_PATH:-}"
 
+# Pin BLAS/OpenMP to single-threaded for the convert stage. The prepare
+# pipeline forks ~28+ workers per node; without this each forked worker
+# spawns up to $(nproc) BLAS threads, causing 28×288 ≈ 8000 OS threads to
+# thrash 288 cores. Probe 1985333 measured a 76× node-throughput regression
+# without this pinning. Tokenize stages do GPU work and are left untouched.
+if [ "${STAGE:-}" = "convert" ]; then
+  export OMP_NUM_THREADS=1
+  export MKL_NUM_THREADS=1
+  export OPENBLAS_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
+  export VECLIB_MAXIMUM_THREADS=1
+fi
+
 lhotse_runtime_install() {
   if [ "${INSTALL_TORCHCODEC}" = "1" ]; then
     uv pip install --python /opt/venv/bin/python --no-deps --force-reinstall "${TORCHCODEC_WHL}"

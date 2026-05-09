@@ -69,6 +69,17 @@ def test_cap_sampler_buckets_to_rank_local_cut_count():
     assert kwargs["num_buckets"] == 20
 
 
+def test_cap_sampler_uses_single_bucket_for_single_cut_rank():
+    kwargs = _build_sampler_kwargs(
+        _tokenize_spec(dataloader={"num_buckets": 20, "max_batch_duration": 100.0})
+    )
+
+    capped = _cap_sampler_buckets_to_cut_count(kwargs, cut_count=1, rank=1)
+
+    assert capped["duration_bins"] == []
+    assert kwargs["num_buckets"] == 20
+
+
 def test_cap_sampler_buckets_keeps_unknown_cut_count():
     kwargs = _build_sampler_kwargs(_tokenize_spec(dataloader={"num_buckets": 20}))
 

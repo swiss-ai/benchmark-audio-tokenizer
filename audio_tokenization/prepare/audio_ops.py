@@ -4,8 +4,38 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from contextlib import contextmanager
+import os
 
 from audio_tokenization.prepare.constants import MIN_RMS_DB
+
+
+@contextmanager
+def _suppress_stderr_fd():
+    """Temporarily silence C libraries that write directly to stderr fd 2."""
+    saved_fd = os.dup(2)
+    try:
+        with open(os.devnull, "wb") as devnull:
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+
+
+def load_audio_quietly(cut, *args, **kwargs):
+    """Load audio while suppressing noisy C decoder stderr output."""
+    with _suppress_stderr_fd():
+        return cut.load_audio(*args, **kwargs)
+
+
+def extract_audio_bytes(value):
+    """Accept HF audio structs and plain binary audio columns."""
+    if isinstance(value, dict):
+        return value.get("bytes")
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    return None
 
 
 def _ffmpeg_cli_to_wav(audio_bytes: bytes, recording_id: str) -> bytes:
@@ -42,14 +72,16 @@ def build_recording_from_audio_bytes(
         runtime_counts["recording_from_bytes"] += 1
 
     try:
-        return Recording.from_bytes(data=audio_bytes, recording_id=recording_id)
+        with _suppress_stderr_fd():
+            return Recording.from_bytes(data=audio_bytes, recording_id=recording_id)
     except (ValueError, RuntimeError, OSError):
         pass
 
     if runtime_counts is not None:
         runtime_counts["ffmpeg_cli_fallback"] += 1
     wav_bytes = _ffmpeg_cli_to_wav(audio_bytes, recording_id)
-    return Recording.from_bytes(data=wav_bytes, recording_id=recording_id)
+    with _suppress_stderr_fd():
+        return Recording.from_bytes(data=wav_bytes, recording_id=recording_id)
 
 
 def normalize_batch_peak(audios, target_db: float = -3.0):
@@ -62,7 +94,7 @@ def normalize_batch_peak(audios, target_db: float = -3.0):
 
 def rms_db(cut) -> float:
     """Compute RMS level in dB for a cut's audio."""
-    audio = cut.load_audio()
+    audio = load_audio_quietly(cut)
     return rms_db_from_audio(audio)
 
 
@@ -174,7 +206,7 @@ def apply_audio_pipeline(
         cut = tokenize_fn(cut)
 
     cut.custom = cut.custom or {}
-    audio = cut.load_audio()
+    audio = load_audio_quietly(cut)
     rms_val = rms_db_from_audio(audio)
     if should_skip_quiet(rms_val):
         runtime_counts["skipped_quiet_audio"] += 1
@@ -191,7 +223,7 @@ def to_mono(cut, mono_downmix=True, stats=None):
     if mono_downmix:
         try:
             result = cut.to_mono(mono_downmix=True)
-            result.load_audio()
+            load_audio_quietly(result)
             return result
         except Exception:
             if stats is not None:

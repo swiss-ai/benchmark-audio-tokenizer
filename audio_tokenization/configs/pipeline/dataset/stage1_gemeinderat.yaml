@@ -1,7 +1,6 @@
 defaults:
   - /recipe/wds_audio_only@_here_
   - /tokenizer/apertus_wavtok@_here_
-  - /profile/cscs@_here_
   - _self_
 
 # Stage-1 Gemeinderat audio-only rebuild.

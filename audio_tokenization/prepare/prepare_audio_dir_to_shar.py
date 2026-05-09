@@ -39,6 +39,7 @@ from audio_tokenization.prepare.runtime import (
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
+    maybe_log_worker_progress,
     run_pool_and_finalize,
     validate_prepare_runtime,
     write_prepare_state_for_spec,
@@ -70,27 +71,7 @@ def _convert_worker(args_tuple):
     Each worker writes to its own ``worker_XX/`` directory to avoid contention.
     Resume is considered complete only when ``worker_XX/_SUCCESS`` exists.
     """
-    if len(args_tuple) == 17:
-        (
-            worker_id,
-            jsonl_paths,
-            audio_index,
-            shar_dir,
-            target_sr,
-            shard_size,
-            shar_format,
-            min_sr,
-            mono_downmix,
-            vad_max_chunk_sec,
-            vad_min_chunk_sec,
-            vad_sample_rate,
-            vad_max_merge_gap_sec,
-            vad_max_duration_sec,
-            vad_min_rms_db,
-            audio_ext,
-            resampling_backend,
-        ) = args_tuple
-    elif len(args_tuple) == 16 and isinstance(args_tuple[2], dict):
+    if len(args_tuple) == 16 and isinstance(args_tuple[2], dict):
         (
             worker_id,
             jsonl_paths,
@@ -109,7 +90,6 @@ def _convert_worker(args_tuple):
             audio_ext,
             resampling_backend,
         ) = args_tuple
-        vad_min_rms_db = None
     else:
         (
             worker_id,
@@ -125,7 +105,6 @@ def _convert_worker(args_tuple):
             vad_sample_rate,
             vad_max_merge_gap_sec,
             vad_max_duration_sec,
-            vad_min_rms_db,
             audio_ext,
             resampling_backend,
         ) = args_tuple
@@ -151,6 +130,7 @@ def _convert_worker(args_tuple):
     worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
     t0 = time.time()
     written = skipped = errors = 0
+    next_log_at = 1000
     total_duration_sec = 0.0
     vad_cfg = VADChunkingConfig(
         max_chunk_sec=float(vad_max_chunk_sec),
@@ -160,11 +140,6 @@ def _convert_worker(args_tuple):
         max_duration_sec=(
             float(vad_max_duration_sec)
             if vad_max_duration_sec is not None
-            else None
-        ),
-        min_rms_db=(
-            float(vad_min_rms_db)
-            if vad_min_rms_db is not None
             else None
         ),
     )
@@ -223,8 +198,7 @@ def _convert_worker(args_tuple):
                     try:
                         out_cuts, reason = split_cut_by_vad(
                             cut=cut,
-                            sample_key=key,
-                            vad_lookup={key: timestamps},
+                            timestamps=timestamps,
                             cfg=vad_cfg,
                             runtime_counts=runtime_counts,
                         )
@@ -273,6 +247,15 @@ def _convert_worker(args_tuple):
                             written += 1
                             total_duration_sec += subcut.duration
                             runtime_counts["cuts_written"] += 1
+                            next_log_at = maybe_log_worker_progress(
+                                logger=logger,
+                                worker_id=worker_id,
+                                written=written,
+                                skipped=skipped,
+                                errors=errors,
+                                t0=t0,
+                                next_log_at=next_log_at,
+                            )
                         except Exception as e:
                             errors += 1
                             runtime_counts["processing_errors"] += 1
@@ -284,15 +267,6 @@ def _convert_worker(args_tuple):
                                     f"Worker {worker_id} error on chunk "
                                     f"{key}@{offset:.1f}: {e}"
                                 )
-
-                    if written % 1000 == 0 and written > 0:
-                        elapsed = time.time() - t0
-                        logger.info(
-                            f"Worker {worker_id}: {written} written, "
-                            f"{skipped} skipped, {errors} errors "
-                            f"({written / elapsed:.1f} samples/s)"
-                        )
-
     if reason_counts:
         logger.info(f"Worker {worker_id} VAD reasons: {dict(reason_counts)}")
 
@@ -355,9 +329,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vad-max-duration-sec", type=float, default=None,
                         help="Drop atomic speech segments longer than this "
                              "(default: same as --vad-max-chunk-sec)")
-    parser.add_argument("--vad-min-rms-db", type=float, default=None,
-                        help="Drop VAD spans below this RMS before merge/pack")
-
     # Parallelism
     parser.add_argument("--num-workers", type=int, default=None,
                         help="Number of parallel workers (default: one per JSONL file)")
@@ -437,7 +408,6 @@ def run(spec):
             i.vad_sample_rate,
             i.vad_max_merge_gap_sec,
             i.vad_max_duration_sec,
-            i.vad_min_rms_db,
             i.audio_ext,
             o.resampling_backend,
         )
@@ -474,7 +444,6 @@ def _args_to_spec(args):
             "vad_sample_rate": args.vad_sample_rate,
             "vad_max_merge_gap_sec": args.vad_max_merge_gap_sec,
             "vad_max_duration_sec": args.vad_max_duration_sec,
-            "vad_min_rms_db": args.vad_min_rms_db,
         },
         "output": {
             "shar_dir": str(args.shar_dir) if args.shar_dir else None,

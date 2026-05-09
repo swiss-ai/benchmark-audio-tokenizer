@@ -23,6 +23,7 @@ from audio_tokenization.prepare import (
 )
 from audio_tokenization.prepare.constants import (
     CURRENT_PREPARE_STATE_VERSION,
+    CURRENT_STAGE_STATE_VERSION,
     PREPARE_STATE_FILE,
 )
 from audio_tokenization.prepare.runtime import (
@@ -74,10 +75,10 @@ def _namespace_to_plain_dict(ns):
 
 
 def test_load_dataset_spec_infore2_and_aozora():
-    infore2 = load_dataset_spec(_load_dataset_cfg("infore2"))
+    infore2 = load_dataset_spec(_load_dataset_cfg("cooldown_infore2"))
     aozora = load_dataset_spec(_load_dataset_cfg("aozora_hurigana"))
 
-    assert infore2.name == "infore2"
+    assert infore2.name == "cooldown_infore2"
     assert infore2.convert.family == "parquet"
     assert infore2.convert.input.parquet_glob == "train-*.parquet"
     assert infore2.materialize.interleave.enabled is True
@@ -311,9 +312,9 @@ def test_prepare_state_rejects_stale_version(tmp_path):
 
 
 def test_validate_or_write_prepare_state_rejects_missing_invariant(tmp_path):
-    state_path = tmp_path / "_PREPARE_STATE.json"
+    state_path = tmp_path / "stage_state.json"
     stale_payload = {
-        "version": CURRENT_PREPARE_STATE_VERSION,
+        "version": CURRENT_STAGE_STATE_VERSION,
         "parquet_dir": "/tmp/data",
         "text_tokenizer": None,
     }
@@ -338,7 +339,7 @@ def test_prepare_state_rejects_unknown_future_version(tmp_path):
 
 
 def test_validate_or_write_prepare_state_first_run_writes_versioned(tmp_path):
-    state_path = tmp_path / "_PREPARE_STATE.json"
+    state_path = tmp_path / "stage_state.json"
     expected = {"parquet_dir": "/tmp/data", "text_tokenizer": None}
 
     wrote = validate_or_write_prepare_state(
@@ -350,12 +351,24 @@ def test_validate_or_write_prepare_state_first_run_writes_versioned(tmp_path):
     assert wrote is True
 
     payload = json.loads(state_path.read_text())
-    assert payload["version"] == CURRENT_PREPARE_STATE_VERSION
+    assert payload["version"] == CURRENT_STAGE_STATE_VERSION
+    assert CURRENT_STAGE_STATE_VERSION != CURRENT_PREPARE_STATE_VERSION
     assert payload["parquet_dir"] == "/tmp/data"
 
 
+def test_write_prepare_state_for_spec_uses_prepare_specific_version(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    spec = _minimal_parquet_spec(tmp_path)
+
+    _write_state_via_runtime_helper(spec)
+
+    payload = json.loads((out / PREPARE_STATE_FILE).read_text())
+    assert payload["version"] == CURRENT_PREPARE_STATE_VERSION
+
+
 def test_validate_or_write_prepare_state_detects_invariant_drift(tmp_path):
-    state_path = tmp_path / "_PREPARE_STATE.json"
+    state_path = tmp_path / "stage_state.json"
     validate_or_write_prepare_state(
         state_path,
         expected={"parquet_dir": "/tmp/data"},
@@ -1018,8 +1031,7 @@ def test_audio_dir_run_uses_shared_audio_index_with_fork(tmp_path, monkeypatch):
 
     assert captured["mp_start_method"] == "fork"
     assert len(captured["worker_args"]) == 1
-    assert len(captured["worker_args"][0]) == 16
-    assert captured["worker_args"][0][13] is None  # vad_min_rms_db default
+    assert len(captured["worker_args"][0]) == 15
     assert prepare_audio_dir_to_shar._AUDIO_INDEX is None
 
 
@@ -1059,7 +1071,6 @@ def test_lhotse_recipe_cli_args_round_trip_to_spec(tmp_path):
     assert spec.input.recipe == "librispeech"
     assert spec.input.split == "test-clean"
     assert spec.output.shar_dir == str(tmp_path / "out")
-
 
 
 def test_run_convert_dispatch_skips_when_disabled():

@@ -31,6 +31,7 @@ from pathlib import Path
 from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
+    extract_audio_bytes,
     write_cut_to_shar,
 )
 from audio_tokenization.prepare.cli import (
@@ -62,6 +63,7 @@ from audio_tokenization.prepare.runtime import (
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
+    maybe_log_worker_progress,
     run_pool_and_finalize,
     validate_prepare_runtime,
     write_prepare_state_for_spec,
@@ -132,6 +134,7 @@ def _convert_worker(args: ColumnarWorkerArgs):
     worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
     t0 = time.time()
     written = skipped = errors = 0
+    next_log_at = 1000
     total_duration_sec = 0.0
     runtime_counts = Counter()
     _tokenize_text = make_text_tokenize_fn(text_tokenizer, text_tokenize_custom_columns) if text_tokenizer is not None else None
@@ -169,8 +172,7 @@ def _convert_worker(args: ColumnarWorkerArgs):
                     fallback_id=fallback_id,
                 )
                 try:
-                    audio_struct = row[audio_column]
-                    audio_bytes = audio_struct.get("bytes") if isinstance(audio_struct, dict) else None
+                    audio_bytes = extract_audio_bytes(row[audio_column])
                     if not audio_bytes:
                         skipped += 1
                         runtime_counts["skipped_empty_audio"] += 1
@@ -245,13 +247,15 @@ def _convert_worker(args: ColumnarWorkerArgs):
                     )
                     written += 1
                     total_duration_sec += cut.duration
-
-                    if written % 1000 == 0:
-                        elapsed = time.time() - t0
-                        logger.info(
-                            f"Worker {worker_id}: {written} written, {skipped} skipped, "
-                            f"{errors} errors ({written / elapsed:.1f} samples/s)"
-                        )
+                    next_log_at = maybe_log_worker_progress(
+                        logger=logger,
+                        worker_id=worker_id,
+                        written=written,
+                        skipped=skipped,
+                        errors=errors,
+                        t0=t0,
+                        next_log_at=next_log_at,
+                    )
 
                 except Exception as e:
                     errors += 1

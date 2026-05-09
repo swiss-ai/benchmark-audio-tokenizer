@@ -88,6 +88,17 @@ def _cap_sampler_buckets_to_cut_count(
     if cut_count is None or cut_count <= 0:
         return sampler_kwargs
     num_buckets = int(sampler_kwargs["num_buckets"])
+    if cut_count < 2:
+        sampler_kwargs = dict(sampler_kwargs)
+        sampler_kwargs["num_buckets"] = 1
+        sampler_kwargs["duration_bins"] = []
+        logger.warning(
+            "[rank %s] Using single duration bucket because only %s cut(s) "
+            "are assigned to this rank.",
+            rank,
+            cut_count,
+        )
+        return sampler_kwargs
     if num_buckets <= cut_count:
         return sampler_kwargs
     sampler_kwargs = dict(sampler_kwargs)
@@ -101,6 +112,34 @@ def _cap_sampler_buckets_to_cut_count(
         cut_count,
     )
     return sampler_kwargs
+
+
+def _is_bucket_count_assertion(exc: AssertionError) -> bool:
+    message = str(exc)
+    return (
+        "The number of buckets" in message
+        or "num_buckets > 1" in message
+        or message == ""
+    )
+
+
+def _create_rank_sampler(cuts, sampler_kwargs: dict[str, Any], *, rank: int):
+    """Create one rank-level sampler, falling back to one bucket for tiny streams."""
+    try:
+        return DynamicBucketingSampler(cuts, **sampler_kwargs), sampler_kwargs
+    except AssertionError as exc:
+        if not _is_bucket_count_assertion(exc):
+            raise
+        fallback_kwargs = dict(sampler_kwargs)
+        fallback_kwargs["num_buckets"] = 1
+        fallback_kwargs["duration_bins"] = []
+        logger.warning(
+            "[rank %s] Dynamic bucket estimation failed for the rank-local "
+            "stream (%s); retrying with a single duration bucket.",
+            rank,
+            exc or "num_buckets invariant",
+        )
+        return DynamicBucketingSampler(cuts, **fallback_kwargs), fallback_kwargs
 
 
 def _flatten_wandb_config(prefix: str, payload: Any) -> dict[str, Any]:
@@ -154,22 +193,7 @@ def _build_wandb_config(
             "sampler": dict(sampler_kwargs),
         },
     }
-    config = _flatten_wandb_config("", resolved)
-    # Preserve legacy top-level keys used by older W&B dashboards.
-    config.update(
-        {
-            "max_batch_duration": sampler_kwargs["max_duration"],
-            "min_duration": spec.filter.min_duration,
-            "max_duration": spec.filter.max_duration,
-            "num_buckets": sampler_kwargs["num_buckets"],
-            "buffer_size": sampler_kwargs["buffer_size"],
-            "target_sample_rate": spec.tokenizer.sampling_rate,
-            "mode": spec.mode,
-            "audio_text_format": spec.audio_text_format,
-            "audio_text_task": spec.audio_text_task,
-        }
-    )
-    return config
+    return _flatten_wandb_config("", resolved)
 
 
 def _build_wandb_tags(
@@ -191,47 +215,6 @@ def _build_wandb_tags(
         if tag not in tags:
             tags.append(tag)
     return tags
-
-
-class _WorkUnitBatchSampler:
-    """Yield dynamic batches independently per SHAR work unit.
-
-    Lhotse SHAR is a streaming format: skipping globally planned batches would
-    still read skipped audio bytes from tar streams. Keeping bucketing scoped to
-    one work unit preserves sequential I/O locality and makes batch padding for
-    each cut independent of the number of launched ranks.
-    """
-
-    def __init__(
-        self,
-        work_units: list[tuple[str, Any, int | None]],
-        *,
-        sampler_kwargs: dict[str, Any],
-        rank: int,
-    ) -> None:
-        self.work_units = work_units
-        self.sampler_kwargs = sampler_kwargs
-        self.rank = rank
-        self._completed_work_units = 0
-
-    def __iter__(self):
-        self._completed_work_units = 0
-        for work_unit_id, cuts, cut_count in self.work_units:
-            kwargs = _cap_sampler_buckets_to_cut_count(
-                dict(self.sampler_kwargs),
-                cut_count=cut_count,
-                rank=self.rank,
-            )
-            logger.info(
-                "[rank %s] Sampling work unit %s with %s estimated cuts",
-                self.rank,
-                work_unit_id,
-                cut_count,
-            )
-            sampler = DynamicBucketingSampler(cuts, **kwargs)
-            for batch in sampler:
-                yield batch
-            self._completed_work_units += 1
 
 
 def _format_writer_state(writer_state: Any) -> str:
@@ -267,7 +250,6 @@ def tokenize_loop(
     dataset_name: str,
     input_shar_dirs: Sequence[str],
     planned_shar_fields: dict[str, list[str]],
-    planned_work_units: list[dict[str, Any]] | None = None,
     rank: int,
     world_size: int,
     local_rank: int,
@@ -280,10 +262,9 @@ def tokenize_loop(
     Steps:
         1. Load prepared Shar CutSet -- see ``data.py``
         2. Create ``DynamicBucketingSampler`` with global bucketing
-        3. Optionally resume from checkpoint
-        4. Wrap in dataset + ``DataLoader`` for CPU/GPU overlap
-        5. Loop over prefetched batches, tokenize on GPU, write output
-        6. Periodically checkpoint (sampler state + chunk boundary)
+        3. Wrap in dataset + ``DataLoader`` for CPU/GPU overlap
+        4. Loop over prefetched batches, tokenize on GPU, write output
+        5. Periodically rotate committed output chunks
     """
     output_dir = str(final_output_dir)
     final_output_dir.mkdir(parents=True, exist_ok=True)
@@ -301,40 +282,15 @@ def tokenize_loop(
     # ------------------------------------------------------------------
     # 1. Build CutSet (prepared Shar load + filters/resample safety-net)
     # ------------------------------------------------------------------
-    if planned_work_units:
-        work_unit_cutsets = []
-        for work_unit in planned_work_units:
-            cuts = build_cutset(
-                spec,
-                input_shar_dirs=input_shar_dirs,
-                planned_shar_fields=work_unit["fields"],
-                rank=rank,
-                world_size=1,
-                stats=cumulative_stats,
-            )
-            work_unit_cutsets.append(
-                (
-                    str(work_unit["work_unit_id"]),
-                    cuts,
-                    int(work_unit["cut_count"]),
-                )
-            )
-        cut_count = (
-            assigned_cut_count
-            if assigned_cut_count is not None
-            else sum(count for _wid, _cuts, count in work_unit_cutsets)
-        )
-    else:
-        cuts = build_cutset(
-            spec,
-            input_shar_dirs=input_shar_dirs,
-            planned_shar_fields=planned_shar_fields,
-            rank=rank,
-            world_size=world_size,
-            stats=cumulative_stats,
-        )
-        work_unit_cutsets = None
-        cut_count = assigned_cut_count if assigned_cut_count is not None else _cutset_len(cuts)
+    cuts = build_cutset(
+        spec,
+        input_shar_dirs=input_shar_dirs,
+        planned_shar_fields=planned_shar_fields,
+        rank=rank,
+        world_size=world_size,
+        stats=cumulative_stats,
+    )
+    cut_count = assigned_cut_count if assigned_cut_count is not None else _cutset_len(cuts)
     if cut_count == 0:
         logger.warning(
             "[rank %s/%s] no cuts assigned after shard-level distribution; "
@@ -358,25 +314,17 @@ def tokenize_loop(
         return result
 
     # ------------------------------------------------------------------
-    # 2. Dynamic bucketing sampler -- each rank's CutSet is already split
-    #    at the shard level (see data.py), so the sampler uses
-    #    world_size=1 to avoid the O(world_size) strided distribution.
+    # 2. Dynamic bucketing sampler -- assignment is per work unit, but sampling
+    #    is rank-level. Keeping those axes separate avoids tiny tail/filter-heavy
+    #    work units violating Lhotse's bucket-count invariants.
     # ------------------------------------------------------------------
     sampler_kwargs = _build_sampler_kwargs(spec)
-    if work_unit_cutsets is None:
-        sampler_kwargs = _cap_sampler_buckets_to_cut_count(
-            sampler_kwargs,
-            cut_count=cut_count,
-            rank=rank,
-        )
-    if work_unit_cutsets is not None:
-        sampler = _WorkUnitBatchSampler(
-            work_unit_cutsets,
-            sampler_kwargs=sampler_kwargs,
-            rank=rank,
-        )
-    else:
-        sampler = DynamicBucketingSampler(cuts, **sampler_kwargs)
+    sampler_kwargs = _cap_sampler_buckets_to_cut_count(
+        sampler_kwargs,
+        cut_count=cut_count,
+        rank=rank,
+    )
+    sampler, sampler_kwargs = _create_rank_sampler(cuts, sampler_kwargs, rank=rank)
 
     # ------------------------------------------------------------------
     # 3. DataLoader with prefetching -- worker subprocesses decode audio
@@ -668,9 +616,7 @@ def tokenize_loop(
             f"{summary['text_tokens']:,} text tokens across {summary['num_ranks']} ranks"
         )
 
-    # Re-raise after saving progress so the exit code signals failure.
-    # This MUST come after all cleanup (checkpoint, metadata, wandb) so
-    # partial work is never silently lost.
+    # Re-raise after terminal cleanup so the exit code signals failure.
     if _loop_error is not None:
         raise RuntimeError(
             f"[rank {rank}] Tokenization loop failed after processing "
@@ -691,7 +637,6 @@ def run_lhotse_pipeline(
     dataset_name: str,
     input_shar_dirs: Sequence[str],
     planned_shar_fields: dict[str, list[str]],
-    planned_work_units: list[dict[str, Any]] | None = None,
     rank: int,
     world_size: int,
     local_rank: int,
@@ -702,7 +647,7 @@ def run_lhotse_pipeline(
 
     Expects pre-built Shar data (via ``prepare_hf_to_shar`` or
     ``prepare_wds_to_shar``).  Loads the Shar CutSet, tokenizes on GPU,
-    and writes micro-shards with DDP checkpointing.
+    and writes rank-local micro-shards.
     """
     if planned_shar_fields is None:
         raise RuntimeError(
@@ -737,7 +682,6 @@ def run_lhotse_pipeline(
         dataset_name=dataset_name,
         input_shar_dirs=input_shar_dirs,
         planned_shar_fields=planned_shar_fields,
-        planned_work_units=planned_work_units,
         rank=rank,
         world_size=world_size,
         local_rank=local_rank,

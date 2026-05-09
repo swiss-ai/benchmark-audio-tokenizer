@@ -2,10 +2,12 @@ import sys
 import types
 from collections import Counter
 import gzip
+import os
 
 import numpy as np
 import pytest
 
+import audio_tokenization.prepare.audio_ops as audio_ops
 from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
@@ -71,6 +73,67 @@ def test_build_recording_from_audio_bytes_stringifies_recording_id(monkeypatch):
     assert recording == "recording"
     assert calls == {"data": b"audio-bytes", "recording_id": "123"}
     assert stats["recording_from_bytes"] == 1
+
+
+def test_build_recording_from_audio_bytes_suppresses_primary_decoder_stderr(
+    monkeypatch,
+    capfd,
+):
+    fake_lhotse = types.ModuleType("lhotse")
+
+    class _Recording:
+        @staticmethod
+        def from_bytes(*, data, recording_id):
+            os.write(2, b"noisy C decoder warning\n")
+            return "recording"
+
+    fake_lhotse.Recording = _Recording
+    monkeypatch.setitem(sys.modules, "lhotse", fake_lhotse)
+
+    recording = build_recording_from_audio_bytes(b"mp3", "clip-1")
+
+    assert recording == "recording"
+    assert capfd.readouterr().err == ""
+
+
+def test_build_recording_from_audio_bytes_uses_ffmpeg_fallback_after_primary_failure(
+    monkeypatch,
+):
+    calls = []
+    fake_lhotse = types.ModuleType("lhotse")
+
+    class _Recording:
+        @staticmethod
+        def from_bytes(*, data, recording_id):
+            calls.append((data, recording_id))
+            if data == b"broken-mp3":
+                raise RuntimeError("primary decoder failed")
+            return "recording-from-wav"
+
+    fake_lhotse.Recording = _Recording
+    monkeypatch.setitem(sys.modules, "lhotse", fake_lhotse)
+    monkeypatch.setattr(
+        audio_ops,
+        "_ffmpeg_cli_to_wav",
+        lambda audio_bytes, recording_id: b"wav-bytes",
+    )
+
+    stats = Counter()
+    recording = build_recording_from_audio_bytes(
+        b"broken-mp3",
+        "clip-1",
+        runtime_counts=stats,
+    )
+
+    assert recording == "recording-from-wav"
+    assert calls == [
+        (b"broken-mp3", "clip-1"),
+        (b"wav-bytes", "clip-1"),
+    ]
+    assert stats["recording_from_bytes"] == 1
+    assert stats["ffmpeg_cli_fallback"] == 1
+
+
 def test_resolve_input_source_and_clip_num_defaults_to_raw_id_and_chunk_idx():
     assert resolve_input_source_and_clip_num("clip-1", chunk_idx=3) == (
         "clip-1",
@@ -152,6 +215,29 @@ def test_apply_audio_pipeline_can_return_decoded_audio_for_shar_write():
     assert cut.custom["rms_db"] == pytest.approx(-20.0)
 
 
+def test_apply_audio_pipeline_suppresses_decoder_stderr(capfd):
+    audio = np.full((1, 16000), 0.1, dtype=np.float32)
+
+    class Cut:
+        sampling_rate = 16000
+        num_channels = 1
+        custom = None
+
+        def load_audio(self):
+            os.write(2, b"noisy C decoder warning\n")
+            return audio
+
+    cut, skip, decoded_audio = apply_audio_pipeline(
+        Cut(),
+        target_sr=None,
+        runtime_counts=Counter(),
+    )
+
+    assert skip is False
+    assert decoded_audio is audio
+    assert capfd.readouterr().err == ""
+
+
 def test_load_external_metadata_reads_jsonl_gz(tmp_path):
     path = tmp_path / "meta.jsonl.gz"
     with gzip.open(path, "wb") as f:
@@ -192,6 +278,61 @@ def test_load_external_metadata_reads_headered_tsv(tmp_path):
     assert metadata == {
         "utt-1": ("halló", {"speaker_id": "spk-a", "duration": "1.2"}),
         "utt-2": ("bless", {"speaker_id": "spk-b", "duration": "2.3"}),
+    }
+
+
+def test_load_external_metadata_reads_headered_tsv_without_text_column(tmp_path):
+    path = tmp_path / "meta.tsv"
+    path.write_text(
+        "id\tartist_id\talbum_id\tgenres\n"
+        "1142857\t429523\t137046\t['game']\n",
+        encoding="utf-8",
+    )
+
+    metadata = load_external_metadata(
+        str(path),
+        ("artist_id", "album_id", "genres"),
+        id_field="id",
+        text_field="__unused_text__",
+    )
+
+    assert metadata == {
+        "1142857": (
+            None,
+            {
+                "artist_id": "429523",
+                "album_id": "137046",
+                "genres": "['game']",
+            },
+        ),
+    }
+
+
+def test_load_external_metadata_reads_parquet_without_text_column(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    path = tmp_path / "meta.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": ["clip-1", "clip-2"],
+                "audio_url": ["https://cdn.example/clip-1.mp3", None],
+                "unused": ["x", "y"],
+            }
+        ),
+        path,
+    )
+
+    metadata = load_external_metadata(
+        str(path),
+        ("audio_url",),
+        id_field="id",
+        text_field="__unused_text__",
+    )
+
+    assert metadata == {
+        "clip-1": (None, {"audio_url": "https://cdn.example/clip-1.mp3"}),
+        "clip-2": (None, {}),
     }
 
 

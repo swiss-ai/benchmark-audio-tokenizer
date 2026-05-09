@@ -653,6 +653,65 @@ def test_run_tokenize_distributed_rank0_owns_cleanup_and_success(tmp_path, monke
     assert (final_dir / "_SUCCESS").is_file()
 
 
+def test_run_tokenize_resume_restarts_incomplete_output_after_state_validation(
+    tmp_path, monkeypatch
+):
+    from audio_tokenization.prepare.runtime import (
+        mark_partition_success,
+        validate_or_write_prepare_state,
+    )
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
+    from audio_tokenization.stages._provenance import build_tokenize_resume_fingerprint
+    from audio_tokenization.stages.tokenize import (
+        TOKENIZE_START_FILE,
+        TOKENIZE_STATE_FILE,
+        run_tokenize,
+    )
+
+    shar_dir = tmp_path / "shar"
+    _write_cut_shar_index(shar_dir, durations=(10.0, 11.0))
+    mark_partition_success(shar_dir)
+
+    output_dir = tmp_path / "out"
+    spec = load_dataset_spec(_tokenize_spec_payload(str(shar_dir), str(output_dir)))
+    final_dir = output_dir / build_tokenize_output_subdir(
+        spec.tokenize,
+        dataset_name=spec.name,
+    )
+    final_dir.mkdir(parents=True)
+    partial_chunk = final_dir / "rank_0000_chunk_0000.bin"
+    partial_chunk.write_bytes(b"partial")
+    stale_stats = final_dir / "rank_0000_stats.json"
+    stale_stats.write_text(json.dumps({"rank": 0, "success": False}) + "\n")
+    (final_dir / "stats_summary.json").write_text("{}\n")
+    (final_dir / TOKENIZE_START_FILE).write_text("{}\n")
+
+    fingerprint = build_tokenize_resume_fingerprint(
+        spec,
+        input_shar_dirs=[str(shar_dir)],
+    )
+    validate_or_write_prepare_state(
+        final_dir / TOKENIZE_STATE_FILE,
+        expected=fingerprint,
+        invariant_keys=tuple(fingerprint.keys()),
+        guidance="test",
+    )
+
+    def fake_run(_spec, **kwargs):
+        assert not partial_chunk.exists()
+        assert not stale_stats.exists()
+        assert not (final_dir / "stats_summary.json").exists()
+        assert not (final_dir / TOKENIZE_START_FILE).exists()
+        return {"rank": 0, "success": True, "output_dir": str(kwargs["final_output_dir"])}
+
+    monkeypatch.setattr("audio_tokenization.stages.tokenize._invoke_pipeline", fake_run)
+
+    result = run_tokenize(spec, resume=True)
+
+    assert result["skipped"] is False
+    assert not partial_chunk.exists()
+
+
 def test_run_tokenize_distributed_nonzero_rank_does_not_cleanup(tmp_path, monkeypatch):
     from audio_tokenization.prepare.runtime import mark_partition_success
     from audio_tokenization.output_layout import build_tokenize_output_subdir
@@ -961,6 +1020,8 @@ def test_run_tokenize_rejects_resume_when_upstream_prepare_state_changes(tmp_pat
         expected=spec_old.convert.fingerprint_payload(),
         invariant_keys=tuple(spec_old.convert.fingerprint_payload().keys()),
         guidance="test",
+        state_version=CURRENT_PREPARE_STATE_VERSION,
+        state_label="prepare state",
     )
 
     subdir = build_tokenize_output_subdir(spec_old.tokenize, dataset_name=spec_old.name)
@@ -1111,7 +1172,9 @@ def test_run_tokenize_derives_output_name_from_dataset_name(tmp_path, monkeypatc
     assert captured["kwargs"]["dataset_name"] == "infore2"
 
 
-def test_run_tokenize_clears_partial_output_dir_before_rerun(tmp_path, monkeypatch):
+def test_run_tokenize_resume_false_clears_partial_output_dir_before_rerun(
+    tmp_path, monkeypatch
+):
     from audio_tokenization.prepare.runtime import (
         mark_partition_success,
         validate_or_write_prepare_state,
@@ -1151,7 +1214,7 @@ def test_run_tokenize_clears_partial_output_dir_before_rerun(tmp_path, monkeypat
         "audio_tokenization.stages.tokenize._invoke_pipeline", fake_run
     )
 
-    result = run_tokenize(spec, resume=True)
+    result = run_tokenize(spec, resume=False)
     assert result["skipped"] is False
 
 
@@ -1227,9 +1290,13 @@ def test_run_stages_all_end_to_end_control_plane(tmp_path, monkeypatch):
         "audio_tokenization.stages.convert.importlib.import_module",
         lambda _name: type("FakePrepareModule", (), {"run": staticmethod(fake_convert)}),
     )
+    def fake_tokenize(_spec, **kwargs):
+        mark_partition_success(kwargs["final_output_dir"])
+        return {"tokenized": True, "output_dir": str(kwargs["final_output_dir"])}
+
     monkeypatch.setattr(
         "audio_tokenization.stages.tokenize._invoke_pipeline",
-        lambda _spec, **kwargs: {"tokenized": True, "output_dir": str(kwargs["final_output_dir"])},
+        fake_tokenize,
     )
     monkeypatch.setattr(
         "audio_tokenization.stages.materialize._invoke_shift_by_one",
@@ -1681,7 +1748,7 @@ def test_run_materialize_explicit_missing_cache_dir_does_not_delete_existing_out
 def test_run_materialize_interleave_rejects_resume_when_upstream_tokenize_state_changes(
     tmp_path, monkeypatch
 ):
-    from audio_tokenization.prepare.constants import CURRENT_PREPARE_STATE_VERSION
+    from audio_tokenization.prepare.constants import CURRENT_STAGE_STATE_VERSION
     from audio_tokenization.prepare.runtime import (
         mark_partition_success,
         validate_or_write_prepare_state,
@@ -1732,7 +1799,7 @@ def test_run_materialize_interleave_rejects_resume_when_upstream_tokenize_state_
     (cache_dir / TOKENIZE_STATE_FILE).write_text(
         json.dumps(
             {
-                "version": CURRENT_PREPARE_STATE_VERSION,
+                "version": CURRENT_STAGE_STATE_VERSION,
                 **spec_new.tokenize.fingerprint_payload(),
             },
             indent=2,

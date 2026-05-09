@@ -1,15 +1,13 @@
 defaults:
   - /recipe/parquet_audio_text_interleaved@_here_
   - /tokenizer/apertus_wavtok@_here_
-  - /profile/cscs@_here_
   - _self_
 
 # SRG Apertus — Swiss German news/radio (i4ds dataset).
 # 1361 parquet shards, ~553k chunks, ~3552 hours, language=gsw.
-# Convert into the staging tree first; move verified outputs into
-# internal-only as a separate operator step.
+# Restricted-distribution dataset; outputs land under SHAR/internal-only/.
 
-name: srg_apertus
+name: internal_srg_apertus
 language: gsw
 
 source:
@@ -27,10 +25,10 @@ timeline:
   parser: trailing_number
 
 outputs:
-  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/srg_apertus
-  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/internal-only/srg_apertus
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/internal-only
   name: srg_apertus
-  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/srg_apertus_interleaved
+  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/internal-only/srg_apertus_interleaved
 
 materialization:
   transcribe_ratio: 0.5

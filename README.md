@@ -21,6 +21,14 @@ The benchmarking framework focuses on two main objectives:
 - `uv` package manager (recommended, for creating virtual environments)
 - PyTorch NGC 24.11 environment (recommended)
 
+## Production Conversion Defaults
+
+Use `conversion.resampling_backend: soxr` for large SHAR conversion runs. `soxr`
+is a dedicated CPU resampler with high-quality output, predictable performance,
+and less container/ABI coupling than torchaudio. Decode can still dominate
+runtime on compressed audio, so the end-to-end speedup is dataset-dependent, but
+`soxr` is the preferred production default for resampling.
+
 ## Installation
 
 ### 1. Clone the Repository

@@ -93,7 +93,6 @@ class AudioOnlyHandler:
             self._idx,
             self._cut_ids,
         )
-        done = self._chunk_id
         self._chunk_id += 1
         self.chunk_samples = 0
         self.chunks_written += 1
@@ -108,7 +107,7 @@ class AudioOnlyHandler:
             self._cut_ids_path,
         ) = \
             open_chunk_writer(self._output_dir, self._rank, self._chunk_id, self._vocab_size)
-        return done
+        return self._chunk_id
 
     def get_writer_state(self) -> int:
         return self._chunk_id
@@ -124,6 +123,7 @@ class AudioOnlyHandler:
                 self._cut_ids,
             )
             self.chunks_written += 1
+            self._chunk_id += 1
         else:
             self._cut_ids.abort()
             for p in (self._tmp_bin, self._tmp_idx):

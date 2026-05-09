@@ -1,7 +1,6 @@
 defaults:
   - /recipe/parquet_audio_text_interleaved@_here_
   - /tokenizer/apertus_wavtok@_here_
-  - /profile/cscs@_here_
   - _self_
 
 name: aozora_hurigana
@@ -23,7 +22,12 @@ timeline:
   clip_num: clip_num
 
 outputs:
-  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/aozora_hurigana_train
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/aozora_hurigana
   tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
   name: aozora_hurigana
   interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/aozora_hurigana_interleaved
+
+materialization:
+  # 8 k tokens per sequence — cooldown-wide standard for interleave.
+  max_seq_len: 8192
+  transcribe_ratio: 0.5

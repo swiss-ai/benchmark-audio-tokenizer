@@ -21,7 +21,6 @@ from audio_tokenization.stages._provenance import (
 )
 from audio_tokenization.stages._resume import (
     prepare_output_for_work,
-    run_with_resume,
     try_skip_if_complete,
 )
 
@@ -162,28 +161,32 @@ def _execute_tokenize_plan(
             resume=resume,
         )
 
-    return run_with_resume(
+    guidance = (
+        "Tokenize output at this path was produced under different spec "
+        "values. Either re-issue the matching config to resume, or remove "
+        f"{final_output_dir} and restart from scratch."
+    )
+    skipped = prepare_output_for_work(
         output_dir=final_output_dir,
         state_filename=TOKENIZE_STATE_FILE,
         fingerprint=fingerprint,
-        guidance=(
-            "Tokenize output at this path was produced under different spec "
-            "values. Either re-issue the matching config to resume, or remove "
-            f"{final_output_dir} and restart from scratch."
-        ),
+        guidance=guidance,
         stage_label="tokenize",
         resume=resume,
-        work=lambda: _invoke_pipeline_for_rank(
-            spec,
-            dataset_name=dataset_name,
-            input_shar_dirs=input_shar_dirs,
-            final_output_dir=final_output_dir,
-            rank=0,
-            world_size=1,
-            local_rank=local_rank,
-        ),
         logger=logger,
     )
+    if skipped is not None:
+        return skipped
+    result = _invoke_pipeline_for_rank(
+        spec,
+        dataset_name=dataset_name,
+        input_shar_dirs=input_shar_dirs,
+        final_output_dir=final_output_dir,
+        rank=0,
+        world_size=1,
+        local_rank=local_rank,
+    )
+    return {**result, "skipped": False, "output_dir": str(final_output_dir)}
 
 
 def _execute_tokenize_plan_distributed(
@@ -373,16 +376,11 @@ def _invoke_pipeline_for_assignment(
             world_size=world_size,
         )
 
-    planned_work_units = _work_units_for_assignment(
-        final_output_dir,
-        work_unit_ids=rank_assignment.work_unit_ids,
-    )
     return _invoke_pipeline(
         spec,
         dataset_name=dataset_name,
         input_shar_dirs=input_shar_dirs,
         planned_shar_fields=rank_assignment.fields,
-        planned_work_units=planned_work_units,
         rank=rank_assignment.rank,
         world_size=world_size,
         local_rank=local_rank,
@@ -398,44 +396,6 @@ def _read_tokenize_assignment(final_output_dir: Path):
     )
 
     return read_tokenize_assignment(final_output_dir / TOKENIZE_ASSIGNMENT_FILE)
-
-
-def _work_units_for_assignment(
-    final_output_dir: Path,
-    *,
-    work_unit_ids: list[str],
-) -> list[dict[str, Any]]:
-    """Return per-work-unit SHAR fields for shard-scoped batching.
-
-    The rank assignment owns which work units a rank processes. The tokenizer
-    core still needs the unit boundaries so dynamic bucketing never mixes cuts
-    from different SHAR shards; otherwise a cut's padded batch can change with
-    world size and produce different codec tokens.
-    """
-
-    from audio_tokenization.pipelines.lhotse.planning import (
-        SHAR_WORK_MANIFEST_FILE,
-        read_shar_work_manifest,
-    )
-
-    manifest = read_shar_work_manifest(final_output_dir / SHAR_WORK_MANIFEST_FILE)
-    by_id = {unit.work_unit_id: unit for unit in manifest.work_units}
-    planned = []
-    for work_unit_id in work_unit_ids:
-        unit = by_id.get(work_unit_id)
-        if unit is None:
-            raise RuntimeError(
-                f"Tokenize assignment references unknown work unit {work_unit_id!r}"
-            )
-        planned.append(
-            {
-                "work_unit_id": unit.work_unit_id,
-                "fields": unit.fields,
-                "cut_count": unit.cut_count,
-                "duration_sec": unit.duration_sec,
-            }
-        )
-    return planned
 
 
 def _write_inactive_rank_stats(
@@ -649,7 +609,6 @@ def _invoke_pipeline(
     dataset_name: str,
     input_shar_dirs: list[str],
     planned_shar_fields: dict[str, list[str]],
-    planned_work_units: list[dict[str, Any]] | None = None,
     rank: int,
     world_size: int,
     local_rank: int,
@@ -663,7 +622,6 @@ def _invoke_pipeline(
         dataset_name=dataset_name,
         input_shar_dirs=input_shar_dirs,
         planned_shar_fields=planned_shar_fields,
-        planned_work_units=planned_work_units,
         rank=rank,
         world_size=world_size,
         local_rank=local_rank,

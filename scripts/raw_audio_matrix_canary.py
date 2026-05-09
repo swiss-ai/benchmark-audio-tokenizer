@@ -230,7 +230,7 @@ def _rchiera_overrides(shar_dir: Path, tokenized_dir: Path, output_name: str, me
 def _spc_overrides(shar_dir: Path, tokenized_dir: Path, output_name: str, *, mode: str) -> list[str]:
     materialize_enabled = "true" if mode == "audio_text_interleaved" else "false"
     return [
-        "dataset=ccpodcasts",
+        "dataset=cooldown_ccpodcasts",
         f"dataset.name=canary_spc_parquet_{mode}",
         f"dataset.recipe.mode={mode}",
         f"dataset.recipe.materialize_interleave={materialize_enabled}",
@@ -483,7 +483,7 @@ def main() -> None:
         ),
         TokenizeCase(
             name="spc_parquet_direct",
-            dataset="ccpodcasts",
+            dataset="cooldown_ccpodcasts",
             output_name="spc_parquet_direct",
             output_kind="megatron",
             shar_dir=spc_shar,
@@ -491,7 +491,7 @@ def main() -> None:
         ),
         TokenizeCase(
             name="spc_parquet_interleave",
-            dataset="ccpodcasts",
+            dataset="cooldown_ccpodcasts",
             output_name="spc_parquet_interleave",
             output_kind="interleave",
             shar_dir=spc_shar,

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -19,6 +20,7 @@ from audio_tokenization.prepare.constants import (
     SUCCESS_MARKER_FILE,
     WORKER_ASSIGNMENT_FILE,
     WORKER_STATS_FILE,
+    state_version_for_filename,
 )
 from audio_tokenization.utils.io import atomic_streaming_write, atomic_write_json
 from audio_tokenization.utils.stats import load_json_records, max_field, sum_counter_fields
@@ -28,9 +30,9 @@ logger = logging.getLogger(__name__)
 
 
 class PrepareStateLegacyError(RuntimeError):
-    """Raised by ``read_prepare_state`` for legacy prepare-state files.
+    """Raised by ``read_prepare_state`` for legacy state files.
 
-    Distinguishes the two legitimate "this SHAR predates the typed prepare-state
+    Distinguishes the two legitimate "this output predates the typed state
     contract" cases (no ``version`` field, or a ``version`` older than this code
     knows) from genuine bugs (future-version downgrade, malformed payload,
     non-int version). Provenance readers in ``stages/_provenance.py`` opt into
@@ -40,6 +42,48 @@ class PrepareStateLegacyError(RuntimeError):
 
 
 _PREPARE_TOTAL_FIELDS = ("written", "skipped", "errors", "total_duration_sec")
+
+
+def _state_version_for_path(state_path: Path) -> int:
+    return state_version_for_filename(state_path.name)
+
+
+def _state_label_for_path(state_path: Path) -> str:
+    return "prepare state" if state_path.name == PREPARE_STATE_FILE else "stage state"
+
+
+def maybe_log_worker_progress(
+    *,
+    logger,
+    worker_id: int,
+    written: int,
+    skipped: int,
+    errors: int,
+    t0: float,
+    next_log_at: int,
+    interval: int = 1000,
+) -> int:
+    """Log worker progress after crossing a write-count threshold.
+
+    VAD conversion is one-to-many: one input recording can emit many output
+    cuts. Exact modulo checks miss progress when ``written`` jumps past a
+    threshold, so callers carry the next threshold explicitly.
+    """
+    if interval <= 0:
+        raise ValueError("interval must be > 0")
+    if written < next_log_at:
+        return next_log_at
+
+    elapsed = max(time.time() - t0, 1e-9)
+    logger.info(
+        "Worker %s: %d written, %d skipped, %d errors (%.1f samples/s)",
+        worker_id,
+        written,
+        skipped,
+        errors,
+        written / elapsed,
+    )
+    return ((written // interval) + 1) * interval
 
 
 def validate_prepare_runtime(
@@ -98,8 +142,13 @@ def mark_partition_success(
         f.write("ok\n")
 
 
-def read_prepare_state(state_path: Path) -> dict:
-    """Read a current-version prepare state file.
+def read_prepare_state(
+    state_path: Path,
+    *,
+    expected_version: int | None = None,
+    state_label: str | None = None,
+) -> dict:
+    """Read a current-version state file.
 
     Raises:
         FileNotFoundError: if ``state_path`` does not exist.
@@ -108,6 +157,10 @@ def read_prepare_state(state_path: Path) -> dict:
     """
     if not state_path.is_file():
         raise FileNotFoundError(state_path)
+    if expected_version is None:
+        expected_version = _state_version_for_path(state_path)
+    if state_label is None:
+        state_label = _state_label_for_path(state_path)
 
     payload = json.loads(state_path.read_text())
     if not isinstance(payload, dict):
@@ -115,8 +168,8 @@ def read_prepare_state(state_path: Path) -> dict:
 
     if "version" not in payload:
         raise PrepareStateLegacyError(
-            f"Prepare state at {state_path} has no version. Delete the output "
-            "directory and reconvert from raw inputs."
+            f"{state_label} at {state_path} has no version. Delete the output "
+            "directory and rerun the stage."
         )
 
     version = payload["version"]
@@ -126,19 +179,19 @@ def read_prepare_state(state_path: Path) -> dict:
             f"got {type(version).__name__}"
         )
 
-    if version > CURRENT_PREPARE_STATE_VERSION:
+    if version > expected_version:
         raise RuntimeError(
-            f"Prepare state at {state_path} is version {version}, but this code "
-            f"only knows how to read up to version {CURRENT_PREPARE_STATE_VERSION}. "
+            f"{state_label} at {state_path} is version {version}, but this code "
+            f"only knows how to read up to version {expected_version}. "
             "Upgrade audio_tokenization to a newer release, or delete the state "
-            "file to start a fresh prepare run."
+            "file to start a fresh run."
         )
 
-    if version < CURRENT_PREPARE_STATE_VERSION:
+    if version < expected_version:
         raise PrepareStateLegacyError(
-            f"Prepare state at {state_path} is stale version {version}; "
-            f"expected {CURRENT_PREPARE_STATE_VERSION}. Delete the output "
-            "directory and reconvert from raw inputs."
+            f"{state_label} at {state_path} is stale version {version}; "
+            f"expected {expected_version}. Delete the output "
+            "directory and rerun the stage."
         )
 
     return payload
@@ -168,10 +221,20 @@ def validate_or_write_prepare_state(
     expected: Mapping[str, object],
     invariant_keys: Sequence[str],
     guidance: str,
+    state_version: int | None = None,
+    state_label: str | None = None,
 ) -> bool:
     """Persist first-run state or assert resume invariants on later runs."""
+    if state_version is None:
+        state_version = _state_version_for_path(state_path)
+    if state_label is None:
+        state_label = _state_label_for_path(state_path)
     if state_path.is_file():
-        payload = read_prepare_state(state_path)
+        payload = read_prepare_state(
+            state_path,
+            expected_version=state_version,
+            state_label=state_label,
+        )
 
         for key in invariant_keys:
             if key not in payload:
@@ -197,7 +260,7 @@ def validate_or_write_prepare_state(
                 )
         return False
 
-    versioned = {"version": CURRENT_PREPARE_STATE_VERSION, **dict(expected)}
+    versioned = {"version": state_version, **dict(expected)}
     atomic_write_json(state_path, versioned)
     return True
 
@@ -245,6 +308,8 @@ def write_prepare_state_for_spec(spec) -> None:
             f"wrote to {shar_dir}. Re-issue the original config to resume, "
             f"or remove {shar_dir} and restart from scratch."
         ),
+        state_version=CURRENT_PREPARE_STATE_VERSION,
+        state_label="prepare state",
     )
     if wrote:
         logger.info(f"Wrote prepare state: {state_path}")
@@ -330,6 +395,19 @@ def build_shar_index(
 ) -> None:
     """Build a merged ``shar_index.json`` from all ``worker_*`` directories."""
     worker_dirs = [shar_root / worker_dir_fmt.format(wid) for wid in range(num_workers)]
+    build_shar_index_for_worker_dirs(
+        shar_root,
+        worker_dirs,
+        index_filename=index_filename,
+    )
+
+
+def build_shar_index_for_worker_dirs(
+    shar_root: Path,
+    worker_dirs: Sequence[Path],
+    index_filename: str = SHAR_INDEX_FILENAME,
+) -> None:
+    """Build a merged ``shar_index.json`` from completed worker directories."""
     index_path, cuts_count = build_shar_index_from_parts(
         shar_root=shar_root,
         part_dirs=worker_dirs,
@@ -613,8 +691,16 @@ def run_pool_and_finalize(
     )
     t0 = _time.time()
     ctx = _mp.get_context(mp_start_method)
+    results = []
     with ctx.Pool(processes=len(worker_args)) as pool:
-        results = pool.map(worker_fn, worker_args)
+        for result in pool.imap_unordered(worker_fn, worker_args):
+            results.append(result)
+            logger.info(
+                "Worker %s finished (%d/%d)",
+                result.get("worker_id", "?"),
+                len(results),
+                len(worker_args),
+            )
 
     elapsed = _time.time() - t0
     summary = build_prepare_summary(
@@ -643,7 +729,11 @@ def run_pool_and_finalize(
     atomic_write_json(summary_path, summary, sort_keys=False)
     logger.info(f"Wrote prepare summary: {summary_path}")
 
-    build_shar_index(Path(shar_dir), num_workers=num_workers)
+    worker_dirs = [
+        Path(shar_dir) / f"worker_{int(result['worker_id']):02d}"
+        for result in sorted(results, key=lambda r: int(r["worker_id"]))
+    ]
+    build_shar_index_for_worker_dirs(Path(shar_dir), worker_dirs)
 
     from audio_tokenization.prepare.validate_shar import (
         validate_shar_directory,

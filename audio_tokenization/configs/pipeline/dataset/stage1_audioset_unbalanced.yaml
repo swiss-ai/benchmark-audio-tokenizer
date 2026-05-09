@@ -1,7 +1,6 @@
 defaults:
   - /recipe/hf_audio_only@_here_
   - /tokenizer/apertus_wavtok@_here_
-  - /profile/cscs@_here_
   - _self_
 
 # Stage-1 AudioSet unbalanced rebuild from the local HF Arrow cache.

@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from audio_tokenization.config.schema import DatasetSpec, InterleaveProductSpec
-from audio_tokenization.prepare.constants import PREPARE_STATE_FILE
+from audio_tokenization.prepare.constants import (
+    PREPARE_STATE_FILE,
+    state_version_for_filename,
+)
 from audio_tokenization.prepare.metadata import normalize_optional_path
 from audio_tokenization.prepare.runtime import (
     PrepareStateLegacyError,
@@ -31,7 +34,10 @@ def read_stage_provenance(
     for input_dir in _normalize_paths(input_dirs):
         state_path = Path(input_dir) / state_filename
         if state_path.is_file():
-            provenance[input_dir] = _read_upstream_state_for_provenance(state_path)
+            provenance[input_dir] = _read_upstream_state_for_provenance(
+                state_path,
+                state_filename=state_filename,
+            )
     return provenance
 
 
@@ -78,7 +84,11 @@ def _normalize_paths(paths: Sequence[str | Path]) -> list[str]:
     return sorted(normalize_optional_path(path) for path in paths)
 
 
-def _read_upstream_state_for_provenance(state_path: Path) -> dict[str, Any]:
+def _read_upstream_state_for_provenance(
+    state_path: Path,
+    *,
+    state_filename: str,
+) -> dict[str, Any]:
     """Read an upstream state file for fingerprinting, tolerating legacy SHARs.
 
     Stage ownership stays strict: convert resume still rejects stale or
@@ -94,7 +104,9 @@ def _read_upstream_state_for_provenance(state_path: Path) -> dict[str, Any]:
     """
 
     try:
-        return read_prepare_state(state_path)
+        return read_prepare_state(
+            state_path, expected_version=state_version_for_filename(state_filename)
+        )
     except PrepareStateLegacyError:
         raw = state_path.read_bytes()
         payload: Any

@@ -71,6 +71,7 @@ from audio_tokenization.prepare.runtime import (
     distribute_round_robin,
     ensure_worker_assignment,
     init_worker_process,
+    maybe_log_worker_progress,
     run_pool_and_finalize,
     validate_prepare_runtime,
     write_prepare_state_for_spec,
@@ -365,7 +366,6 @@ def _convert_worker(args_tuple):
         vad_sample_rate,
         vad_max_merge_gap_sec,
         vad_max_duration_sec,
-        vad_min_rms_db,
         text_tokenizer,
         resampling_backend,
         input_clip_id_parser_name,
@@ -390,20 +390,19 @@ def _convert_worker(args_tuple):
             sample_rate=int(vad_sample_rate),
             max_merge_gap_sec=float(vad_max_merge_gap_sec),
             max_duration_sec=float(vad_max_duration_sec) if vad_max_duration_sec is not None else None,
-            min_rms_db=float(vad_min_rms_db) if vad_min_rms_db is not None else None,
         )
-        vad_lookup, sr_lookup, lang_lookup = load_vad_from_per_shard_dir(
+        vad_lookup, lang_lookup = load_vad_from_per_shard_dir(
             Path(vad_per_shard_dir), tar_paths, with_lang=True, logger=logger,
         )
     else:
         vad_cfg = None
         vad_lookup = {}
-        sr_lookup = {}
         lang_lookup = {}
 
     worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
     t0 = time.time()
     written = skipped = errors = 0
+    next_log_at = 1000
     total_duration_sec = 0.0
     runtime_counts = Counter()
     _tokenize_text = make_text_tokenize_fn(text_tokenizer) if text_tokenizer is not None else None
@@ -438,10 +437,8 @@ def _convert_worker(args_tuple):
                 if use_vad_segmenting:
                     out_cuts, reason = split_cut_by_vad(
                         cut=cut,
-                        sample_key=cut.recording_id,
-                        vad_lookup=vad_lookup,
+                        timestamps=vad_lookup.get(canonical_sample_key(cut.recording_id)),
                         cfg=vad_cfg,
-                        sr_lookup=sr_lookup,
                         runtime_counts=runtime_counts,
                     )
                     reason_counts[reason] += 1
@@ -491,12 +488,14 @@ def _convert_worker(args_tuple):
                     written += 1
                     total_duration_sec += out_cut.duration
                     runtime_counts["cuts_written"] += 1
-
-                if written % 1000 == 0:
-                    elapsed = time.time() - t0
-                    logger.info(
-                        f"Worker {worker_id}: {written} written, {skipped} skipped, "
-                        f"{errors} errors ({written / elapsed:.1f} samples/s)"
+                    next_log_at = maybe_log_worker_progress(
+                        logger=logger,
+                        worker_id=worker_id,
+                        written=written,
+                        skipped=skipped,
+                        errors=errors,
+                        t0=t0,
+                        next_log_at=next_log_at,
                     )
 
             except Exception as e:
@@ -561,9 +560,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vad-max-duration-sec", type=float, default=None,
                         help="Drop atomic speech segments longer than this "
                              "(default: same as --vad-max-chunk-sec)")
-    parser.add_argument("--vad-min-rms-db", type=float, default=None,
-                        help="Drop VAD spans below this RMS before merge/pack")
-
     return parser
 
 
@@ -671,7 +667,6 @@ def run(spec):
             i.vad_sample_rate,
             i.vad_max_merge_gap_sec,
             i.vad_max_duration_sec,
-            i.vad_min_rms_db,
             text_tokenizer,
             o.resampling_backend,
             m.input_clip_id_parser,
@@ -701,7 +696,6 @@ def _args_to_spec(args):
             "vad_sample_rate": args.vad_sample_rate,
             "vad_max_merge_gap_sec": args.vad_max_merge_gap_sec,
             "vad_max_duration_sec": args.vad_max_duration_sec,
-            "vad_min_rms_db": args.vad_min_rms_db,
         },
         "output": {
             "shar_dir": str(args.shar_dir) if args.shar_dir else None,

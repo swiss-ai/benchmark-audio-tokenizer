@@ -1,8 +1,9 @@
 #!/bin/bash
-# Stage-1 CommonVoice pipeline launcher.
+# Stage-1 CommonVoice25 parquet pipeline launcher.
 #
-# The current card tokenizes the existing per-language Stage-1 SHAR roots:
-#   /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1/commonvoice/*_other
+# Convert processed parquet -> SHAR:
+#   sbatch --time=12:00:00 --nodes=1 --ntasks=1 --cpus-per-task=288 \
+#     /iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/scripts/slurm/stage1_commonvoice.slurm convert
 #
 # Tokenize SHAR -> Megatron audio tokens:
 #   sbatch --time=12:00:00 --nodes=1 --ntasks-per-node=4 --gpus-per-node=4 \
@@ -10,7 +11,7 @@
 #     /iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/scripts/slurm/stage1_commonvoice.slurm tokenize
 #
 # Add normal Hydra overrides after the stage when needed, for example:
-#   scripts/slurm/stage1_commonvoice.slurm tokenize runtime.resume=true
+#   scripts/slurm/stage1_commonvoice.slurm convert source.files=en/dev.parquet
 
 #SBATCH --account=infra01
 #SBATCH --job-name=cv-stage1
@@ -26,7 +27,7 @@ set -euo pipefail
 DATASET=stage1_commonvoice
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
-    echo "Usage: sbatch [resources] $0 <tokenize> [hydra overrides...]" >&2
+    echo "Usage: sbatch [resources] $0 <convert|tokenize> [hydra overrides...]" >&2
     exit 2
 fi
 shift
@@ -40,10 +41,10 @@ mkdir -p "${LOG_DIR}"
 TASKS=${SLURM_NTASKS:-${SLURM_NPROCS:-1}}
 
 case "${STAGE}" in
-    tokenize) ;;
+    convert|tokenize) ;;
     *)
         echo "Unsupported stage: ${STAGE}" >&2
-        echo "Use: tokenize" >&2
+        echo "Use: convert or tokenize" >&2
         exit 2
         ;;
 esac
@@ -60,9 +61,13 @@ echo "=========================================="
 
 export REPO_DIR RUNTIME_ENV_SH DATASET STAGE
 export INSTALL_TORCHAUDIO=${INSTALL_TORCHAUDIO:-1}
+export INSTALL_TORCHCODEC=${INSTALL_TORCHCODEC:-0}
 export INSTALL_ONCE_PER_NODE=${INSTALL_ONCE_PER_NODE:-1}
 export PRINT_LHOTSE_RUNTIME=${PRINT_LHOTSE_RUNTIME:-0}
 export RUNTIME_READY_FILE=${RUNTIME_READY_FILE:-/tmp/.lhotse_runtime_ready_${SLURM_JOB_ID:-manual}}
+if [ "${STAGE}" = "convert" ]; then
+    export LHOTSE_AUDIO_BACKEND=${LHOTSE_AUDIO_BACKEND:-LibsndfileBackend}
+fi
 
 run_stage() {
     local pipeline_stage=$1
@@ -92,6 +97,9 @@ python -m audio_tokenization run \
 }
 
 case "${STAGE}" in
+    convert)
+        run_stage convert 1
+        ;;
     tokenize)
         run_stage tokenize "${TASKS}"
         ;;
