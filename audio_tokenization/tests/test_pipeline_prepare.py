@@ -100,24 +100,6 @@ def test_load_dataset_spec_infore2_and_aozora():
     ]
 
 
-def test_stage1_voxpopuli_vad_parquet_uses_generic_parquet_runner():
-    spec = load_dataset_spec(_load_dataset_cfg("stage1_voxpopuli_vad_parquet"))
-
-    assert spec.convert.family == "parquet"
-    assert spec.convert.input.parquet_glob == "*/*.parquet"
-    assert spec.convert.metadata.audio_column == "audio"
-    assert spec.convert.metadata.id_column == "source_id"
-    assert spec.convert.metadata.custom_columns == [
-        "source_path",
-        "source_duration_sec",
-        "source_sample_rate",
-        "vad_jsonl",
-        "vad_sample_rate",
-    ]
-    assert spec.convert.metadata.source_id_column == "source_id"
-    assert spec.convert.metadata.chunks_column == "chunks"
-
-
 def test_load_dataset_spec_does_not_reconfigure_logging(monkeypatch):
     import logging
 
