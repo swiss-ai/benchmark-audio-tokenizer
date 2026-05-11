@@ -435,6 +435,12 @@ class PrepareSpec(SchemaModel):
                 "input_clip_id_parser cannot be combined with vad_segmentation; "
                 "input IDs already encode clip numbering."
             )
+        if self.metadata.chunks_column and self.family != "parquet":
+            raise ValueError(
+                f"metadata.chunks_column is only implemented for family='parquet'; "
+                f"got family={self.family!r}. Either drop chunks_column or convert "
+                "the source to parquet upstream."
+            )
         return self
 
     @classmethod

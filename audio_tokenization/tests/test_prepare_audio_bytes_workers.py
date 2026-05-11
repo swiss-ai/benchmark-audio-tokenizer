@@ -921,6 +921,74 @@ def test_extract_clip_timestamps_rejects_non_finite_values():
         )
 
 
+def test_prepare_parquet_worker_chunks_column_emits_one_subcut_per_chunk(
+    monkeypatch, tmp_path
+):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["row-1"],
+                "audio": [{"bytes": b"long-audio-bytes"}],
+                "text": ["transcript"],
+                "source_id": ["episode-42"],
+                "chunks": [[
+                    {"clip_start_sec": 0.0, "clip_duration_sec": 1.5},
+                    {"clip_start_sec": 1.5, "clip_duration_sec": 2.0},
+                    {"clip_start_sec": 3.5, "clip_duration_sec": 1.25, "clip_id": "named-clip"},
+                ]],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    # The chunks path calls cut.truncate(...) per chunk; patch the fake cut
+    # so truncate returns a fresh namespace per call (mirrors lhotse.cut.truncate).
+    def _truncate(self, *, offset, duration, preserve_id=False):
+        return types.SimpleNamespace(
+            id=self.id, recording_id=self.recording_id, duration=duration,
+            sampling_rate=self.sampling_rate, num_channels=self.num_channels,
+            supervisions=[], custom=None,
+        )
+
+    def fake_build(audio_bytes, recording_id, *, runtime_counts=None):
+        helper_calls.append({"audio_bytes": audio_bytes, "recording_id": recording_id})
+        if runtime_counts is not None:
+            runtime_counts["recording_from_bytes"] += 1
+        cut = types.SimpleNamespace(
+            id=str(recording_id), recording_id=str(recording_id), duration=10.0,
+            sampling_rate=16000, num_channels=1, supervisions=[], custom=None,
+        )
+        cut.truncate = _truncate.__get__(cut, type(cut))
+        return types.SimpleNamespace(to_cut=lambda: cut)
+
+    monkeypatch.setattr(
+        prepare_parquet_to_shar, "build_recording_from_audio_bytes", fake_build
+    )
+
+    result = prepare_parquet_to_shar._convert_worker(
+        _parquet_worker_args(
+            tmp_path,
+            duration_column=None,
+            source_id_column="source_id",
+            chunks_column="chunks",
+        )
+    )
+
+    assert result["written"] == 3
+    assert result["errors"] == 0
+    assert len(written_cuts) == 3
+    # Third chunk has explicit clip_id; the first two get stable derived IDs.
+    assert written_cuts[2].id == "named-clip"
+    assert written_cuts[0].id != written_cuts[1].id  # stable IDs differ across chunks
+    for c in written_cuts:
+        assert c.custom["source_recording_id"] == "row-1"
+        assert "global_offset_sec" in c.custom
+
+
 def test_prepare_parquet_worker_rejects_invalid_clip_interval(monkeypatch, tmp_path):
     written_cuts = []
     helper_calls = []
