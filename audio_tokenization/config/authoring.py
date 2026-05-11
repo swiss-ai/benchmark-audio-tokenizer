@@ -35,6 +35,11 @@ def resolve_authoring_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     conversion = _mapping(data.get("conversion"), "conversion")
     tokenization = _mapping(data.get("tokenization"), "tokenization")
     materialization = _mapping(data.get("materialization"), "materialization")
+    if "sft" in materialization:
+        raise ValueError(
+            "materialization.sft is not supported. SFT config was removed "
+            "until the SFT assembler lands with its schema and tests."
+        )
 
     source_type = _str_value(source.get("type") or recipe.get("source_type"), "source.type")
     pipeline_mode = _str_value(recipe.get("mode"), "recipe.mode")
@@ -215,7 +220,6 @@ def _build_materialize(
             "num_workers": _materialize_value(materialization, interleave_defaults, "num_workers"),
             "tmp_dir": _materialize_value(materialization, interleave_defaults, "tmp_dir"),
         },
-        "sft": _mapping(materialization.get("sft"), "materialization.sft"),
     }
 
 
@@ -311,6 +315,7 @@ def _metadata(
         ("clip_start", "clip_start_column"),
         ("clip_end", "clip_end_column"),
         ("clip_duration", "clip_duration_column"),
+        ("chunks", "chunks_column"),
     ):
         out[dst] = timeline.get(src)
     return out

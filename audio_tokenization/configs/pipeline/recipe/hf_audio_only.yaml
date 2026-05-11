@@ -82,4 +82,3 @@ materialization:
     transcribe_ratio: null
     num_workers: null
     tmp_dir: null
-  sft: {}

@@ -10,7 +10,11 @@ from omegaconf import OmegaConf
 
 from audio_tokenization.__main__ import _split_command
 from audio_tokenization.config import load_dataset_spec
-from audio_tokenization.config.schema import PrepareMetadataSpec, PrepareSpec
+from audio_tokenization.config.schema import (
+    _INPUT_SPEC_BY_FAMILY,
+    PrepareMetadataSpec,
+    PrepareSpec,
+)
 from audio_tokenization.prepare.columnar import ColumnarWorkerArgs
 from audio_tokenization.prepare.cli import expand_path_patterns
 from audio_tokenization.stages import convert as convert_stage
@@ -27,7 +31,9 @@ from audio_tokenization.prepare.constants import (
     PREPARE_STATE_FILE,
 )
 from audio_tokenization.prepare.runtime import (
+    preflight_prepare_spec,
     read_prepare_state,
+    resolve_prepare_inputs,
     validate_or_write_prepare_state,
 )
 
@@ -94,6 +100,24 @@ def test_load_dataset_spec_infore2_and_aozora():
     ]
 
 
+def test_stage1_voxpopuli_vad_parquet_uses_generic_parquet_runner():
+    spec = load_dataset_spec(_load_dataset_cfg("stage1_voxpopuli_vad_parquet"))
+
+    assert spec.convert.family == "parquet"
+    assert spec.convert.input.parquet_glob == "*/*.parquet"
+    assert spec.convert.metadata.audio_column == "audio"
+    assert spec.convert.metadata.id_column == "id"
+    assert spec.convert.metadata.custom_columns == [
+        "lang",
+        "source_recording_id",
+        "global_offset_sec",
+    ]
+    assert spec.convert.metadata.source_id_column == "source_id"
+    assert spec.convert.metadata.clip_num_column == "clip_num"
+    assert spec.convert.metadata.clip_start_column == "clip_start_sec"
+    assert spec.convert.metadata.clip_duration_column == "clip_duration_sec"
+
+
 def test_load_dataset_spec_does_not_reconfigure_logging(monkeypatch):
     import logging
 
@@ -114,6 +138,132 @@ def test_load_dataset_spec_does_not_reconfigure_logging(monkeypatch):
     )
 
     assert spec.convert.family == "hf"
+
+
+def test_prepare_family_registry_is_owned_by_input_specs():
+    expected_modules = {
+        "parquet": "audio_tokenization.prepare.prepare_parquet_to_shar",
+        "hf": "audio_tokenization.prepare.prepare_hf_to_shar",
+        "wds": "audio_tokenization.prepare.prepare_wds_to_shar",
+        "audio_dir": "audio_tokenization.prepare.prepare_audio_dir_to_shar",
+        "lhotse_recipe": "audio_tokenization.prepare.prepare_lhotse_recipe_to_shar",
+    }
+
+    assert set(_INPUT_SPEC_BY_FAMILY) == set(expected_modules)
+    for family, input_cls in _INPUT_SPEC_BY_FAMILY.items():
+        assert input_cls.FAMILY == family
+        assert input_cls.RUNNER_MODULE == expected_modules[family]
+
+
+def test_prepare_runtime_delegates_resolution_to_family_runner(monkeypatch):
+    from audio_tokenization.prepare import runtime
+
+    spec = PrepareSpec.from_mapping(
+        {
+            "family": "parquet",
+            "input": {"parquet_dir": "/tmp/in"},
+            "output": {"shar_dir": "/tmp/out", "shard_size": 2000},
+        }
+    )
+
+    class _Runner:
+        @staticmethod
+        def resolve(received):
+            assert received is spec
+            return ["resolved.parquet"], {"family": "parquet"}
+
+    monkeypatch.setattr(runtime, "get_prepare_runner", lambda received: _Runner)
+
+    assert runtime.resolve_prepare_inputs(spec) == (
+        ["resolved.parquet"],
+        {"family": "parquet"},
+    )
+
+
+def test_prepare_family_runners_canary_resolve_and_preflight(tmp_path):
+    from audio_tokenization.prepare.runtime import get_prepare_runner
+
+    parquet_dir = tmp_path / "parquet"
+    parquet_dir.mkdir()
+    parquet_file = parquet_dir / "data.parquet"
+    parquet_file.write_text("stub\n")
+
+    arrow_dir = tmp_path / "arrow"
+    arrow_dir.mkdir()
+    arrow_file = arrow_dir / "data.arrow"
+    arrow_file.write_text("stub\n")
+
+    wds_dir = tmp_path / "wds"
+    wds_dir.mkdir()
+    wds_file = wds_dir / "data.tar"
+    wds_file.write_text("stub\n")
+
+    audio_root = tmp_path / "audio"
+    audio_root.mkdir()
+    vad_jsonl = tmp_path / "vad.jsonl"
+    vad_jsonl.write_text("{}\n")
+
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir()
+
+    cases = {
+        "parquet": (
+            {
+                "family": "parquet",
+                "input": {"parquet_dir": str(parquet_dir)},
+                "output": {"shar_dir": str(tmp_path / "out_parquet"), "shard_size": 2000},
+            },
+            [str(parquet_file)],
+        ),
+        "hf": (
+            {
+                "family": "hf",
+                "input": {"arrow_dir": str(arrow_dir)},
+                "output": {"shar_dir": str(tmp_path / "out_hf"), "shard_size": 2000},
+            },
+            [str(arrow_file)],
+        ),
+        "wds": (
+            {
+                "family": "wds",
+                "input": {"wds_shards": [str(wds_dir / "*.tar")]},
+                "output": {"shar_dir": str(tmp_path / "out_wds"), "shard_size": 2000},
+            },
+            [str(wds_file)],
+        ),
+        "audio_dir": (
+            {
+                "family": "audio_dir",
+                "input": {"audio_root": str(audio_root), "jsonl_files": [str(vad_jsonl)]},
+                "output": {"shar_dir": str(tmp_path / "out_audio_dir"), "shard_size": 2000},
+            },
+            [str(vad_jsonl)],
+        ),
+        "lhotse_recipe": (
+            {
+                "family": "lhotse_recipe",
+                "input": {
+                    "recipe": "librispeech",
+                    "corpus_dir": str(corpus_dir),
+                    "split": "test-clean",
+                },
+                "output": {"shar_dir": str(tmp_path / "out_lhotse"), "shard_size": 2000},
+            },
+            [],
+        ),
+    }
+
+    for family, (payload, expected_resolved) in cases.items():
+        spec = PrepareSpec.from_mapping(payload)
+        runner = get_prepare_runner(spec)
+        assert callable(runner.resolve)
+        assert callable(runner.preflight)
+        assert callable(runner.run)
+
+        resolved, summary = resolve_prepare_inputs(spec)
+        assert resolved == expected_resolved
+        assert summary["family"] == family
+        preflight_prepare_spec(spec, runtime_validator=lambda **_kwargs: None)
 
 
 def test_load_dataset_spec_does_not_import_prepare_modules():
@@ -620,6 +770,27 @@ def test_prepare_spec_fingerprint_payload_is_hashable_and_stable(
         assert fp[key] == expected
 
 
+def test_hf_preflight_honors_arrow_files_override_when_arrow_dir_missing(tmp_path):
+    arrow_file = tmp_path / "explicit.arrow"
+    arrow_file.write_bytes(b"not a real arrow file; preflight should not parse it")
+    missing_arrow_dir = tmp_path / "missing_arrow_dir"
+
+    payload = _minimal_payload("hf")
+    payload["convert"]["input"].update(
+        {
+            "arrow_dir": str(missing_arrow_dir),
+            "arrow_files": [str(arrow_file)],
+        }
+    )
+    spec = PrepareSpec.from_mapping(payload["convert"])
+
+    resolved, summary = resolve_prepare_inputs(spec)
+    assert resolved == [str(arrow_file)]
+    assert summary["arrow_files"] == [str(arrow_file)]
+
+    preflight_prepare_spec(spec, runtime_validator=lambda **_kwargs: None)
+
+
 @pytest.mark.parametrize("family", ["parquet", "hf"])
 def test_prepare_fingerprint_includes_clip_timestamp_metadata_fields(family):
     payload = _minimal_payload(family)
@@ -1031,7 +1202,10 @@ def test_audio_dir_run_uses_shared_audio_index_with_fork(tmp_path, monkeypatch):
 
     assert captured["mp_start_method"] == "fork"
     assert len(captured["worker_args"]) == 1
-    assert len(captured["worker_args"][0]) == 15
+    worker_args = captured["worker_args"][0]
+    assert isinstance(worker_args, prepare_audio_dir_to_shar.AudioDirWorkerArgs)
+    assert worker_args.audio_index is None
+    assert worker_args.jsonl_paths == (str(jsonl_path),)
     assert prepare_audio_dir_to_shar._AUDIO_INDEX is None
 
 
@@ -1112,22 +1286,139 @@ def test_run_convert_resume_false_removes_existing_output_dir(tmp_path, monkeypa
 
     class _RunnerModule:
         @staticmethod
-        def run(prepare_spec):
+        def run(prepare_spec, *, resolved_inputs=None):
+            del resolved_inputs
             captured["exists_on_entry"] = Path(prepare_spec.output.shar_dir).exists()
             _write_cut_shar_index(Path(prepare_spec.output.shar_dir))
             return {"ran": True}
 
-    monkeypatch.setattr(
-        convert_stage.importlib,
-        "import_module",
-        lambda _path: _RunnerModule,
-    )
+    monkeypatch.setattr(convert_stage, "get_prepare_runner", lambda _spec: _RunnerModule)
     monkeypatch.setattr(convert_stage, "validate_prepare_runtime", lambda **_kwargs: None)
 
     result = convert_stage.run_convert(spec, resume=False)
     assert result == {"ran": True}
     assert captured["exists_on_entry"] is False
     assert (out / "_shar_work_manifest.json").is_file()
+
+
+def test_run_convert_reuses_stage_resolved_inputs_without_stage_preflight(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    resolved_inputs = [str(tmp_path / "inputs" / "data.parquet")]
+    spec = load_dataset_spec(
+        {
+            "name": "single_resolve",
+            "convert": {
+                "family": "parquet",
+                "input": {"parquet_dir": str(tmp_path / "inputs")},
+                "output": {"shar_dir": str(out), "shard_size": 2000},
+            },
+        }
+    )
+    captured = {}
+
+    def _resolve_inputs_once(prepare_spec):
+        captured["resolved_spec"] = prepare_spec
+        return resolved_inputs, {
+            "family": "parquet",
+            "resolved_inputs": resolved_inputs,
+        }
+
+    def _unexpected_stage_preflight(*_args, **_kwargs):
+        raise AssertionError("convert stage must not preflight before runner")
+
+    class _RunnerModule:
+        @staticmethod
+        def run(prepare_spec, *, resolved_inputs=None):
+            captured["runner_spec"] = prepare_spec
+            captured["runner_resolved_inputs"] = resolved_inputs
+            _write_cut_shar_index(Path(prepare_spec.output.shar_dir))
+            return {"ran": True}
+
+    monkeypatch.setattr(convert_stage, "resolve_prepare_inputs", _resolve_inputs_once)
+    monkeypatch.setattr(convert_stage, "preflight_prepare_spec", _unexpected_stage_preflight)
+    monkeypatch.setattr(convert_stage, "get_prepare_runner", lambda _spec: _RunnerModule)
+
+    result = convert_stage.run_convert(spec)
+
+    assert result == {"ran": True}
+    assert captured["resolved_spec"] is spec.convert
+    assert captured["runner_spec"] is spec.convert
+    assert captured["runner_resolved_inputs"] == resolved_inputs
+    assert (out / "_shar_work_manifest.json").is_file()
+
+
+def test_convert_execution_loads_runner_from_input_spec(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    resolved_inputs = [str(tmp_path / "inputs" / "data.parquet")]
+    spec = load_dataset_spec(
+        {
+            "name": "runner_from_spec",
+            "convert": {
+                "family": "parquet",
+                "input": {"parquet_dir": str(tmp_path / "inputs")},
+                "output": {"shar_dir": str(out), "shard_size": 2000},
+            },
+        }
+    )
+    captured = {}
+
+    class _RunnerModule:
+        @staticmethod
+        def run(prepare_spec, *, resolved_inputs=None):
+            captured["runner_spec"] = prepare_spec
+            captured["runner_resolved_inputs"] = resolved_inputs
+            _write_cut_shar_index(Path(prepare_spec.output.shar_dir))
+            return {"ran": True}
+
+    monkeypatch.setattr(convert_stage, "resolve_prepare_inputs", lambda _spec: (resolved_inputs, {}))
+    monkeypatch.setattr(convert_stage, "get_prepare_runner", lambda _spec: _RunnerModule)
+
+    result = convert_stage.run_convert(spec)
+
+    assert result == {"ran": True}
+    assert captured["runner_spec"] is spec.convert
+    assert captured["runner_resolved_inputs"] == resolved_inputs
+
+
+def test_run_convert_preflights_exactly_once_via_runner(tmp_path, monkeypatch):
+    """Stage does not preflight; runner preflights once. Together: exactly one call."""
+    out = tmp_path / "out"
+    resolved_inputs = [str(tmp_path / "inputs" / "data.parquet")]
+    spec = load_dataset_spec(
+        {
+            "name": "single_preflight",
+            "convert": {
+                "family": "parquet",
+                "input": {"parquet_dir": str(tmp_path / "inputs")},
+                "output": {"shar_dir": str(out), "shard_size": 2000},
+            },
+        }
+    )
+    preflight_calls: list[dict[str, Any]] = []
+
+    def _track_preflight(prepare_spec, **kwargs):
+        preflight_calls.append({"family": prepare_spec.family, "kwargs": kwargs})
+
+    monkeypatch.setattr(
+        convert_stage,
+        "resolve_prepare_inputs",
+        lambda prepare_spec: (resolved_inputs, {"family": prepare_spec.family}),
+    )
+    monkeypatch.setattr(convert_stage, "preflight_prepare_spec", _track_preflight)
+
+    class _RunnerModule:
+        @staticmethod
+        def run(prepare_spec, *, resolved_inputs=None):
+            convert_stage.preflight_prepare_spec(prepare_spec)
+            _write_cut_shar_index(Path(prepare_spec.output.shar_dir))
+            return {"ran": True}
+
+    monkeypatch.setattr(convert_stage, "get_prepare_runner", lambda _spec: _RunnerModule)
+
+    convert_stage.run_convert(spec)
+
+    assert len(preflight_calls) == 1, f"expected exactly one preflight, got {len(preflight_calls)}"
+    assert preflight_calls[0]["family"] == "parquet"
 
 
 def test_split_command_defaults_to_run():

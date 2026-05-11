@@ -74,12 +74,12 @@ def resolve_tokenize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
         preflight=lambda: _preflight_tokenize_plan(
             input_shar_dirs,
             input_was_explicit,
-            spec.tokenize.output.shar_index_filename,
         ),
         execute=lambda resume: _execute_tokenize_plan(
             spec=tokenize_spec,
             dataset_name=spec.name,
             input_shar_dirs=input_shar_dirs,
+            input_was_explicit=input_was_explicit,
             final_output_dir=final_output_dir,
             fingerprint=fingerprint,
             resume=resume,
@@ -89,7 +89,6 @@ def resolve_tokenize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
 
 def run_tokenize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
     plan = resolve_tokenize_plan(spec)
-    plan.preflight()
     return plan.execute(resume)
 
 
@@ -114,7 +113,6 @@ def _resolve_input_shar_dirs(spec: DatasetSpec) -> list[str]:
 def _preflight_tokenize_plan(
     shar_dirs: list[str],
     input_was_explicit: bool,
-    index_name: str,
 ) -> None:
     _require_input_shar_dirs_exist(shar_dirs)
     if not input_was_explicit:
@@ -143,10 +141,12 @@ def _execute_tokenize_plan(
     spec: TokenizeSpec,
     dataset_name: str,
     input_shar_dirs: list[str],
+    input_was_explicit: bool,
     final_output_dir: Path,
     fingerprint: dict[str, Any],
     resume: bool,
 ) -> dict[str, Any]:
+    _preflight_tokenize_plan(input_shar_dirs, input_was_explicit)
     rank, world_size, local_rank = _distributed_rank_info()
     if world_size > 1:
         return _execute_tokenize_plan_distributed(
@@ -177,12 +177,18 @@ def _execute_tokenize_plan(
     )
     if skipped is not None:
         return skipped
-    result = _invoke_pipeline_for_rank(
+    assignment = _write_tokenize_assignment(
+        spec,
+        input_shar_dirs=input_shar_dirs,
+        final_output_dir=final_output_dir,
+        world_size=1,
+    )
+    result = _invoke_pipeline_for_assignment(
         spec,
         dataset_name=dataset_name,
         input_shar_dirs=input_shar_dirs,
         final_output_dir=final_output_dir,
-        rank=0,
+        rank_assignment=assignment.assignment_for_rank(0),
         world_size=1,
         local_rank=local_rank,
     )
@@ -322,41 +328,6 @@ def _write_tokenize_assignment(
         manifest_source,
     )
     return assignment
-
-
-def _invoke_pipeline_for_rank(
-    spec: TokenizeSpec,
-    *,
-    dataset_name: str,
-    input_shar_dirs: list[str],
-    final_output_dir: Path,
-    rank: int,
-    world_size: int,
-    local_rank: int,
-) -> dict[str, Any]:
-    """Plan rank-local SHAR ownership, then enter the tokenizer runtime.
-
-    Assignment is part of the stage contract for every launch, including
-    single-GPU runs. Keeping it here avoids a second planning path inside the
-    hot tokenizer core and guarantees `_tokenize_assignment.json` exists for
-    resume/debug no matter how many ranks were used.
-    """
-
-    assignment = _write_tokenize_assignment(
-        spec,
-        input_shar_dirs=input_shar_dirs,
-        final_output_dir=final_output_dir,
-        world_size=world_size,
-    )
-    return _invoke_pipeline_for_assignment(
-        spec,
-        dataset_name=dataset_name,
-        input_shar_dirs=input_shar_dirs,
-        final_output_dir=final_output_dir,
-        rank_assignment=assignment.assignment_for_rank(rank),
-        world_size=world_size,
-        local_rank=local_rank,
-    )
 
 
 def _invoke_pipeline_for_assignment(

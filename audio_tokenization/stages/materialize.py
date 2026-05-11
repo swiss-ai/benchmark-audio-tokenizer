@@ -9,7 +9,6 @@ from typing import Any
 from audio_tokenization.config.schema import (
     DatasetSpec,
     InterleaveProductSpec,
-    SftProductSpec,
 )
 from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.runtime import resolve_num_workers
@@ -26,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 
 INTERLEAVE_STATE_FILE = "products_interleave_state.json"
-SFT_STATE_FILE = "products_sft_state.json"
 
 
 def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
@@ -75,6 +73,7 @@ def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
         success_marker=output_dir / SUCCESS_MARKER_FILE,
         preflight=lambda: _preflight_materialize_plan(spec, interleave, parquet_dir),
         execute=lambda resume: _execute_materialize_plan(
+            spec=spec,
             interleave=interleave,
             parquet_dir=parquet_dir,
             tokenizer_path=tokenizer_path,
@@ -90,7 +89,6 @@ def run_materialize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]
 
     interleave_plan = resolve_materialize_plan(spec)
     if interleave_plan.enabled:
-        interleave_plan.preflight()
         results.update(interleave_plan.execute(resume))
     else:
         results["interleave"] = {
@@ -98,24 +96,7 @@ def run_materialize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]
             "reason": interleave_plan.reason or "interleave.disabled",
         }
 
-    sft = spec.materialize.sft
-    if sft.enabled:
-        results["sft"] = _run_sft_materialize(sft, resume=resume)
-    else:
-        results["sft"] = {"skipped": True, "reason": "sft.disabled"}
-
     return results
-
-
-def _run_sft_materialize(sft: SftProductSpec, *, resume: bool) -> dict[str, Any]:
-    # Fail on the unimplemented surface before validating config — users
-    # shouldn't chase config errors for a product the assembler doesn't yet
-    # build. Add product-specific preflight with the assembler implementation.
-    raise NotImplementedError(
-        "materialize.sft is a typed product now, but the SFT assembler is not "
-        "implemented in this slice. It will consume doc_manifest + audio token "
-        "cache manifests and write final Megatron sequences."
-    )
 
 
 def _preflight_materialize_plan(
@@ -140,6 +121,7 @@ def _preflight_materialize_plan(
 
 def _execute_materialize_plan(
     *,
+    spec: DatasetSpec,
     interleave: InterleaveProductSpec,
     parquet_dir: Path,
     tokenizer_path: str,
@@ -147,6 +129,7 @@ def _execute_materialize_plan(
     fingerprint: dict[str, Any],
     resume: bool,
 ) -> dict[str, Any]:
+    _preflight_materialize_plan(spec, interleave, parquet_dir)
     argv = _build_interleave_argv(interleave, parquet_dir, tokenizer_path)
     return {
         "interleave": run_with_resume(

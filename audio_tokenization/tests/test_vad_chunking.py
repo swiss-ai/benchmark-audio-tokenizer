@@ -9,7 +9,7 @@ per-span decodes), this module covers the surviving chunking surface:
   * merge_and_pack_vad: max_duration_sec drop, merge-gap behavior,
     max_chunk_sec packing, min_chunk_sec drop.
 
-Worker-level call shapes (audio_dir tuple, WDS tuple, vad_lookup wiring)
+Worker-level call shapes (audio_dir/WDS typed args, vad_lookup wiring)
 are exercised by test_pipeline_prepare.py and test_prepare_wds_to_shar.py.
 """
 from collections import Counter

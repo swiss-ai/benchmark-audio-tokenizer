@@ -64,6 +64,7 @@ from audio_tokenization.prepare.runtime import (
     ensure_worker_assignment,
     init_worker_process,
     maybe_log_worker_progress,
+    coerce_resolved_inputs,
     run_pool_and_finalize,
     validate_prepare_runtime,
     write_prepare_state_for_spec,
@@ -276,10 +277,54 @@ def _convert_worker(args: ColumnarWorkerArgs):
 # ---------------------------------------------------------------------------
 
 
+def resolve(spec) -> tuple[list[str], dict]:
+    """Resolve Arrow input shards for this prepare family."""
+    i = spec.input
+    if i.arrow_files:
+        resolved = expand_path_patterns(i.arrow_files)
+        input_summary = {
+            "family": spec.family,
+            "arrow_files": list(i.arrow_files),
+            "resolved_inputs": resolved,
+        }
+    elif i.arrow_dir:
+        arrow_dir = Path(i.arrow_dir)
+        resolved = sorted(str(p) for p in arrow_dir.glob(i.arrow_glob))
+        input_summary = {
+            "family": spec.family,
+            "arrow_dir": str(arrow_dir),
+            "arrow_glob": i.arrow_glob,
+            "resolved_inputs": resolved,
+        }
+    else:
+        raise ValueError("Either arrow_files or arrow_dir must be provided")
+    if not resolved:
+        raise FileNotFoundError("No arrow files resolved for HF input")
+    return resolved, input_summary
+
+
+def preflight(
+    spec,
+    *,
+    runtime_validator=validate_prepare_runtime,
+) -> None:
+    """Validate generic HF Arrow prepare prerequisites."""
+    i, o = spec.input, spec.output
+    if not i.arrow_files and i.arrow_dir is not None:
+        arrow_dir = Path(i.arrow_dir)
+        if not arrow_dir.is_dir():
+            raise NotADirectoryError(f"Arrow input dir not found: {arrow_dir}")
+    runtime_validator(
+        resampling_backend=o.resampling_backend,
+        require_ffmpeg=True,
+        text_tokenizer_path=o.text_tokenizer,
+    )
+
+
 def _preflight_prepare(spec, resolved: list[str]) -> None:
     import pyarrow.ipc as ipc
 
-    m, o = spec.metadata, spec.output
+    m = spec.metadata
     sample_path = resolved[0]
     with open(sample_path, "rb") as f:
         schema_names = ipc.open_stream(f).schema.names
@@ -305,11 +350,7 @@ def _preflight_prepare(spec, resolved: list[str]) -> None:
         logger=logger,
     )
 
-    validate_prepare_runtime(
-        resampling_backend=o.resampling_backend,
-        require_ffmpeg=True,
-        text_tokenizer_path=o.text_tokenizer,
-    )
+    preflight(spec, runtime_validator=validate_prepare_runtime)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -347,19 +388,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(spec):
+def run(spec, *, resolved_inputs: list[str] | None = None):
     """Execute HF arrow prepare for a typed PrepareSpec."""
     i, o, m = spec.input, spec.output, spec.metadata
     shar_dir = Path(o.shar_dir)
 
-    if i.arrow_files:
-        resolved = expand_path_patterns(i.arrow_files)
-    elif i.arrow_dir:
-        resolved = sorted(str(p) for p in Path(i.arrow_dir).glob(i.arrow_glob))
-    else:
-        raise ValueError("prepare.input requires arrow_dir or arrow_files")
-    if not resolved:
-        raise FileNotFoundError("No arrow files resolved")
+    resolved = coerce_resolved_inputs(spec, resolved_inputs)
 
     _preflight_prepare(spec, resolved)
 

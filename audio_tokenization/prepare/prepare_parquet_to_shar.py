@@ -67,6 +67,7 @@ from audio_tokenization.prepare.runtime import (
     ensure_worker_assignment,
     init_worker_process,
     maybe_log_worker_progress,
+    coerce_resolved_inputs,
     run_pool_and_finalize,
     validate_prepare_runtime,
     write_prepare_state_for_spec,
@@ -92,6 +93,32 @@ logger = logging.getLogger(__name__)
 _ITEMS_KEY = "resolved_parquets"
 _EXTERNAL_METADATA = None
 _DEFAULT_READ_BATCH_SIZE = 256
+
+
+def _coerce_chunk_float(chunk: dict, key: str) -> float:
+    value = chunk.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"chunk field {key!r} must be numeric")
+    value = float(value)
+    if value < 0:
+        raise ValueError(f"chunk field {key!r} must be >= 0")
+    return value
+
+
+def _coerce_chunk_num(chunk: dict, fallback: int) -> int:
+    value = chunk.get("clip_num", fallback)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("chunk field 'clip_num' must be integer-like")
+    clip_num = int(value)
+    if clip_num != value or clip_num < 0:
+        raise ValueError("chunk field 'clip_num' must be a non-negative integer")
+    return clip_num
+
+
+def _stable_chunk_id(source_id: str, clip_num: int, clip_start: float, clip_duration: float) -> str:
+    start_ms = round(float(clip_start) * 1000)
+    duration_ms = round(float(clip_duration) * 1000)
+    return f"{source_id}_{clip_num:06d}_{start_ms:012d}_{duration_ms:012d}"
 
 
 def _convert_worker(args: ColumnarWorkerArgs):
@@ -126,13 +153,14 @@ def _convert_worker(args: ColumnarWorkerArgs):
     clip_end_column = args.clip_end_column
     clip_duration_column = args.clip_duration_column
     read_batch_size = args.read_batch_size
+    chunks_column = args.chunks_column
 
     reused = check_worker_reuse(worker_id, shar_dir)
     if reused is not None:
         return reused
     init_worker_process(resampling_backend)
 
-    from lhotse import SupervisionSegment
+    from lhotse import SupervisionSegment, fastcopy
     from lhotse.shar import SharWriter
 
     worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
@@ -166,6 +194,7 @@ def _convert_worker(args: ColumnarWorkerArgs):
                 clip_start_column,
                 clip_end_column,
                 clip_duration_column,
+                chunks_column,
                 id_column,
                 language_column,
                 custom_columns,
@@ -226,6 +255,109 @@ def _convert_worker(args: ColumnarWorkerArgs):
                     )
                     if custom:
                         cut.custom = custom
+
+                    if chunks_column:
+                        chunks = _get_field(row, chunks_column)
+                        if not isinstance(chunks, list) or not chunks:
+                            skipped += 1
+                            runtime_counts["skipped_empty_chunks"] += 1
+                            continue
+                        if source_id_column:
+                            source_id = _get_field(row, source_id_column)
+                            if source_id is _MISSING or source_id is None:
+                                raise ValueError(
+                                    f"source_id_column {source_id_column!r} is missing or null in row"
+                                )
+                            source_id = str(source_id)
+                        else:
+                            source_id = str(row_id)
+
+                        for chunk_idx, chunk in enumerate(chunks):
+                            if not isinstance(chunk, dict):
+                                raise TypeError("chunk entries must be structs")
+                            clip_start_val = _coerce_chunk_float(
+                                chunk, "clip_start_sec"
+                            )
+                            clip_duration_val = _coerce_chunk_float(
+                                chunk, "clip_duration_sec"
+                            )
+                            if clip_duration_val <= 0:
+                                raise ValueError(
+                                    "chunk field 'clip_duration_sec' must be > 0"
+                                )
+                            clip_num = _coerce_chunk_num(chunk, chunk_idx)
+                            clip_id = str(
+                                chunk.get("clip_id")
+                                or _stable_chunk_id(
+                                    source_id,
+                                    clip_num,
+                                    clip_start_val,
+                                    clip_duration_val,
+                                )
+                            )
+                            try:
+                                subcut = cut.truncate(
+                                    offset=clip_start_val,
+                                    duration=clip_duration_val,
+                                    preserve_id=False,
+                                )
+                            except TypeError:
+                                subcut = cut.truncate(
+                                    offset=clip_start_val,
+                                    duration=clip_duration_val,
+                                )
+
+                            subcut = fastcopy(subcut, id=clip_id)
+                            subcut.custom = dict(custom or {})
+                            subcut.custom["source_recording_id"] = str(row_id)
+                            subcut.custom["global_offset_sec"] = clip_start_val
+                            chunk_lang = chunk.get("lang", lang)
+                            if chunk_lang is not None:
+                                subcut.custom["lang"] = chunk_lang
+                            if text:
+                                subcut.supervisions = [SupervisionSegment(
+                                    id=subcut.id,
+                                    recording_id=subcut.recording_id,
+                                    start=0.0,
+                                    duration=subcut.duration,
+                                    text=text,
+                                    language=chunk_lang,
+                                )]
+
+                            set_interleave_metadata(
+                                subcut,
+                                source_id,
+                                clip_num,
+                                clip_start=clip_start_val,
+                                clip_duration=clip_duration_val,
+                            )
+                            subcut, skip, decoded_audio = apply_audio_pipeline(
+                                subcut,
+                                target_sr=target_sr,
+                                tokenize_fn=_tokenize_text,
+                                runtime_counts=runtime_counts,
+                            )
+                            if skip:
+                                skipped += 1
+                                continue
+                            write_cut_to_shar(
+                                writer,
+                                subcut,
+                                audio=decoded_audio,
+                                runtime_counts=runtime_counts,
+                            )
+                            written += 1
+                            total_duration_sec += subcut.duration
+                            next_log_at = maybe_log_worker_progress(
+                                logger=logger,
+                                worker_id=worker_id,
+                                written=written,
+                                skipped=skipped,
+                                errors=errors,
+                                t0=t0,
+                                next_log_at=next_log_at,
+                            )
+                        continue
                     if text:
                         cut.supervisions = [SupervisionSegment(
                             id=cut.id,
@@ -310,11 +442,42 @@ def _convert_worker(args: ColumnarWorkerArgs):
 # ---------------------------------------------------------------------------
 
 
+def resolve(spec: PrepareSpec) -> tuple[list[str], dict]:
+    """Resolve parquet input shards for this prepare family."""
+    i = spec.input
+    parquet_dir = Path(i.parquet_dir)
+    resolved = sorted(str(p) for p in parquet_dir.glob(i.parquet_glob))
+    if not resolved:
+        raise FileNotFoundError(f"No files match {parquet_dir / i.parquet_glob}")
+    return resolved, {
+        "family": spec.family,
+        "parquet_dir": str(parquet_dir),
+        "parquet_glob": i.parquet_glob,
+        "resolved_inputs": resolved,
+    }
+
+
+def preflight(
+    spec: PrepareSpec,
+    *,
+    runtime_validator=validate_prepare_runtime,
+) -> None:
+    """Validate generic parquet prepare prerequisites."""
+    i, o = spec.input, spec.output
+    parquet_dir = Path(i.parquet_dir)
+    if not parquet_dir.is_dir():
+        raise NotADirectoryError(f"Parquet input dir not found: {parquet_dir}")
+    runtime_validator(
+        resampling_backend=o.resampling_backend,
+        require_ffmpeg=True,
+        text_tokenizer_path=o.text_tokenizer,
+    )
+
+
 def _preflight_prepare(spec: PrepareSpec, resolved: list[str]) -> None:
     import pyarrow.parquet as pq
 
     m = spec.metadata
-    o = spec.output
     sample_path = resolved[0]
     validate_columnar_schema_roots(
         available_roots=pq.ParquetFile(sample_path).schema_arrow.names,
@@ -326,6 +489,7 @@ def _preflight_prepare(spec: PrepareSpec, resolved: list[str]) -> None:
             getattr(m, "clip_start_column", None),
             getattr(m, "clip_end_column", None),
             getattr(m, "clip_duration_column", None),
+            getattr(m, "chunks_column", None),
         ),
         optional_columns=(
             m.text_column,
@@ -338,11 +502,7 @@ def _preflight_prepare(spec: PrepareSpec, resolved: list[str]) -> None:
         logger=logger,
     )
 
-    validate_prepare_runtime(
-        resampling_backend=o.resampling_backend,
-        require_ffmpeg=True,
-        text_tokenizer_path=o.text_tokenizer,
-    )
+    preflight(spec, runtime_validator=validate_prepare_runtime)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -379,20 +539,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(spec: PrepareSpec):
+def run(spec: PrepareSpec, *, resolved_inputs: list[str] | None = None):
     """Execute parquet prepare for a typed PrepareSpec.
 
     The standalone ``main(argv)`` path also feeds this; it parses argv, then
     routes the values through ``PrepareSpec`` so Hydra and CLI runs converge
     on one execution path.
     """
-    i, o, m = spec.input, spec.output, spec.metadata
-    parquet_dir = Path(i.parquet_dir)
+    o, m = spec.output, spec.metadata
     shar_dir = Path(o.shar_dir)
 
-    resolved = sorted(str(p) for p in parquet_dir.glob(i.parquet_glob))
-    if not resolved:
-        raise FileNotFoundError(f"No files match {parquet_dir / i.parquet_glob}")
+    resolved = coerce_resolved_inputs(spec, resolved_inputs)
 
     _preflight_prepare(spec, resolved)
 
@@ -454,6 +611,7 @@ def run(spec: PrepareSpec):
             clip_end_column=m.clip_end_column,
             clip_duration_column=m.clip_duration_column,
             read_batch_size=o.read_batch_size,
+            chunks_column=m.chunks_column,
         )
         for wid, parquets in enumerate(worker_parquets)
         if parquets

@@ -18,7 +18,6 @@ from audio_tokenization.config.schema import (
     InterleaveProductSpec,
     PrepareMetadataSpec,
     PrepareOutputSpec,
-    SftProductSpec,
     TokenizeDataloaderSpec,
     TokenizeFilterSpec,
     TokenizeOutputSpec,
@@ -105,10 +104,6 @@ def test_materialize_default_mirrors_schema_defaults():
     _assert_subset(
         materialize["materialize"]["interleave"], _schema_defaults(InterleaveProductSpec),
         "materialize/default.yaml materialize.interleave",
-    )
-    _assert_subset(
-        materialize["materialize"]["sft"], _schema_defaults(SftProductSpec),
-        "materialize/default.yaml materialize.sft",
     )
 
 

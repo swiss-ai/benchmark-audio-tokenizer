@@ -428,7 +428,6 @@ configs/pipeline/
 | `convert.*` | Raw source, conversion metadata, SHAR output, workers |
 | `tokenize.*` | SHAR input, tokenizer, filters, bucketing, DataLoader |
 | `materialize.interleave.*` | Interleave cache input and final sequence output |
-| `materialize.sft.*` | Future SFT product contract |
 | `runtime.resume` | Resume only when `_SUCCESS` and state fingerprints match |
 
 ```bash

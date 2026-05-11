@@ -11,14 +11,3 @@ materialize:
     transcribe_ratio: null
     num_workers: null
     tmp_dir: null
-  sft:
-    enabled: false
-    doc_manifest: null
-    audio_token_cache_dir: null
-    audio_token_cache_manifest: null
-    output_dir: null
-    tokenizer_path: null
-    chat_template: null
-    max_seq_len: 262144
-    num_workers: null
-    tmp_dir: null

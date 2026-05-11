@@ -42,23 +42,22 @@ def _write_vad_jsonl(
 
 
 def _worker_args(tmp_path: Path, jsonl_path: Path, audio_path: Path):
-    return (
-        0,
-        [str(jsonl_path)],
-        {"clip": audio_path},
-        str(tmp_path / "shar"),
-        None,
-        100,
-        "wav",
-        16000,
-        True,
-        200.0,
-        5.0,
-        16000,
-        1.0,
-        None,
-        ".wav",
-        "default",
+    return prepare_audio_dir_to_shar.AudioDirWorkerArgs(
+        worker_id=0,
+        jsonl_paths=(str(jsonl_path),),
+        audio_index={"clip": str(audio_path)},
+        shar_dir=str(tmp_path / "shar"),
+        target_sr=None,
+        shard_size=100,
+        shar_format="wav",
+        min_sr=16000,
+        mono_downmix=True,
+        vad_max_chunk_sec=200.0,
+        vad_min_chunk_sec=5.0,
+        vad_sample_rate=16000,
+        vad_max_merge_gap_sec=1.0,
+        vad_max_duration_sec=None,
+        resampling_backend="default",
     )
 
 

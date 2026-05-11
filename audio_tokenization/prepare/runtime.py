@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -10,7 +11,7 @@ import shutil
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.prepare.constants import (
@@ -27,18 +28,6 @@ from audio_tokenization.utils.stats import load_json_records, max_field, sum_cou
 
 
 logger = logging.getLogger(__name__)
-
-
-class PrepareStateLegacyError(RuntimeError):
-    """Raised by ``read_prepare_state`` for legacy state files.
-
-    Distinguishes the two legitimate "this output predates the typed state
-    contract" cases (no ``version`` field, or a ``version`` older than this code
-    knows) from genuine bugs (future-version downgrade, malformed payload,
-    non-int version). Provenance readers in ``stages/_provenance.py`` opt into
-    legacy tolerance by catching this subclass; everything else still fails
-    loud as a generic ``RuntimeError``.
-    """
 
 
 _PREPARE_TOTAL_FIELDS = ("written", "skipped", "errors", "total_duration_sec")
@@ -108,6 +97,39 @@ def validate_prepare_runtime(
         )
 
 
+def get_prepare_runner(spec):
+    """Import the runner module declared by the prepare input spec."""
+    return importlib.import_module(spec.input.RUNNER_MODULE)
+
+
+def resolve_prepare_inputs(spec) -> tuple[list[str], dict[str, Any]]:
+    """Resolve raw prepare inputs through the family runner."""
+    return get_prepare_runner(spec).resolve(spec)
+
+
+def coerce_resolved_inputs(spec, resolved_inputs: list[str] | None) -> list[str]:
+    """Use the stage-supplied input list when provided; otherwise resolve once.
+
+    Lets CLI-only runners (no upstream resolver) and stage-driven runs share one
+    code path while guaranteeing the actual glob runs exactly once per invocation.
+    """
+    if resolved_inputs is not None:
+        return list(resolved_inputs)
+    return resolve_prepare_inputs(spec)[0]
+
+
+def preflight_prepare_spec(
+    spec,
+    *,
+    runtime_validator: Callable[..., None] = validate_prepare_runtime,
+) -> None:
+    """Run generic prepare preflight through the family runner."""
+    return get_prepare_runner(spec).preflight(
+        spec,
+        runtime_validator=runtime_validator,
+    )
+
+
 def setup_partition_dir(
     part_dir: Path,
     *,
@@ -167,7 +189,7 @@ def read_prepare_state(
         raise RuntimeError(f"Invalid prepare state format: {state_path}")
 
     if "version" not in payload:
-        raise PrepareStateLegacyError(
+        raise RuntimeError(
             f"{state_label} at {state_path} has no version. Delete the output "
             "directory and rerun the stage."
         )
@@ -188,7 +210,7 @@ def read_prepare_state(
         )
 
     if version < expected_version:
-        raise PrepareStateLegacyError(
+        raise RuntimeError(
             f"{state_label} at {state_path} is stale version {version}; "
             f"expected {expected_version}. Delete the output "
             "directory and rerun the stage."

@@ -9,6 +9,7 @@ from audio_tokenization.config.schema import PrepareSpec
 from audio_tokenization.prepare.prepare_wds_to_shar import (
     SidecarMetadataProvider,
     TarScanResult,
+    WdsWorkerArgs,
     _convert_worker,
     iter_tar_cuts,
 )
@@ -270,27 +271,27 @@ def test_convert_worker_preserves_presegmented_clip_number_with_parser(monkeypat
     )
 
     result = _convert_worker(
-        (
-            0,
-            ["dataset.tar"],
-            str(tmp_path / "shar"),
-            None,
-            100,
-            "flac",
-            None,
-            None,
-            None,
-            False,
-            None,
-            200.0,
-            10.0,
-            16000,
-            0.5,
-            None,
-            None,
-            None,
-            "trailing_number",
-            None,
+        WdsWorkerArgs(
+            worker_id=0,
+            tar_paths=("dataset.tar",),
+            shar_dir=str(tmp_path / "shar"),
+            target_sr=None,
+            shard_size=100,
+            shar_format="flac",
+            min_sr=None,
+            text_field="text",
+            custom_fields=None,
+            mono_downmix=False,
+            vad_per_shard_dir=None,
+            vad_max_chunk_sec=200.0,
+            vad_min_chunk_sec=10.0,
+            vad_sample_rate=16000,
+            vad_max_merge_gap_sec=0.5,
+            vad_max_duration_sec=None,
+            text_tokenizer=None,
+            resampling_backend=None,
+            input_clip_id_parser_name="trailing_number",
+            language=None,
         )
     )
 
@@ -322,7 +323,10 @@ def test_run_uses_configured_mp_start_method_without_external_metadata(monkeypat
         }
     )
 
-    monkeypatch.setattr(prepare_wds_to_shar, "expand_path_patterns", lambda _patterns: ["/data/a.tar"])
+    monkeypatch.setattr(
+        "audio_tokenization.prepare.cli.expand_path_patterns",
+        lambda _patterns: ["/data/a.tar"],
+    )
     monkeypatch.setattr(prepare_wds_to_shar, "validate_prepare_runtime", lambda **_kwargs: None)
     monkeypatch.setattr(prepare_wds_to_shar, "write_prepare_state_for_spec", lambda _spec: None)
     monkeypatch.setattr(
@@ -332,11 +336,15 @@ def test_run_uses_configured_mp_start_method_without_external_metadata(monkeypat
     )
     monkeypatch.setattr(prepare_wds_to_shar, "load_text_tokenizer", lambda _path: None)
 
-    def fake_run_pool(_worker, _worker_args, _shar_dir, _num_workers, *, mp_start_method):
+    def fake_run_pool(_worker, worker_args, _shar_dir, _num_workers, *, mp_start_method):
         captured["mp_start_method"] = mp_start_method
+        captured["worker_args"] = worker_args
 
     monkeypatch.setattr(prepare_wds_to_shar, "run_pool_and_finalize", fake_run_pool)
 
     prepare_wds_to_shar.run(spec)
 
     assert captured["mp_start_method"] == "fork"
+    assert len(captured["worker_args"]) == 1
+    assert isinstance(captured["worker_args"][0], WdsWorkerArgs)
+    assert captured["worker_args"][0].tar_paths == ("/data/a.tar",)

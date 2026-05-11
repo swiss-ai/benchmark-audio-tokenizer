@@ -17,6 +17,7 @@ import pytest
 
 from audio_tokenization.config import load_dataset_spec
 from audio_tokenization.pipelines.shard_io import INTERLEAVE_CACHE_OUTPUT_STEM
+from audio_tokenization.stages._plans import ResolvedStagePlan
 from audio_tokenization.stages import clean_stages, plan_stages, run_stages, status_stages
 
 
@@ -72,7 +73,6 @@ def test_run_stages_materialize_disabled_by_default():
     assert result == {
         "materialize": {
             "interleave": {"skipped": True, "reason": "interleave.disabled"},
-            "sft": {"skipped": True, "reason": "sft.disabled"},
         }
     }
 
@@ -482,6 +482,34 @@ def test_run_tokenize_short_circuits_when_section_absent():
     assert run_tokenize(spec) == {"skipped": True, "reason": "tokenize.disabled"}
 
 
+def test_run_tokenize_does_not_call_plan_preflight_directly(tmp_path, monkeypatch):
+    from audio_tokenization.stages import tokenize as tokenize_stage
+
+    spec = load_dataset_spec(
+        _tokenize_spec_payload(str(tmp_path / "shar"), str(tmp_path / "out"))
+    )
+    plan = ResolvedStagePlan(
+        stage="tokenize",
+        enabled=True,
+        reason=None,
+        inputs={},
+        outputs={},
+        effective={},
+        fingerprint={},
+        output_dir=tmp_path / "out",
+        state_path=tmp_path / "out" / "tokenize_state.json",
+        success_marker=tmp_path / "out" / "_SUCCESS",
+        preflight=lambda: (_ for _ in ()).throw(
+            AssertionError("run_tokenize should not call plan.preflight()")
+        ),
+        execute=lambda resume: {"resume": resume},
+    )
+
+    monkeypatch.setattr(tokenize_stage, "resolve_tokenize_plan", lambda _spec: plan)
+
+    assert tokenize_stage.run_tokenize(spec, resume=False) == {"resume": False}
+
+
 def test_run_tokenize_requires_prepare_success_marker(tmp_path):
     from audio_tokenization.stages.tokenize import run_tokenize
 
@@ -777,7 +805,7 @@ def test_run_tokenize_distributed_nonzero_rank_does_not_cleanup(tmp_path, monkey
     assert not (final_dir / "_SUCCESS").exists()
 
 
-def test_read_prepare_provenance_tolerates_legacy_unversioned_state(tmp_path):
+def test_read_prepare_provenance_rejects_legacy_unversioned_state(tmp_path):
     from audio_tokenization.stages._provenance import read_prepare_provenance
 
     shar_dir = tmp_path / "legacy_shar"
@@ -790,12 +818,8 @@ def test_read_prepare_provenance_tolerates_legacy_unversioned_state(tmp_path):
     }
     (shar_dir / "_PREPARE_STATE.json").write_text(json.dumps(legacy_state) + "\n")
 
-    provenance = read_prepare_provenance([str(shar_dir)])
-    payload = provenance[str(shar_dir)]
-
-    assert payload["provenance_format"] == "opaque_legacy_prepare_state"
-    assert payload["payload"] == legacy_state
-    assert len(payload["sha256"]) == 64
+    with pytest.raises(RuntimeError, match="has no version"):
+        read_prepare_provenance([str(shar_dir)])
 
 
 def test_nonzero_rank_ignores_stale_tokenize_start_marker(tmp_path, monkeypatch):
@@ -1227,7 +1251,6 @@ def test_run_stages_all_runs_in_order_and_short_circuits():
         "tokenize": {"skipped": True, "reason": "tokenize.disabled"},
         "materialize": {
             "interleave": {"skipped": True, "reason": "interleave.disabled"},
-            "sft": {"skipped": True, "reason": "sft.disabled"},
         },
     }
 
@@ -1275,7 +1298,7 @@ def test_run_stages_all_end_to_end_control_plane(tmp_path, monkeypatch):
         }
     )
 
-    def fake_convert(_prepare_spec):
+    def fake_convert(_prepare_spec, **_kwargs):
         _write_cut_shar_index(shar_dir)
         write_prepare_state_for_spec(spec.convert)
         mark_partition_success(shar_dir)
@@ -1283,12 +1306,8 @@ def test_run_stages_all_end_to_end_control_plane(tmp_path, monkeypatch):
 
     monkeypatch.setattr("audio_tokenization.stages.convert.validate_prepare_runtime", lambda **_: None)
     monkeypatch.setattr(
-        "audio_tokenization.stages.convert._DISPATCH",
-        {"parquet": "test.fake_prepare_parquet_to_shar"},
-    )
-    monkeypatch.setattr(
-        "audio_tokenization.stages.convert.importlib.import_module",
-        lambda _name: type("FakePrepareModule", (), {"run": staticmethod(fake_convert)}),
+        "audio_tokenization.stages.convert.get_prepare_runner",
+        lambda _spec: type("FakePrepareModule", (), {"run": staticmethod(fake_convert)}),
     )
     def fake_tokenize(_spec, **kwargs):
         mark_partition_success(kwargs["final_output_dir"])
@@ -1374,7 +1393,39 @@ def test_run_materialize_interleave_disabled_returns_skip():
     )
     assert run_materialize_impl(spec) == {
         "interleave": {"skipped": True, "reason": "interleave.disabled"},
-        "sft": {"skipped": True, "reason": "sft.disabled"},
+    }
+
+
+def test_run_materialize_does_not_call_plan_preflight_directly(tmp_path, monkeypatch):
+    from audio_tokenization.stages import materialize as materialize_stage
+
+    spec = load_dataset_spec(
+        _interleave_spec_payload(
+            tokenize_output_dir=str(tmp_path / "tokenize"),
+            interleave_output_dir=str(tmp_path / "interleave"),
+        )
+    )
+    plan = ResolvedStagePlan(
+        stage="materialize",
+        enabled=True,
+        reason=None,
+        inputs={},
+        outputs={},
+        effective={},
+        fingerprint={},
+        output_dir=tmp_path / "interleave",
+        state_path=tmp_path / "interleave" / "products_interleave_state.json",
+        success_marker=tmp_path / "interleave" / "_SUCCESS",
+        preflight=lambda: (_ for _ in ()).throw(
+            AssertionError("run_materialize should not call plan.preflight()")
+        ),
+        execute=lambda resume: {"interleave": {"resume": resume}},
+    )
+
+    monkeypatch.setattr(materialize_stage, "resolve_materialize_plan", lambda _spec: plan)
+
+    assert materialize_stage.run_materialize(spec, resume=False) == {
+        "interleave": {"resume": False}
     }
 
 

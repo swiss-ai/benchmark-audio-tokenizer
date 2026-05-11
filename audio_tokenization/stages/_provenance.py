@@ -9,8 +9,6 @@ Why this exists:
 
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -20,10 +18,7 @@ from audio_tokenization.prepare.constants import (
     state_version_for_filename,
 )
 from audio_tokenization.prepare.metadata import normalize_optional_path
-from audio_tokenization.prepare.runtime import (
-    PrepareStateLegacyError,
-    read_prepare_state,
-)
+from audio_tokenization.prepare.runtime import read_prepare_state
 
 
 def read_stage_provenance(
@@ -89,35 +84,12 @@ def _read_upstream_state_for_provenance(
     *,
     state_filename: str,
 ) -> dict[str, Any]:
-    """Read an upstream state file for fingerprinting, tolerating legacy SHARs.
+    """Read an upstream state file for fingerprinting.
 
-    Stage ownership stays strict: convert resume still rejects stale or
-    unversioned prepare state through ``read_prepare_state``. Tokenize is only a
-    consumer of upstream SHARs, including legacy/external roots; for those, an
-    opaque content hash is enough to invalidate stale downstream resumes if the
-    upstream state changes.
-
-    Only ``PrepareStateLegacyError`` (no-version / stale-version) gets the
-    opaque-hash fallback. Future-version state, malformed payloads, or other
-    bugs still propagate as ``RuntimeError`` so downgrade and corruption
-    scenarios fail loud instead of silently being treated as legacy data.
+    Stage ownership stays strict: any upstream state file that exists must use
+    the current typed/versioned state contract. External SHAR roots without a
+    state file are still allowed; they are fingerprinted by resolved path only.
     """
-
-    try:
-        return read_prepare_state(
-            state_path, expected_version=state_version_for_filename(state_filename)
-        )
-    except PrepareStateLegacyError:
-        raw = state_path.read_bytes()
-        payload: Any
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            payload = None
-        legacy: dict[str, Any] = {
-            "provenance_format": "opaque_legacy_prepare_state",
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        }
-        if isinstance(payload, dict):
-            legacy["payload"] = payload
-        return legacy
+    return read_prepare_state(
+        state_path, expected_version=state_version_for_filename(state_filename)
+    )

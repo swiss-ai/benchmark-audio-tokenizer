@@ -52,6 +52,7 @@ class ColumnarWorkerArgs:
     clip_end_column: str | None
     clip_duration_column: str | None
     read_batch_size: int
+    chunks_column: str | None = None
 
 
 def add_columnar_metadata_args(

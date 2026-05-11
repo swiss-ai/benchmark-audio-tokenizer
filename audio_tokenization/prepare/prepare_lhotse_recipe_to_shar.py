@@ -318,8 +318,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(spec):
+def resolve(spec) -> tuple[list[str], dict]:
+    """Lhotse recipes materialize their own file list at runtime."""
+    i = spec.input
+    return [], {
+        "family": spec.family,
+        "recipe": i.recipe,
+        "corpus_dir": i.corpus_dir,
+        "split": i.split,
+        "language": spec.metadata.language,
+    }
+
+
+def preflight(
+    spec,
+    *,
+    runtime_validator=validate_prepare_runtime,
+) -> None:
+    """Validate generic lhotse_recipe prepare prerequisites."""
+    i, o = spec.input, spec.output
+    corpus_dir = Path(i.corpus_dir)
+    if not corpus_dir.exists():
+        raise FileNotFoundError(f"Lhotse corpus dir not found: {corpus_dir}")
+    json.loads(i.recipe_kwargs)
+    runtime_validator(
+        resampling_backend=None,
+        require_ffmpeg=False,
+        text_tokenizer_path=o.text_tokenizer,
+    )
+
+
+def run(spec, *, resolved_inputs: list[str] | None = None):
     """Execute lhotse_recipe prepare for a typed PrepareSpec."""
+    del resolved_inputs
     num_workers = spec.output.num_workers if spec.output.num_workers is not None else 64
     if spec.output.num_workers is None:
         spec = spec.model_copy(
@@ -332,11 +363,7 @@ def run(spec):
 
     extra_kwargs = json.loads(i.recipe_kwargs)
 
-    validate_prepare_runtime(
-        resampling_backend=None,
-        require_ffmpeg=False,
-        text_tokenizer_path=o.text_tokenizer,
-    )
+    preflight(spec, runtime_validator=validate_prepare_runtime)
 
     shar_dir.mkdir(parents=True, exist_ok=True)
     write_prepare_state_for_spec(spec)

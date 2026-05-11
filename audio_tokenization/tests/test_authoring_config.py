@@ -1,3 +1,5 @@
+import pytest
+
 from audio_tokenization.config import load_dataset_spec
 
 
@@ -105,7 +107,6 @@ def _authoring_interleaved_payload():
                 "num_workers": None,
                 "tmp_dir": None,
             },
-            "sft": {},
         },
     }
 
@@ -120,3 +121,11 @@ def test_authoring_materialize_null_interleave_defaults_do_not_suppress_override
     assert interleave.max_seq_len == 8192
     assert interleave.max_gap_sec == 5.0
     assert interleave.transcribe_ratio == 0.5
+
+
+def test_authoring_rejects_removed_sft_materialization_section():
+    payload = _authoring_interleaved_payload()
+    payload["materialization"]["sft"] = {"enabled": True}
+
+    with pytest.raises(ValueError, match=r"materialization\.sft.*not supported"):
+        load_dataset_spec(payload)

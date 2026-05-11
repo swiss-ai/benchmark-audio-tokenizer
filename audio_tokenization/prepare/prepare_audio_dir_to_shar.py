@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 import logging
 import time
 from pathlib import Path
@@ -40,6 +41,7 @@ from audio_tokenization.prepare.runtime import (
     ensure_worker_assignment,
     init_worker_process,
     maybe_log_worker_progress,
+    coerce_resolved_inputs,
     run_pool_and_finalize,
     validate_prepare_runtime,
     write_prepare_state_for_spec,
@@ -61,60 +63,63 @@ _ITEMS_KEY = "resolved_jsonls"
 _AUDIO_INDEX = None
 
 
+@dataclass(frozen=True, slots=True)
+class AudioDirWorkerArgs:
+    """Typed worker contract for audio-dir VAD prepare.
+
+    ``audio_index`` is ``None`` for fork workers, where the large index is
+    shared through the module global via copy-on-write. Spawn/forkserver workers
+    receive the index explicitly because they do not inherit module globals.
+    """
+
+    worker_id: int
+    jsonl_paths: tuple[str, ...]
+    audio_index: dict[str, str] | None
+    shar_dir: str
+    target_sr: int | None
+    shard_size: int
+    shar_format: str
+    min_sr: int | None
+    mono_downmix: bool
+    vad_max_chunk_sec: float
+    vad_min_chunk_sec: float
+    vad_sample_rate: int
+    vad_max_merge_gap_sec: float
+    vad_max_duration_sec: float | None
+    resampling_backend: str | None
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
 
-def _convert_worker(args_tuple):
+def _convert_worker(args: AudioDirWorkerArgs):
     """Convert a subset of VAD JSONL entries to Shar.
 
     Each worker writes to its own ``worker_XX/`` directory to avoid contention.
     Resume is considered complete only when ``worker_XX/_SUCCESS`` exists.
     """
-    if len(args_tuple) == 16 and isinstance(args_tuple[2], dict):
-        (
-            worker_id,
-            jsonl_paths,
-            audio_index,
-            shar_dir,
-            target_sr,
-            shard_size,
-            shar_format,
-            min_sr,
-            mono_downmix,
-            vad_max_chunk_sec,
-            vad_min_chunk_sec,
-            vad_sample_rate,
-            vad_max_merge_gap_sec,
-            vad_max_duration_sec,
-            audio_ext,
-            resampling_backend,
-        ) = args_tuple
-    else:
-        (
-            worker_id,
-            jsonl_paths,
-            shar_dir,
-            target_sr,
-            shard_size,
-            shar_format,
-            min_sr,
-            mono_downmix,
-            vad_max_chunk_sec,
-            vad_min_chunk_sec,
-            vad_sample_rate,
-            vad_max_merge_gap_sec,
-            vad_max_duration_sec,
-            audio_ext,
-            resampling_backend,
-        ) = args_tuple
-        audio_index = _AUDIO_INDEX
-        if audio_index is None:
-            raise RuntimeError(
-                "audio_dir worker did not receive an audio index. Use fork "
-                "start method for the shared-index path or pass the legacy "
-                "worker tuple containing audio_index."
-            )
+    worker_id = args.worker_id
+    jsonl_paths = args.jsonl_paths
+    audio_index = args.audio_index if args.audio_index is not None else _AUDIO_INDEX
+    shar_dir = args.shar_dir
+    target_sr = args.target_sr
+    shard_size = args.shard_size
+    shar_format = args.shar_format
+    min_sr = args.min_sr
+    mono_downmix = args.mono_downmix
+    vad_max_chunk_sec = args.vad_max_chunk_sec
+    vad_min_chunk_sec = args.vad_min_chunk_sec
+    vad_sample_rate = args.vad_sample_rate
+    vad_max_merge_gap_sec = args.vad_max_merge_gap_sec
+    vad_max_duration_sec = args.vad_max_duration_sec
+    resampling_backend = args.resampling_backend
+    if audio_index is None:
+        raise RuntimeError(
+            "audio_dir worker did not receive an audio index. Use fork "
+            "start method for the shared-index path or pass "
+            "AudioDirWorkerArgs.audio_index explicitly."
+        )
 
     reused = check_worker_reuse(worker_id, shar_dir)
     if reused is not None:
@@ -283,6 +288,40 @@ def _convert_worker(args_tuple):
 # CLI
 # ---------------------------------------------------------------------------
 
+def resolve(spec) -> tuple[list[str], dict]:
+    """Resolve VAD JSONL files for this prepare family."""
+    i = spec.input
+    if not i.jsonl_files:
+        raise ValueError("prepare.input.jsonl_files is required")
+    resolved = expand_path_patterns(i.jsonl_files)
+    if not resolved:
+        raise FileNotFoundError("No audio_dir JSONL files resolved")
+    return resolved, {
+        "family": spec.family,
+        "audio_root": i.audio_root,
+        "audio_ext": i.audio_ext,
+        "jsonl_files": list(i.jsonl_files),
+        "resolved_inputs": resolved,
+    }
+
+
+def preflight(
+    spec,
+    *,
+    runtime_validator=validate_prepare_runtime,
+) -> None:
+    """Validate generic audio-dir prepare prerequisites."""
+    i, o = spec.input, spec.output
+    audio_root = Path(i.audio_root)
+    if not audio_root.is_dir():
+        raise NotADirectoryError(f"Audio root not found: {audio_root}")
+    runtime_validator(
+        resampling_backend=o.resampling_backend,
+        require_ffmpeg=False,
+        text_tokenizer_path=None,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert audio dir + VAD JSONL -> Lhotse Shar (parallel)",
@@ -338,35 +377,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(spec):
+def run(spec, *, resolved_inputs: list[str] | None = None):
     """Execute audio_dir prepare for a typed PrepareSpec."""
     i, o = spec.input, spec.output
     audio_root = Path(i.audio_root)
     shar_dir = Path(o.shar_dir)
 
-    if not audio_root.is_dir():
-        raise NotADirectoryError(f"Audio root not found: {audio_root}")
-
-    resolved_jsonls = expand_path_patterns(i.jsonl_files)
-    if not resolved_jsonls:
-        raise FileNotFoundError(f"No files match patterns: {list(i.jsonl_files)}")
-
-    validate_prepare_runtime(
-        resampling_backend=o.resampling_backend,
-        require_ffmpeg=False,
-        text_tokenizer_path=None,
-    )
-
-    if i.vad_max_chunk_sec <= 0:
-        raise ValueError("vad_max_chunk_sec must be > 0")
-    if i.vad_min_chunk_sec < 0:
-        raise ValueError("vad_min_chunk_sec must be >= 0")
-    if i.vad_min_chunk_sec > i.vad_max_chunk_sec:
-        raise ValueError("vad_min_chunk_sec must be <= vad_max_chunk_sec")
-    if i.vad_sample_rate <= 0:
-        raise ValueError("vad_sample_rate must be > 0")
-    if i.vad_max_merge_gap_sec < 0:
-        raise ValueError("vad_max_merge_gap_sec must be >= 0")
+    resolved_jsonls = coerce_resolved_inputs(spec, resolved_inputs)
+    preflight(spec, runtime_validator=validate_prepare_runtime)
 
     logger.info(f"Building audio index from {audio_root} (*{i.audio_ext}) ...")
     t_idx = time.time()
@@ -394,27 +412,25 @@ def run(spec):
     for wid, jsonls in enumerate(worker_jsonls):
         if not jsonls:
             continue
-        common = (
-            wid,
-            jsonls,
-            str(shar_dir),
-            o.target_sr,
-            o.shard_size,
-            o.shar_format,
-            i.min_sr,
-            not i.no_mono_downmix,
-            i.vad_max_chunk_sec,
-            i.vad_min_chunk_sec,
-            i.vad_sample_rate,
-            i.vad_max_merge_gap_sec,
-            i.vad_max_duration_sec,
-            i.audio_ext,
-            o.resampling_backend,
+        worker_args.append(
+            AudioDirWorkerArgs(
+                worker_id=wid,
+                jsonl_paths=tuple(jsonls),
+                audio_index=None if use_shared_audio_index else audio_index,
+                shar_dir=str(shar_dir),
+                target_sr=o.target_sr,
+                shard_size=o.shard_size,
+                shar_format=o.shar_format,
+                min_sr=i.min_sr,
+                mono_downmix=not i.no_mono_downmix,
+                vad_max_chunk_sec=i.vad_max_chunk_sec,
+                vad_min_chunk_sec=i.vad_min_chunk_sec,
+                vad_sample_rate=i.vad_sample_rate,
+                vad_max_merge_gap_sec=i.vad_max_merge_gap_sec,
+                vad_max_duration_sec=i.vad_max_duration_sec,
+                resampling_backend=o.resampling_backend,
+            )
         )
-        if use_shared_audio_index:
-            worker_args.append(common)
-        else:
-            worker_args.append((wid, jsonls, audio_index, *common[2:]))
 
     try:
         run_pool_and_finalize(

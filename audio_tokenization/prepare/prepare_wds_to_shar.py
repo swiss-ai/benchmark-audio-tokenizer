@@ -72,6 +72,7 @@ from audio_tokenization.prepare.runtime import (
     ensure_worker_assignment,
     init_worker_process,
     maybe_log_worker_progress,
+    coerce_resolved_inputs,
     run_pool_and_finalize,
     validate_prepare_runtime,
     write_prepare_state_for_spec,
@@ -233,6 +234,32 @@ class ExternalMetadataProvider(MetadataProvider):
 _METADATA_PROVIDER: MetadataProvider | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class WdsWorkerArgs:
+    """Typed worker contract for WDS prepare."""
+
+    worker_id: int
+    tar_paths: tuple[str, ...]
+    shar_dir: str
+    target_sr: int | None
+    shard_size: int
+    shar_format: str
+    min_sr: int | None
+    text_field: str
+    custom_fields: tuple[str, ...] | None
+    mono_downmix: bool
+    vad_per_shard_dir: str | None
+    vad_max_chunk_sec: float
+    vad_min_chunk_sec: float
+    vad_sample_rate: int
+    vad_max_merge_gap_sec: float
+    vad_max_duration_sec: float | None
+    text_tokenizer: Any | None
+    resampling_backend: str | None
+    input_clip_id_parser_name: str | None
+    language: str | None
+
+
 def _parse_sidecar(
     raw: bytes, ext: str, text_field: str = "text",
     custom_fields: Optional[Tuple[str, ...]] = None,
@@ -342,35 +369,33 @@ def iter_tar_cuts(
 # Worker
 # ---------------------------------------------------------------------------
 
-def _convert_worker(args_tuple):
+def _convert_worker(args: WdsWorkerArgs):
     """Convert a subset of WDS tar shards to Shar.
 
     Each worker writes to its own ``worker_XX/`` directory to avoid contention.
     Resume is considered complete only when ``worker_XX/_SUCCESS`` exists.
     Partial output (cuts manifests without marker) is deleted and recomputed.
     """
-    (
-        worker_id,
-        tar_paths,
-        shar_dir,
-        target_sr,
-        shard_size,
-        shar_format,
-        min_sr,
-        text_field,
-        custom_fields,
-        mono_downmix,
-        vad_per_shard_dir,
-        vad_max_chunk_sec,
-        vad_min_chunk_sec,
-        vad_sample_rate,
-        vad_max_merge_gap_sec,
-        vad_max_duration_sec,
-        text_tokenizer,
-        resampling_backend,
-        input_clip_id_parser_name,
-        language,
-    ) = args_tuple
+    worker_id = args.worker_id
+    tar_paths = args.tar_paths
+    shar_dir = args.shar_dir
+    target_sr = args.target_sr
+    shard_size = args.shard_size
+    shar_format = args.shar_format
+    min_sr = args.min_sr
+    text_field = args.text_field
+    custom_fields = args.custom_fields
+    mono_downmix = args.mono_downmix
+    vad_per_shard_dir = args.vad_per_shard_dir
+    vad_max_chunk_sec = args.vad_max_chunk_sec
+    vad_min_chunk_sec = args.vad_min_chunk_sec
+    vad_sample_rate = args.vad_sample_rate
+    vad_max_merge_gap_sec = args.vad_max_merge_gap_sec
+    vad_max_duration_sec = args.vad_max_duration_sec
+    text_tokenizer = args.text_tokenizer
+    resampling_backend = args.resampling_backend
+    input_clip_id_parser_name = args.input_clip_id_parser_name
+    language = args.language
 
     reused = check_worker_reuse(worker_id, shar_dir)
     if reused is not None:
@@ -526,6 +551,41 @@ def _convert_worker(args_tuple):
 _ITEMS_KEY = "resolved_shards"
 
 
+def resolve(spec) -> tuple[list[str], dict]:
+    """Resolve WebDataset tar shards for this prepare family."""
+    i = spec.input
+    if not i.wds_shards:
+        raise ValueError("prepare.input.wds_shards is required")
+    resolved = expand_path_patterns(i.wds_shards)
+    if not resolved:
+        raise FileNotFoundError("No WDS shards resolved")
+    return resolved, {
+        "family": spec.family,
+        "wds_shards": list(i.wds_shards),
+        "resolved_inputs": resolved,
+    }
+
+
+def preflight(
+    spec,
+    *,
+    runtime_validator=validate_prepare_runtime,
+) -> None:
+    """Validate generic WDS prepare prerequisites."""
+    i, o = spec.input, spec.output
+    runtime_validator(
+        resampling_backend=o.resampling_backend,
+        require_ffmpeg=True,
+        text_tokenizer_path=o.text_tokenizer,
+    )
+    if i.vad_segmentation:
+        if i.vad_per_shard_dir is None:
+            raise ValueError("vad_per_shard_dir is required when vad_segmentation=true")
+        vad_dir = Path(i.vad_per_shard_dir)
+        if not vad_dir.is_dir():
+            raise NotADirectoryError(f"VAD per-shard dir not found: {vad_dir}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert standard WDS → Lhotse Shar (parallel)",
@@ -563,7 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(spec):
+def run(spec, *, resolved_inputs: list[str] | None = None):
     """Execute WDS prepare for a typed PrepareSpec."""
     i, o, m = spec.input, spec.output, spec.metadata
     shar_dir = Path(o.shar_dir)
@@ -571,15 +631,8 @@ def run(spec):
     if not i.wds_shards:
         raise ValueError("prepare.input.wds_shards is required")
 
-    resolved = expand_path_patterns(i.wds_shards)
-    if not resolved:
-        raise FileNotFoundError(f"No files match patterns: {list(i.wds_shards)}")
-
-    validate_prepare_runtime(
-        resampling_backend=o.resampling_backend,
-        require_ffmpeg=True,
-        text_tokenizer_path=o.text_tokenizer,
-    )
+    resolved = coerce_resolved_inputs(spec, resolved_inputs)
+    preflight(spec, runtime_validator=validate_prepare_runtime)
 
     vad_per_shard_dir = Path(i.vad_per_shard_dir) if i.vad_per_shard_dir else None
     if i.vad_segmentation and vad_per_shard_dir:
@@ -596,25 +649,6 @@ def run(spec):
             return
 
     if i.vad_segmentation:
-        if vad_per_shard_dir is None:
-            raise ValueError("vad_per_shard_dir is required with vad_segmentation")
-        if not vad_per_shard_dir.is_dir():
-            raise NotADirectoryError(f"VAD per-shard directory not found: {vad_per_shard_dir}")
-        if i.vad_max_chunk_sec <= 0:
-            raise ValueError("vad_max_chunk_sec must be > 0")
-        if i.vad_min_chunk_sec < 0:
-            raise ValueError("vad_min_chunk_sec must be >= 0")
-        if i.vad_min_chunk_sec > i.vad_max_chunk_sec:
-            raise ValueError("vad_min_chunk_sec must be <= vad_max_chunk_sec")
-        if i.vad_sample_rate <= 0:
-            raise ValueError("vad_sample_rate must be > 0")
-        if i.vad_max_merge_gap_sec < 0:
-            raise ValueError("vad_max_merge_gap_sec must be >= 0")
-        if m.input_clip_id_parser is not None:
-            raise ValueError(
-                "input_clip_id_parser cannot be combined with vad_segmentation; "
-                "input IDs already encode clip numbering."
-            )
         logger.info(f"VAD segmenting enabled: per_shard_dir={vad_per_shard_dir}")
     else:
         logger.info("VAD segmenting disabled; writing full recordings")
@@ -650,27 +684,27 @@ def run(spec):
     text_tokenizer = load_text_tokenizer(o.text_tokenizer)
 
     worker_args = [
-        (
-            wid,
-            shards,
-            str(shar_dir),
-            o.target_sr,
-            o.shard_size,
-            o.shar_format,
-            i.min_sr,
-            m.text_field,
-            tuple(m.custom_fields) if m.custom_fields else None,
-            not i.no_mono_downmix,
-            str(vad_per_shard_dir) if i.vad_segmentation else None,
-            i.vad_max_chunk_sec,
-            i.vad_min_chunk_sec,
-            i.vad_sample_rate,
-            i.vad_max_merge_gap_sec,
-            i.vad_max_duration_sec,
-            text_tokenizer,
-            o.resampling_backend,
-            m.input_clip_id_parser,
-            m.language,
+        WdsWorkerArgs(
+            worker_id=wid,
+            tar_paths=tuple(shards),
+            shar_dir=str(shar_dir),
+            target_sr=o.target_sr,
+            shard_size=o.shard_size,
+            shar_format=o.shar_format,
+            min_sr=i.min_sr,
+            text_field=m.text_field,
+            custom_fields=tuple(m.custom_fields) if m.custom_fields else None,
+            mono_downmix=not i.no_mono_downmix,
+            vad_per_shard_dir=str(vad_per_shard_dir) if i.vad_segmentation else None,
+            vad_max_chunk_sec=i.vad_max_chunk_sec,
+            vad_min_chunk_sec=i.vad_min_chunk_sec,
+            vad_sample_rate=i.vad_sample_rate,
+            vad_max_merge_gap_sec=i.vad_max_merge_gap_sec,
+            vad_max_duration_sec=i.vad_max_duration_sec,
+            text_tokenizer=text_tokenizer,
+            resampling_backend=o.resampling_backend,
+            input_clip_id_parser_name=m.input_clip_id_parser,
+            language=m.language,
         )
         for wid, shards in enumerate(worker_shards)
         if shards

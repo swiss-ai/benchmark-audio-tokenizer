@@ -1036,6 +1036,8 @@ def test_prepare_parquet_preflight_checks_runtime_and_logs_missing_optional_colu
     )
 
     spec = types.SimpleNamespace(
+        family="parquet",
+        input=types.SimpleNamespace(parquet_dir=str(tmp_path)),
         metadata=types.SimpleNamespace(
             audio_column="audio",
             id_column="audio.path",
@@ -1064,7 +1066,7 @@ def test_prepare_parquet_preflight_checks_runtime_and_logs_missing_optional_colu
     assert "duration" in caplog.text
 
 
-def test_prepare_parquet_preflight_raises_for_missing_required_audio_column(monkeypatch):
+def test_prepare_parquet_preflight_raises_for_missing_required_audio_column(monkeypatch, tmp_path):
     _install_fake_pyarrow(
         monkeypatch,
         _FakeArrowTable(
@@ -1081,6 +1083,8 @@ def test_prepare_parquet_preflight_raises_for_missing_required_audio_column(monk
     )
 
     spec = types.SimpleNamespace(
+        family="parquet",
+        input=types.SimpleNamespace(parquet_dir=str(tmp_path)),
         metadata=types.SimpleNamespace(
             audio_column="audio",
             id_column="id",

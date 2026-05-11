@@ -8,7 +8,7 @@ are not consulted here.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, Mapping
+from typing import Annotated, Any, ClassVar, Literal, Mapping
 
 from omegaconf import DictConfig, OmegaConf
 from pydantic import (
@@ -142,7 +142,20 @@ class SchemaModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class PrepareParquetInputSpec(SchemaModel):
+class PrepareInputSpec(SchemaModel):
+    """Base class for self-describing prepare family input specs."""
+
+    FAMILY: ClassVar[str]
+    RUNNER_MODULE: ClassVar[str]
+
+    def fingerprint_payload(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+class PrepareParquetInputSpec(PrepareInputSpec):
+    FAMILY: ClassVar[str] = "parquet"
+    RUNNER_MODULE: ClassVar[str] = "audio_tokenization.prepare.prepare_parquet_to_shar"
+
     parquet_dir: NonEmptyStr
     parquet_glob: NonEmptyStr = "*.parquet"
 
@@ -153,8 +166,11 @@ class PrepareParquetInputSpec(SchemaModel):
         }
 
 
-class PrepareHfInputSpec(SchemaModel):
+class PrepareHfInputSpec(PrepareInputSpec):
     """HuggingFace arrow-shard input. Either ``arrow_files`` or ``arrow_dir``."""
+
+    FAMILY: ClassVar[str] = "hf"
+    RUNNER_MODULE: ClassVar[str] = "audio_tokenization.prepare.prepare_hf_to_shar"
 
     arrow_dir: str | None = None
     arrow_glob: NonEmptyStr = "*.arrow"
@@ -174,8 +190,24 @@ class PrepareHfInputSpec(SchemaModel):
         }
 
 
-class PrepareWdsInputSpec(SchemaModel):
+def _check_vad_thresholds(spec: Any) -> None:
+    if spec.vad_max_chunk_sec <= 0:
+        raise ValueError("vad_max_chunk_sec must be > 0")
+    if spec.vad_min_chunk_sec < 0:
+        raise ValueError("vad_min_chunk_sec must be >= 0")
+    if spec.vad_min_chunk_sec > spec.vad_max_chunk_sec:
+        raise ValueError("vad_min_chunk_sec must be <= vad_max_chunk_sec")
+    if spec.vad_sample_rate <= 0:
+        raise ValueError("vad_sample_rate must be > 0")
+    if spec.vad_max_merge_gap_sec < 0:
+        raise ValueError("vad_max_merge_gap_sec must be >= 0")
+
+
+class PrepareWdsInputSpec(PrepareInputSpec):
     """Tar-archive input for WebDataset / external-metadata mode."""
+
+    FAMILY: ClassVar[str] = "wds"
+    RUNNER_MODULE: ClassVar[str] = "audio_tokenization.prepare.prepare_wds_to_shar"
 
     wds_shards: StrList
     min_sr: OptIntLike = None
@@ -194,6 +226,11 @@ class PrepareWdsInputSpec(SchemaModel):
             raise ValueError("convert.input.wds_shards must be a non-empty list")
         return self
 
+    @model_validator(mode="after")
+    def _validate_vad_thresholds(self):
+        _check_vad_thresholds(self)
+        return self
+
     def fingerprint_payload(self) -> dict[str, Any]:
         return {
             "wds_shards": _normalize_list_arg(self.wds_shards),
@@ -209,8 +246,11 @@ class PrepareWdsInputSpec(SchemaModel):
         }
 
 
-class PrepareAudioDirInputSpec(SchemaModel):
+class PrepareAudioDirInputSpec(PrepareInputSpec):
     """Audio-files-on-disk + per-language VAD JSONL input."""
+
+    FAMILY: ClassVar[str] = "audio_dir"
+    RUNNER_MODULE: ClassVar[str] = "audio_tokenization.prepare.prepare_audio_dir_to_shar"
 
     audio_root: NonEmptyStr
     jsonl_files: StrList
@@ -229,6 +269,11 @@ class PrepareAudioDirInputSpec(SchemaModel):
             raise ValueError("convert.input.jsonl_files must be a non-empty list")
         return self
 
+    @model_validator(mode="after")
+    def _validate_vad_thresholds(self):
+        _check_vad_thresholds(self)
+        return self
+
     def fingerprint_payload(self) -> dict[str, Any]:
         return {
             "audio_root": normalize_optional_path(self.audio_root),
@@ -244,8 +289,11 @@ class PrepareAudioDirInputSpec(SchemaModel):
         }
 
 
-class PrepareLhotseRecipeInputSpec(SchemaModel):
+class PrepareLhotseRecipeInputSpec(PrepareInputSpec):
     """Lhotse built-in recipe input (commonvoice, librispeech, voxpopuli, ...)."""
+
+    FAMILY: ClassVar[str] = "lhotse_recipe"
+    RUNNER_MODULE: ClassVar[str] = "audio_tokenization.prepare.prepare_lhotse_recipe_to_shar"
 
     recipe: NonEmptyStr
     corpus_dir: NonEmptyStr
@@ -267,12 +315,15 @@ class PrepareLhotseRecipeInputSpec(SchemaModel):
         }
 
 
-_INPUT_SPEC_BY_FAMILY: dict[str, type[SchemaModel]] = {
-    "parquet": PrepareParquetInputSpec,
-    "hf": PrepareHfInputSpec,
-    "wds": PrepareWdsInputSpec,
-    "audio_dir": PrepareAudioDirInputSpec,
-    "lhotse_recipe": PrepareLhotseRecipeInputSpec,
+_INPUT_SPEC_CLASSES: tuple[type[PrepareInputSpec], ...] = (
+    PrepareParquetInputSpec,
+    PrepareHfInputSpec,
+    PrepareWdsInputSpec,
+    PrepareAudioDirInputSpec,
+    PrepareLhotseRecipeInputSpec,
+)
+_INPUT_SPEC_BY_FAMILY: dict[str, type[PrepareInputSpec]] = {
+    cls.FAMILY: cls for cls in _INPUT_SPEC_CLASSES
 }
 
 
@@ -301,6 +352,7 @@ class PrepareMetadataSpec(SchemaModel):
     clip_start_column: str | None = None
     clip_end_column: str | None = None
     clip_duration_column: str | None = None
+    chunks_column: str | None = None
     id_column: IdColumn = None
     id_prefix: str | None = None
     language_column: str | None = None
@@ -322,10 +374,22 @@ class PrepareMetadataSpec(SchemaModel):
                 "clip_num_column requires source_id_column"
             )
         if self.input_clip_id_parser and (
-            self.source_id_column or self.clip_num_column
+            self.source_id_column or self.clip_num_column or self.chunks_column
         ):
             raise ValueError(
-                "set either source_id_column / clip_num_column or input_clip_id_parser, not both"
+                "set either source_id_column / clip_num_column / chunks_column "
+                "or input_clip_id_parser, not both"
+            )
+        if self.chunks_column and not self.source_id_column:
+            raise ValueError("chunks_column requires source_id_column")
+        if self.chunks_column and (
+            self.clip_num_column
+            or self.clip_start_column
+            or self.clip_end_column
+            or self.clip_duration_column
+        ):
+            raise ValueError(
+                "chunks_column cannot be combined with flat clip timeline columns"
             )
         if (self.clip_end_column or self.clip_duration_column) and not self.clip_start_column:
             raise ValueError(
@@ -350,9 +414,27 @@ class PrepareMetadataSpec(SchemaModel):
 class PrepareSpec(SchemaModel):
     enabled: StrictBool = True
     family: PrepareFamily
-    input: Any
+    input: PrepareInputSpec
     output: PrepareOutputSpec
     metadata: PrepareMetadataSpec
+
+    @model_validator(mode="after")
+    def _validate_input_clip_id_parser_compat(self):
+        if self.family != self.input.FAMILY:
+            raise ValueError(
+                f"convert.family={self.family!r} does not match input family "
+                f"{self.input.FAMILY!r}"
+            )
+        if (
+            self.family == "wds"
+            and getattr(self.input, "vad_segmentation", False)
+            and self.metadata.input_clip_id_parser is not None
+        ):
+            raise ValueError(
+                "input_clip_id_parser cannot be combined with vad_segmentation; "
+                "input IDs already encode clip numbering."
+            )
+        return self
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "PrepareSpec":
@@ -570,45 +652,10 @@ class InterleaveProductSpec(SchemaModel):
         }
 
 
-class SftProductSpec(SchemaModel):
-    """Post-tokenize SFT sequence product.
-
-    SFT assembly is a materialization product because it combines model-specific
-    text template rendering with already-tokenized audio components. The actual
-    assembler is intentionally wired separately from the schema so partial
-    configs can be validated before the implementation lands.
-    """
-
-    enabled: StrictBool = False
-    doc_manifest: str | None = None
-    audio_token_cache_dir: str | None = None
-    audio_token_cache_manifest: str | None = None
-    output_dir: str | None = None
-    tokenizer_path: str | None = None
-    chat_template: str | None = None
-    max_seq_len: IntLike = 262144
-    num_workers: OptIntLike = None
-    tmp_dir: str | None = None
-
-    def fingerprint_payload(self) -> dict[str, Any]:
-        """Output-shaping subset: excludes num_workers / tmp_dir."""
-        return {
-            "enabled": self.enabled,
-            "doc_manifest": normalize_optional_path(self.doc_manifest),
-            "audio_token_cache_dir": normalize_optional_path(self.audio_token_cache_dir),
-            "audio_token_cache_manifest": normalize_optional_path(self.audio_token_cache_manifest),
-            "output_dir": normalize_optional_path(self.output_dir),
-            "tokenizer_path": normalize_optional_path(self.tokenizer_path),
-            "chat_template": self.chat_template,
-            "max_seq_len": self.max_seq_len,
-        }
-
-
 class ProductMatrixSpec(SchemaModel):
     """Post-tokenize materializations."""
 
     interleave: InterleaveProductSpec = Field(default_factory=InterleaveProductSpec)
-    sft: SftProductSpec = Field(default_factory=SftProductSpec)
 
 
 class DatasetSpec(SchemaModel):
@@ -699,6 +746,7 @@ def _prepare_metadata_fingerprint(
             "metadata.clip_start_column": metadata.clip_start_column,
             "metadata.clip_end_column": metadata.clip_end_column,
             "metadata.clip_duration_column": metadata.clip_duration_column,
+            "metadata.chunks_column": metadata.chunks_column,
             "metadata.id_column": _normalize_id_column_arg(metadata.id_column),
             "metadata.id_prefix": metadata.id_prefix,
             "metadata.language_column": metadata.language_column,
