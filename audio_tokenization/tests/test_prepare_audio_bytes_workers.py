@@ -107,9 +107,16 @@ class _FakeSharWriter:
         self._sink.append(cut)
 
 
+def _fake_fastcopy(cut, **overrides):
+    for k, v in overrides.items():
+        setattr(cut, k, v)
+    return cut
+
+
 def _install_fake_lhotse(monkeypatch, written_cuts):
     fake_lhotse = types.ModuleType("lhotse")
     fake_lhotse.SupervisionSegment = _FakeSupervisionSegment
+    fake_lhotse.fastcopy = _fake_fastcopy
 
     fake_lhotse_shar = types.ModuleType("lhotse.shar")
     fake_lhotse_shar.SharWriter = lambda **kwargs: _FakeSharWriter(
