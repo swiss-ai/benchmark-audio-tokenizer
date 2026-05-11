@@ -1,113 +1,20 @@
-#!/usr/bin/env python3
 """Convert any Lhotse-supported dataset to Lhotse Shar format.
 
-Uses Lhotse's built-in recipes (100+ datasets) to create manifests, then
-spawns N parallel workers to convert to Shar. Each worker:
-  1. Takes its interleaved partition of the CutSet
-  2. Writes to ``part-{rank:05d}/`` via ``CutSet.to_shar()``
-
-After all workers finish, builds a merged ``shar_index.json``.
+Uses Lhotse's built-in recipes (100+ datasets) to materialize manifests, then
+spawns N parallel workers to convert to Shar. Each worker takes its interleaved
+partition of the CutSet and writes to ``part-{rank:05d}/``. After all workers
+finish, builds a merged ``shar_index.json``.
 
 Lhotse recipes return manifests in two shapes:
   - Flat:   {split: {"recordings": ..., "supervisions": ...}}
   - Nested: {language: {split: {"recordings": ..., "supervisions": ...}}}
-Use ``--language`` to navigate the nested case.
+Set ``metadata.language`` to navigate the nested case.
 
-Usage:
-    # Common Voice zh-CN unverified (nested by language)
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe commonvoice \
-        --corpus_dir /capstor/store/cscs/swissai/infra01/audio-datasets/raw/commonvoice24 \
-        --split other \
-        --language zh-CN \
-        --target_sample_rate 24000 \
-        --num_workers 64
-
-    # Common Voice es train with explicit output dir name
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe commonvoice \
-        --corpus_dir /capstor/store/cscs/swissai/infra01/audio-datasets/raw/commonvoice24 \
-        --split train \
-        --language es \
-        --shar_base_dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/commonvoice \
-        --shar_output_dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/commonvoice/es_train
-
-    # LibriSpeech (flat)
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe librispeech \
-        --corpus_dir /path/to/LibriSpeech \
-        --split train-clean-360 \
-        --num_workers 32
-
-    # VoxPopuli (recipe-specific kwargs still needed for non-standard params)
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe voxpopuli \
-        --corpus_dir /path/to/voxpopuli \
-        --split train \
-        --language en \
-        --recipe_kwargs '{"task": "asr"}' \
-        --num_workers 32
-
-    # Thorsten-DE (single-split dataset, use --split all)
-    PYTHONPATH=/iopsstor/scratch/cscs/xyixuan/dev/lhotse:$PYTHONPATH \
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe thorsten_de \
-        --corpus_dir /capstor/store/cscs/swissai/infra01/audio-datasets/raw/thorsten-de \
-        --split all \
-        --shar_base_dir /iopsstor/scratch/cscs/xyixuan/audio-datasets \
-        --text_tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json \
-        --num_workers 64
-
-    # AISHELL-1 (run once per split: train, dev, test)
-    PYTHONPATH=/iopsstor/scratch/cscs/xyixuan/dev/lhotse:$PYTHONPATH \
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe aishell \
-        --corpus_dir /capstor/store/cscs/swissai/infra01/audio-datasets/raw/aishell/aishell1 \
-        --split train \
-        --shar_base_dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2 \
-        --target_sample_rate 24000 \
-        --text_tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json \
-        --shar_shard_size 5000 \
-        --num_workers 64
-
-    # AISHELL-3 (run once per split: train, test)
-    PYTHONPATH=/iopsstor/scratch/cscs/xyixuan/dev/lhotse:$PYTHONPATH \
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe aishell3 \
-        --corpus_dir /capstor/store/cscs/swissai/infra01/audio-datasets/raw/aishell/aishell3 \
-        --split train \
-        --shar_base_dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2 \
-        --target_sample_rate 24000 \
-        --text_tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json \
-        --shar_shard_size 5000 \
-        --num_workers 64
-
-    # AISHELL-4 (run once per split: train_L, train_M, train_S, test; requires: pip install textgrid)
-    PYTHONPATH=/iopsstor/scratch/cscs/xyixuan/dev/lhotse:$PYTHONPATH \
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe aishell4 \
-        --corpus_dir /capstor/store/cscs/swissai/infra01/audio-datasets/raw/aishell/aishell4 \
-        --split train_L \
-        --shar_base_dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2 \
-        --target_sample_rate 24000 \
-        --text_tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json \
-        --shar_shard_size 5000 \
-        --num_workers 64
-
-    # HUI-Audio-Corpus-German (clean subset)
-    PYTHONPATH=/iopsstor/scratch/cscs/xyixuan/dev/lhotse:$PYTHONPATH \
-    python -m audio_tokenization.prepare.prepare_lhotse_recipe_to_shar \
-        --recipe hui_audio_corpus_german \
-        --corpus_dir /capstor/store/cscs/swissai/infra01/audio-datasets/raw/hui-audio-corpus-german \
-        --split clean \
-        --shar_base_dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2 \
-        --target_sample_rate 24000 \
-        --text_tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json \
-        --shar_shard_size 5000 \
-        --num_workers 64
+Invocation goes through the Hydra stage adapter:
+``python -m audio_tokenization run dataset=<name> stage=convert`` with a
+``configs/pipeline/dataset/<name>.yaml`` that picks the lhotse_recipe recipe.
 """
 
-import argparse
 import importlib
 import json
 import logging
@@ -261,63 +168,6 @@ def build_shar_index(shar_root: Path, index_filename: str, world_size: int):
     logger.info(f"Wrote merged index: {index_path} ({cuts_count} cut shards)")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="CPU-only parallel Lhotse recipe → Shar conversion",
-    )
-
-    # Recipe source
-    parser.add_argument("--recipe", required=True,
-                        help="Lhotse recipe name (e.g. commonvoice, librispeech, voxpopuli)")
-    parser.add_argument("--corpus_dir", type=Path, required=True,
-                        help="Path to the extracted corpus (passed to prepare_*)")
-    parser.add_argument("--split", required=True,
-                        help="Dataset split (e.g. train, dev, test, other, validated)")
-    parser.add_argument("--language", default=None,
-                        help="Language key for recipes that return nested dicts (e.g. zh-CN, en)")
-    parser.add_argument("--recipe_kwargs", default="{}",
-                        help='Extra kwargs for the recipe as JSON (e.g. \'{"splits": ["other"]}\')')
-
-    # Shar output
-    parser.add_argument("--shar_base_dir", type=Path,
-                        default=Path("/iopsstor/scratch/cscs/xyixuan/audio-datasets"))
-    parser.add_argument(
-        "--shar_output_dir",
-        type=Path,
-        default=None,
-        help=(
-            "Optional explicit output directory. If set, this is used directly "
-            "and --shar_base_dir + derived naming is skipped."
-        ),
-    )
-    parser.add_argument("--shar_shard_size", type=int, default=1000)
-    parser.add_argument("--shar_format", default="flac")
-    parser.add_argument("--shar_index_filename", default=SHAR_INDEX_FILENAME)
-
-    # Audio processing
-    parser.add_argument("--target_sample_rate", type=int, default=None)
-    parser.add_argument("--min_sample_rate", type=int, default=None,
-                        help="Drop cuts with sample rate below this threshold")
-
-    # Cut segmentation
-    parser.add_argument("--trim_to_supervisions", action="store_true", default=False,
-                        help="Segment cuts to supervision boundaries (one cut per supervision). "
-                             "Use for datasets with long recordings and many supervisions (e.g. meetings).")
-
-    # Text tokenization
-    parser.add_argument("--text_tokenizer", type=str, default=None,
-                        help="Path to tokenizer.json for pre-tokenizing supervision text")
-
-    # Parallelism
-    parser.add_argument("--num_workers", type=int, default=64)
-
-    return parser
-
-
 def resolve(spec) -> tuple[list[str], dict]:
     """Lhotse recipes materialize their own file list at runtime."""
     i = spec.input
@@ -465,51 +315,3 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
     logger.info("All done!")
 
 
-def _args_to_spec(args):
-    """Translate flat argparse Namespace → typed PrepareSpec.
-
-    The CLI's ``--shar_output_dir`` / ``--shar_base_dir`` derivation
-    happens here so the typed runner can assume a concrete ``shar_dir``.
-    """
-    from audio_tokenization.config.schema import PrepareSpec
-
-    if args.shar_output_dir is not None:
-        shar_dir = args.shar_output_dir
-    else:
-        parts = [args.recipe]
-        if args.language:
-            parts.append(args.language)
-        parts.append(args.split)
-        shar_dir = args.shar_base_dir / "_".join(parts)
-
-    return PrepareSpec.from_mapping({
-        "family": "lhotse_recipe",
-        "input": {
-            "recipe": args.recipe,
-            "corpus_dir": str(args.corpus_dir),
-            "split": args.split,
-            "recipe_kwargs": args.recipe_kwargs,
-            "min_sample_rate": args.min_sample_rate,
-            "trim_to_supervisions": args.trim_to_supervisions,
-            "shar_index_filename": args.shar_index_filename,
-        },
-        "output": {
-            "shar_dir": str(shar_dir),
-            "shard_size": args.shar_shard_size,
-            "shar_format": args.shar_format,
-            "target_sr": args.target_sample_rate,
-            "text_tokenizer": args.text_tokenizer,
-            "num_workers": args.num_workers,
-        },
-        "metadata": {
-            "language": args.language,
-        },
-    })
-
-
-def main(argv=None):
-    return run(_args_to_spec(build_parser().parse_args(argv)))
-
-
-if __name__ == "__main__":
-    main()

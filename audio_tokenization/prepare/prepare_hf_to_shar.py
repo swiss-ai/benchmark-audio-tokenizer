@@ -1,28 +1,13 @@
-#!/usr/bin/env python3
-"""Convert HF-style arrow files (with audio bytes) to Lhotse Shar format.
+"""Convert HF-style arrow shards (with audio bytes) to Lhotse Shar format.
 
-Designed for datasets stored as HuggingFace arrow shards (e.g. People's Speech
-with 786 arrow files). Each row has an audio struct with raw bytes and optional
-text transcription.
+Each row has an audio struct with raw bytes and optional text. Workers are
+assigned *whole arrow files* (not rows) via round-robin.
 
-Workers are assigned *whole arrow files* (not rows) via round-robin. With 786
-files / 128 workers, each worker handles ~6 files, giving good balance.
-
-Usage (People's Speech):
-    python -m audio_tokenization.prepare.prepare_hf_to_shar \
-        --arrow-dir /path/to/peoples_speech/arrow_files \
-        --shar-dir /path/to/output_shar \
-        --audio-column audio \
-        --text-column text \
-        --id-column id \
-        --target-sr 24000 \
-        --shard-size 2000 \
-        --shar-format flac \
-        --text-tokenizer /path/to/tokenizer.json \
-        --num-workers 128
+Invocation goes through the Hydra stage adapter:
+``python -m audio_tokenization run dataset=<name> stage=convert`` with a
+``configs/pipeline/dataset/<name>.yaml`` that picks the HF arrow recipe.
 """
 
-import argparse
 from collections import Counter
 import logging
 import time
@@ -34,15 +19,8 @@ from audio_tokenization.prepare.audio_ops import (
     extract_audio_bytes,
     write_cut_to_shar,
 )
-from audio_tokenization.prepare.cli import (
-    add_audio_processing_args,
-    add_external_metadata_args,
-    add_parallelism_args,
-    add_shar_output_args,
-    expand_path_patterns,
-)
+from audio_tokenization.prepare.cli import expand_path_patterns
 from audio_tokenization.prepare.columnar import (
-    add_columnar_metadata_args,
     ColumnarWorkerArgs,
     external_metadata_lookup_id,
     extract_clip_timestamps,
@@ -50,10 +28,7 @@ from audio_tokenization.prepare.columnar import (
     extract_row_metadata,
     validate_columnar_schema_roots,
 )
-from audio_tokenization.prepare.identity import (
-    add_input_clip_id_parser_arg,
-    set_interleave_metadata,
-)
+from audio_tokenization.prepare.identity import set_interleave_metadata
 from audio_tokenization.prepare.metadata import (
     load_external_metadata,
     resolve_sample_text_and_custom,
@@ -353,41 +328,6 @@ def _preflight_prepare(spec, resolved: list[str]) -> None:
     preflight(spec, runtime_validator=validate_prepare_runtime)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Convert HF arrow shards → Lhotse Shar (parallel)",
-    )
-
-    # Input (use --arrow-files for explicit list, or --arrow-dir + --arrow-glob)
-    parser.add_argument("--arrow-dir", type=Path, default=None,
-                        help="Directory containing arrow files")
-    parser.add_argument("--arrow-glob", type=str, default="*.arrow",
-                        help="Glob pattern for arrow files (default: '*.arrow')")
-    parser.add_argument("--arrow-files", nargs="+", default=None,
-                        help="Explicit list of arrow file paths (overrides --arrow-dir)")
-
-    add_shar_output_args(parser)
-    add_audio_processing_args(parser, target_sr_default=None)
-    add_columnar_metadata_args(
-        parser,
-        id_column_default="id",
-        text_column_default=None,
-    )
-    parser.add_argument(
-        "--read-batch-size",
-        type=int,
-        default=_DEFAULT_READ_BATCH_SIZE,
-        help=(
-            "Rows to materialize at once from each Arrow shard. "
-            "Lower values reduce worker RSS; default: 256."
-        ),
-    )
-    add_external_metadata_args(parser, include_custom_fields=True)
-    add_input_clip_id_parser_arg(parser)
-    add_parallelism_args(parser)
-    return parser
-
-
 def run(spec, *, resolved_inputs: list[str] | None = None):
     """Execute HF arrow prepare for a typed PrepareSpec."""
     i, o, m = spec.input, spec.output, spec.metadata
@@ -468,54 +408,3 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
     )
 
 
-def _args_to_spec(args):
-    from audio_tokenization.config.schema import PrepareSpec
-
-    return PrepareSpec.from_mapping({
-        "family": "hf",
-        "input": {
-            "arrow_dir": str(args.arrow_dir) if args.arrow_dir else None,
-            "arrow_glob": args.arrow_glob,
-            "arrow_files": args.arrow_files,
-        },
-        "output": {
-            "shar_dir": str(args.shar_dir),
-            "shard_size": args.shard_size,
-            "shar_format": args.shar_format,
-            "target_sr": args.target_sr,
-            "text_tokenizer": args.text_tokenizer,
-            "num_workers": args.num_workers,
-            "resampling_backend": args.resampling_backend,
-            "read_batch_size": args.read_batch_size,
-        },
-        "metadata": {
-            "audio_column": args.audio_column,
-            "text_column": args.text_column,
-            "source_id_column": args.source_id_column,
-            "clip_num_column": args.clip_num_column,
-            "clip_start_column": args.clip_start_column,
-            "clip_end_column": args.clip_end_column,
-            "clip_duration_column": args.clip_duration_column,
-            "id_column": args.id_column,
-            "id_prefix": None,
-            "language_column": args.language_column,
-            "language": args.language,
-            "custom_columns": args.custom_columns or [],
-            "constant_custom": {},
-            "derived_custom": {},
-            "text_tokenize_custom_columns": args.text_tokenize_custom_columns or [],
-            "external_metadata": args.external_metadata,
-            "custom_fields": args.custom_fields or [],
-            "id_field": args.id_field,
-            "text_field": args.text_field,
-            "input_clip_id_parser": args.input_clip_id_parser,
-        },
-    })
-
-
-def main(argv=None):
-    return run(_args_to_spec(build_parser().parse_args(argv)))
-
-
-if __name__ == "__main__":
-    main()

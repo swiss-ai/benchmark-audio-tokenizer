@@ -5,24 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Callable
 
-from audio_tokenization.utils.clip_id_parsers import available_clip_id_parsers
-
 INTERLEAVE_CUSTOM_KEY = "interleave"
-
-
-def add_input_clip_id_parser_arg(parser) -> None:
-    """Add a CLI option for parsing source sample IDs at prepare time."""
-    parser.add_argument(
-        "--input-clip-id-parser",
-        type=str,
-        choices=available_clip_id_parsers(),
-        default=None,
-        help=(
-            "Parse incoming sample IDs into (source_id, clip_num) before writing "
-            "interleave metadata. If unset, direct inputs keep raw_id as source_id "
-            "and chunked inputs use dense chunk numbering."
-        ),
-    )
 
 
 def resolve_input_source_and_clip_num(

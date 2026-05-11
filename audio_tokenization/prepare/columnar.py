@@ -7,10 +7,6 @@ import hashlib
 import math
 import re
 
-from audio_tokenization.prepare.cli import (
-    add_language_arg,
-    add_text_tokenizer_args,
-)
 from audio_tokenization.prepare.constants import _MISSING
 from audio_tokenization.prepare.identity import resolve_input_source_and_clip_num
 
@@ -53,48 +49,6 @@ class ColumnarWorkerArgs:
     clip_duration_column: str | None
     read_batch_size: int
     chunks_column: str | None = None
-
-
-def add_columnar_metadata_args(
-    parser,
-    *,
-    id_column_default=None,
-    text_column_default="text",
-    duration_column_default=None,
-):
-    """Add shared CLI args for extracting metadata from columnar sources."""
-    parser.add_argument("--id-column", type=str, nargs="*", default=id_column_default,
-                        help="Column name(s) for row ID. Multiple columns are joined with '_'. "
-                             "Dotted paths like 'audio.path' access nested struct fields. "
-                             "Omit to auto-generate IDs from filename + row index.")
-    parser.add_argument("--audio-column", type=str, default="audio",
-                        help="Column name for audio struct (default: 'audio')")
-    parser.add_argument("--text-column", type=str, default=text_column_default,
-                        help=f"Column name for transcription text (default: {text_column_default!r})")
-    parser.add_argument("--duration-column", type=str, default=duration_column_default,
-                        help="Column name for duration in seconds (for filtering)")
-    parser.add_argument("--source-id-column", type=str, default=None,
-                        help="Column name for interleave source_id. "
-                             "When clip timestamps are present, clip_num is only "
-                             "used as a deterministic tie-breaker.")
-    parser.add_argument("--clip-num-column", type=str, default=None,
-                        help="Column name for interleave clip_num. "
-                             "Use with --source-id-column to avoid parsing row IDs.")
-    parser.add_argument("--clip-start-column", type=str, default=None,
-                        help="Column name for segment start time in the source timeline")
-    parser.add_argument("--clip-end-column", type=str, default=None,
-                        help="Column name for segment end time in the source timeline")
-    parser.add_argument("--clip-duration-column", type=str, default=None,
-                        help="Column name for segment duration in the source timeline")
-    parser.add_argument("--chunks-column", type=str, default=None,
-                        help="Nested list column with VAD chunks for source-level parquet rows")
-    parser.add_argument("--language-column", type=str, default=None,
-                        help="Column name for per-row language code. "
-                             "Takes precedence over --language when set.")
-    parser.add_argument("--custom-columns", type=str, nargs="*", default=None,
-                        help="Additional columns to store in cut.custom dict")
-    add_language_arg(parser)
-    add_text_tokenizer_args(parser, include_custom_columns=True)
 
 
 def _require_id_field(row, col):

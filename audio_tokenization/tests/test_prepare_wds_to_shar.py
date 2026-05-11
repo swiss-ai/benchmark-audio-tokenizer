@@ -323,10 +323,6 @@ def test_run_uses_configured_mp_start_method_without_external_metadata(monkeypat
         }
     )
 
-    monkeypatch.setattr(
-        "audio_tokenization.prepare.cli.expand_path_patterns",
-        lambda _patterns: ["/data/a.tar"],
-    )
     monkeypatch.setattr(prepare_wds_to_shar, "validate_prepare_runtime", lambda **_kwargs: None)
     monkeypatch.setattr(prepare_wds_to_shar, "write_prepare_state_for_spec", lambda _spec: None)
     monkeypatch.setattr(
@@ -342,7 +338,7 @@ def test_run_uses_configured_mp_start_method_without_external_metadata(monkeypat
 
     monkeypatch.setattr(prepare_wds_to_shar, "run_pool_and_finalize", fake_run_pool)
 
-    prepare_wds_to_shar.run(spec)
+    prepare_wds_to_shar.run(spec, resolved_inputs=["/data/a.tar"])
 
     assert captured["mp_start_method"] == "fork"
     assert len(captured["worker_args"]) == 1

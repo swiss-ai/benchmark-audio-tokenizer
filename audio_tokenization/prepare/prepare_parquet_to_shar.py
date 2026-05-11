@@ -1,28 +1,14 @@
-#!/usr/bin/env python3
 """Convert HF-style parquet shards (with audio bytes) to Lhotse Shar format.
 
-Designed for the SPC-R (Speech Parliament Corpus) dataset which ships as ~130
-HuggingFace parquet shards. Each row has:
-- ``id``:       ``row{NNNNN}_seg{NNN}`` (source + segment)
-- ``duration``: float (some rows have <=0 duration with 0 audio bytes)
-- ``audio``:    struct ``{bytes: Binary, sampling_rate: Int64}`` (FLAC at 16kHz)
-- ``text``:     str (transcription)
+Each row carries an ``audio`` struct ``{bytes: Binary, sampling_rate: Int64}``
+plus an id, optional ``text``, and optional ``duration``. Workers are assigned
+*whole parquet files* (not rows) to keep input I/O per worker contiguous.
 
-Workers are assigned *whole parquet files* (not rows). With 130 files / 20
-workers, each worker handles ~6-7 files (~1001 rows each), giving good balance.
-
-Usage (SPC-R):
-    python -m audio_tokenization.prepare.prepare_parquet_to_shar \
-        --parquet-dir /capstor/store/cscs/swissai/infra01/audio-datasets/raw/spc-r-segmented/train \
-        --shar-dir /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/spc_r_segmented_shar \
-        --target-sr 24000 \
-        --shard-size 2000 \
-        --shar-format flac \
-        --text-tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json \
-        --num-workers 20
+Invocation goes through the Hydra stage adapter:
+``python -m audio_tokenization run dataset=<name> stage=convert`` with a
+``configs/pipeline/dataset/<name>.yaml`` that picks the parquet recipe.
 """
 
-import argparse
 from collections import Counter
 import logging
 import time
@@ -35,15 +21,8 @@ from audio_tokenization.prepare.audio_ops import (
     extract_audio_bytes,
     write_cut_to_shar,
 )
-from audio_tokenization.prepare.cli import (
-    add_audio_processing_args,
-    add_external_metadata_args,
-    add_parallelism_args,
-    add_shar_output_args,
-)
 from audio_tokenization.prepare.columnar import (
     _get_field,
-    add_columnar_metadata_args,
     ColumnarWorkerArgs,
     external_metadata_lookup_id,
     extract_clip_timestamps,
@@ -53,10 +32,7 @@ from audio_tokenization.prepare.columnar import (
     validate_columnar_schema_roots,
 )
 from audio_tokenization.prepare.constants import _MISSING
-from audio_tokenization.prepare.identity import (
-    add_input_clip_id_parser_arg,
-    set_interleave_metadata,
-)
+from audio_tokenization.prepare.identity import set_interleave_metadata
 from audio_tokenization.prepare.metadata import (
     load_external_metadata,
     resolve_sample_text_and_custom,
@@ -505,47 +481,8 @@ def _preflight_prepare(spec: PrepareSpec, resolved: list[str]) -> None:
     preflight(spec, runtime_validator=validate_prepare_runtime)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Convert HF parquet shards → Lhotse Shar (parallel)",
-    )
-
-    # Input
-    parser.add_argument("--parquet-dir", type=Path, required=True,
-                        help="Directory containing parquet files")
-    parser.add_argument("--parquet-glob", type=str, default="*.parquet",
-                        help="Glob pattern for parquet files (default: '*.parquet')")
-
-    add_shar_output_args(parser)
-    add_audio_processing_args(parser)
-    add_columnar_metadata_args(
-        parser,
-        text_column_default="text",
-        duration_column_default="duration",
-    )
-    parser.add_argument(
-        "--read-batch-size",
-        type=int,
-        default=_DEFAULT_READ_BATCH_SIZE,
-        help=(
-            "Rows to materialize at once from each parquet shard. "
-            "Lower values reduce worker RSS; default: 256."
-        ),
-    )
-    add_external_metadata_args(parser, include_custom_fields=True)
-    add_input_clip_id_parser_arg(parser)
-    add_parallelism_args(parser, include_mp_start_method=True)
-
-    return parser
-
-
 def run(spec: PrepareSpec, *, resolved_inputs: list[str] | None = None):
-    """Execute parquet prepare for a typed PrepareSpec.
-
-    The standalone ``main(argv)`` path also feeds this; it parses argv, then
-    routes the values through ``PrepareSpec`` so Hydra and CLI runs converge
-    on one execution path.
-    """
+    """Execute parquet prepare for a typed PrepareSpec."""
     o, m = spec.output, spec.metadata
     shar_dir = Path(o.shar_dir)
 
@@ -626,62 +563,3 @@ def run(spec: PrepareSpec, *, resolved_inputs: list[str] | None = None):
     )
 
 
-def _args_to_spec(args) -> PrepareSpec:
-    """Translate flat argparse Namespace → typed PrepareSpec.
-
-    The standalone CLI is a thin frontend: argv → Namespace (via
-    build_parser) → PrepareSpec → run(spec). This keeps the per-family
-    flat↔nested mapping co-located with the CLI it serves, and lets the
-    schema do all validation regardless of caller.
-    """
-    return PrepareSpec.from_mapping({
-        "family": "parquet",
-        "input": {
-            "parquet_dir": str(args.parquet_dir),
-            "parquet_glob": args.parquet_glob,
-        },
-        "output": {
-            "shar_dir": str(args.shar_dir),
-            "shard_size": args.shard_size,
-            "shar_format": args.shar_format,
-            "target_sr": args.target_sr,
-            "text_tokenizer": args.text_tokenizer,
-            "num_workers": args.num_workers,
-            "resampling_backend": args.resampling_backend,
-            "mp_start_method": args.mp_start_method,
-            "read_batch_size": args.read_batch_size,
-        },
-        "metadata": {
-            "audio_column": args.audio_column,
-            "text_column": args.text_column,
-            "duration_column": args.duration_column,
-            "source_id_column": args.source_id_column,
-            "clip_num_column": args.clip_num_column,
-            "clip_start_column": args.clip_start_column,
-            "clip_end_column": args.clip_end_column,
-            "clip_duration_column": args.clip_duration_column,
-            "chunks_column": args.chunks_column,
-            "id_column": args.id_column,
-            "id_prefix": None,
-            "language_column": args.language_column,
-            "language": args.language,
-            "custom_columns": args.custom_columns or [],
-            "constant_custom": {},
-            "derived_custom": {},
-            "text_tokenize_custom_columns": args.text_tokenize_custom_columns or [],
-            "external_metadata": args.external_metadata,
-            "custom_fields": args.custom_fields or [],
-            "id_field": args.id_field,
-            "text_field": args.text_field,
-            "input_clip_id_parser": args.input_clip_id_parser,
-        },
-    })
-
-
-def main(argv=None):
-    args = build_parser().parse_args(argv)
-    return run(_args_to_spec(args))
-
-
-if __name__ == "__main__":
-    main()

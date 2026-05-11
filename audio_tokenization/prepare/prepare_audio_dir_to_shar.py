@@ -1,30 +1,15 @@
-#!/usr/bin/env python3
 """Convert individual audio files + VAD JSONL to Lhotse Shar format.
 
 Reads audio files from a directory tree and VAD timestamps from JSONL files
-(one per language+year or arbitrary grouping), applies VAD-aware chunking
-via ``merge_and_pack_vad``, resamples to target SR, and writes to Shar.
+(one per language+year or arbitrary grouping), applies VAD-aware chunking,
+resamples to target SR, and writes to Shar. Designed for sources like
+VoxPopuli where audio is stored as individual files rather than tar shards.
 
-Each worker processes a subset of JSONL files and writes to its own
-``worker_XX/`` sub-directory.  After all workers finish, a merged
-``shar_index.json`` is written so that the tokenization pipeline can load
-the output directly.
-
-Designed for datasets like VoxPopuli where audio is stored as individual
-files (e.g. ``.ogg``) rather than WebDataset tar shards.
-
-Usage:
-    python -m audio_tokenization.prepare.prepare_audio_dir_to_shar \
-        --audio-root /capstor/.../voxpopuli/raw_audios \
-        --jsonl-files /capstor/.../per_lang_year/*.jsonl \
-        --shar-dir /iopsstor/.../voxpopuli_shar \
-        --target-sr 24000 \
-        --num-workers 272 \
-        --shard-size 2000 \
-        --shar-format flac
+Invocation goes through the Hydra stage adapter:
+``python -m audio_tokenization run dataset=<name> stage=convert`` with a
+``configs/pipeline/dataset/<name>.yaml`` that picks the audio_dir recipe.
 """
 
-import argparse
 from collections import Counter
 from dataclasses import dataclass
 import logging
@@ -322,61 +307,6 @@ def preflight(
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Convert audio dir + VAD JSONL -> Lhotse Shar (parallel)",
-    )
-
-    # Input
-    parser.add_argument("--audio-root", type=Path, required=None,
-                        help="Root directory of audio files (searched recursively)")
-    parser.add_argument("--audio-ext", type=str, default=".ogg",
-                        help="Audio file extension (default: .ogg)")
-    parser.add_argument("--jsonl-files", nargs="+", required=None,
-                        help="VAD JSONL file paths (shell glob expanded by caller)")
-
-    # Shar output
-    parser.add_argument("--shar-dir", type=Path, default=None,
-                        help="Output directory for Shar format")
-    parser.add_argument("--shard-size", type=int, default=2000,
-                        help="Samples per Shar shard (default: 2000)")
-    parser.add_argument("--shar-format", type=str, default="flac",
-                        choices=["flac", "wav", "mp3", "opus"],
-                        help="Audio format in Shar (default: flac)")
-
-    # Audio processing
-    parser.add_argument("--target-sr", type=int, default=24000,
-                        help="Target sample rate (default: 24000)")
-    parser.add_argument("--resampling-backend", type=str, default=None,
-                        choices=["default", "sox"],
-                        help="Lhotse resampling backend override (default: use "
-                             "$LHOTSE_RESAMPLING_BACKEND or 'default')")
-    parser.add_argument("--min-sr", type=int, default=16000,
-                        help="Drop audio below this sample rate (default: 16000)")
-    parser.add_argument("--no-mono-downmix", action="store_true",
-                        help="Select channel 0 instead of averaging stereo channels")
-
-    # VAD chunking
-    parser.add_argument("--vad-max-chunk-sec", type=float, default=200.0,
-                        help="Target max duration while packing VAD segments")
-    parser.add_argument("--vad-min-chunk-sec", type=float, default=5.0,
-                        help="Drop chunks shorter than this duration")
-    parser.add_argument("--vad-sample-rate", type=int, default=16000,
-                        help="Sample rate used to decode VAD timestamp units")
-    parser.add_argument("--vad-max-merge-gap-sec", type=float, default=1.0,
-                        help="Merge adjacent VAD spans when silence gap <= this threshold")
-    parser.add_argument("--vad-max-duration-sec", type=float, default=None,
-                        help="Drop atomic speech segments longer than this "
-                             "(default: same as --vad-max-chunk-sec)")
-    # Parallelism
-    parser.add_argument("--num-workers", type=int, default=None,
-                        help="Number of parallel workers (default: one per JSONL file)")
-    parser.add_argument("--mp-start-method", default="fork",
-                        help="multiprocessing start method (default: fork for shared audio index)")
-
-    return parser
-
-
 def run(spec, *, resolved_inputs: list[str] | None = None):
     """Execute audio_dir prepare for a typed PrepareSpec."""
     i, o = spec.input, spec.output
@@ -444,38 +374,3 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
         _AUDIO_INDEX = None
 
 
-def _args_to_spec(args):
-    from audio_tokenization.config.schema import PrepareSpec
-
-    return PrepareSpec.from_mapping({
-        "family": "audio_dir",
-        "input": {
-            "audio_root": str(args.audio_root) if args.audio_root else None,
-            "jsonl_files": args.jsonl_files or [],
-            "audio_ext": args.audio_ext,
-            "min_sr": args.min_sr,
-            "no_mono_downmix": args.no_mono_downmix,
-            "vad_max_chunk_sec": args.vad_max_chunk_sec,
-            "vad_min_chunk_sec": args.vad_min_chunk_sec,
-            "vad_sample_rate": args.vad_sample_rate,
-            "vad_max_merge_gap_sec": args.vad_max_merge_gap_sec,
-            "vad_max_duration_sec": args.vad_max_duration_sec,
-        },
-        "output": {
-            "shar_dir": str(args.shar_dir) if args.shar_dir else None,
-            "shard_size": args.shard_size,
-            "shar_format": args.shar_format,
-            "target_sr": args.target_sr,
-            "num_workers": args.num_workers,
-            "resampling_backend": args.resampling_backend,
-            "mp_start_method": args.mp_start_method,
-        },
-    })
-
-
-def main(argv=None):
-    return run(_args_to_spec(build_parser().parse_args(argv)))
-
-
-if __name__ == "__main__":
-    main()

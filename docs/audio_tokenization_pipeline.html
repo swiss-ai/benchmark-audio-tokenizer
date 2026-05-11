@@ -529,11 +529,7 @@ rank_0000_chunk_0000.idx  # doc index</code></pre>
 <h2>11. Quick Reference</h2>
 
 <pre><code># Step 1: Convert to Shar (includes text tokenization)
-python -m audio_tokenization.prepare.prepare_wds_to_shar \
-    --wds-shards '/data/shards/*.tar' \
-    --shar-dir /output/shar \
-    --text-tokenizer /path/to/tokenizer.json \
-    --target-sr 24000 --num-workers 32
+python -m audio_tokenization run dataset=&lt;dataset_name&gt; stage=convert
 
 # Step 2: GPU Tokenize
 srun --ntasks-per-node=4 --gpus-per-node=4 --kill-on-bad-exit=0 \

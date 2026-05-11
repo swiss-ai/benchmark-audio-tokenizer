@@ -1,0 +1,34 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# LibriHeavy large split: per-shard parquet → SHAR.
+# The SLURM array driver overrides source.path + outputs.shar_dir per task.
+
+name: libriheavy_large
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___mythicinfinity___libriheavy/default/large
+  files: "*.parquet"
+
+columns:
+  audio: audio
+  text: text_original
+  duration: audio_duration
+  id: id
+  keep:
+    - speaker_id
+    - librivox_book_id
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_2/libriheavy_large
+  name: libriheavy_large
+
+conversion:
+  num_workers: 32
+  shard_size: 20000
+  target_sr: 24000
+
+tokenization:
+  enabled: false

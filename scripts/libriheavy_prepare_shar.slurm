@@ -44,19 +44,11 @@ export LD_LIBRARY_PATH=/users/xyixuan/.local/ffmpeg/lib:${LD_LIBRARY_PATH:-}
 ulimit -n 65536
 uv pip install --python /opt/venv/bin/python polars
 
-python -m audio_tokenization.prepare.prepare_parquet_to_shar \
-    --parquet-dir "${PARQUET_ROOT}/${SHARD_ID}" \
-    --parquet-glob '*.parquet' \
-    --shar-dir "${NODE_SHAR_DIR}" \
-    --id-column id \
-    --audio-column audio \
-    --text-column text_original \
-    --duration-column audio_duration \
-    --custom-columns speaker_id librivox_book_id \
-    --text-tokenizer /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json \
-    --target-sr 24000 \
-    --shard-size 20000 \
-    --num-workers 32
+python -m audio_tokenization run \
+    dataset=libriheavy_large \
+    stage=convert \
+    dataset.source.path="${PARQUET_ROOT}/${SHARD_ID}" \
+    dataset.outputs.shar_dir="${NODE_SHAR_DIR}"
 
 echo ""
 echo "=========================================="

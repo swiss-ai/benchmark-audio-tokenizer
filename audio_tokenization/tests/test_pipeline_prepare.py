@@ -1032,36 +1032,6 @@ def test_prepare_state_ignores_unused_family_specific_knobs(tmp_path, family, pa
     _PREPARE_STATE_WRITERS[family](spec_v2)
 
 
-# ---------------------------------------------------------------------------
-# Per-family CLI smoke: each script's _args_to_spec(args) produces a valid
-# PrepareSpec for typical CLI invocations. Replaces the old
-# "namespace-parity" tests — under typed runners there's no Namespace to
-# compare; both Hydra and CLI converge on PrepareSpec via schema validation.
-# ---------------------------------------------------------------------------
-
-
-def test_parquet_cli_args_round_trip_to_spec():
-    args = prepare_parquet_to_shar.build_parser().parse_args([
-        "--parquet-dir", "/data/p",
-        "--shar-dir", "/out/p",
-    ])
-    spec = prepare_parquet_to_shar._args_to_spec(args)
-    assert spec.family == "parquet"
-    assert spec.input.parquet_dir == "/data/p"
-    assert spec.output.shar_dir == "/out/p"
-
-
-def test_hf_cli_args_round_trip_to_spec():
-    args = prepare_hf_to_shar.build_parser().parse_args([
-        "--arrow-dir", "/data/a",
-        "--shar-dir", "/out/a",
-    ])
-    spec = prepare_hf_to_shar._args_to_spec(args)
-    assert spec.family == "hf"
-    assert spec.input.arrow_dir == "/data/a"
-    assert spec.output.shar_dir == "/out/a"
-
-
 def test_parquet_run_builds_typed_columnar_worker_args(tmp_path, monkeypatch):
     in_dir = tmp_path / "parquet"
     out_dir = tmp_path / "shar"
@@ -1189,44 +1159,6 @@ def test_audio_dir_run_uses_shared_audio_index_with_fork(tmp_path, monkeypatch):
     assert worker_args.audio_index is None
     assert worker_args.jsonl_paths == (str(jsonl_path),)
     assert prepare_audio_dir_to_shar._AUDIO_INDEX is None
-
-
-def test_wds_cli_args_round_trip_to_spec():
-    args = prepare_wds_to_shar.build_parser().parse_args([
-        "--wds-shards", "/data/*.tar",
-        "--shar-dir", "/out/w",
-    ])
-    spec = prepare_wds_to_shar._args_to_spec(args)
-    assert spec.family == "wds"
-    assert spec.input.wds_shards == ["/data/*.tar"]
-    assert spec.output.shar_dir == "/out/w"
-
-
-def test_audio_dir_cli_args_round_trip_to_spec():
-    args = prepare_audio_dir_to_shar.build_parser().parse_args([
-        "--audio-root", "/data/audio",
-        "--jsonl-files", "/data/v.jsonl",
-        "--shar-dir", "/out/d",
-    ])
-    spec = prepare_audio_dir_to_shar._args_to_spec(args)
-    assert spec.family == "audio_dir"
-    assert spec.input.audio_root == "/data/audio"
-    assert spec.input.jsonl_files == ["/data/v.jsonl"]
-    assert spec.output.shar_dir == "/out/d"
-
-
-def test_lhotse_recipe_cli_args_round_trip_to_spec(tmp_path):
-    args = prepare_lhotse_recipe_to_shar.build_parser().parse_args([
-        "--recipe", "librispeech",
-        "--corpus_dir", str(tmp_path),
-        "--split", "test-clean",
-        "--shar_output_dir", str(tmp_path / "out"),
-    ])
-    spec = prepare_lhotse_recipe_to_shar._args_to_spec(args)
-    assert spec.family == "lhotse_recipe"
-    assert spec.input.recipe == "librispeech"
-    assert spec.input.split == "test-clean"
-    assert spec.output.shar_dir == str(tmp_path / "out")
 
 
 def test_run_convert_dispatch_skips_when_disabled():

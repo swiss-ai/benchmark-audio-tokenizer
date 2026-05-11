@@ -1,42 +1,22 @@
-#!/usr/bin/env python3
-"""Convert tar-based audio archives to Lhotse Shar format.
+"""Convert tar-based audio archives (WebDataset shards) to Lhotse Shar format.
 
 Supports two metadata modes:
 
 1. **Standard WDS** (default): Each tar shard contains paired audio +
    sidecar files (e.g. ``sample.wav`` + ``sample.txt``).
-
-2. **External metadata** (``--external-metadata``): Audio-only tar/tar.gz
-   archives with transcripts in a separate TSV or JSONL file. Useful for
-   datasets like GigaSpeech2, Common Voice, Suno, NB-Tale, etc.
+2. **External metadata** (``metadata.external_metadata``): Audio-only
+   tar/tar.gz archives with transcripts in a separate TSV or JSONL file.
 
 Creates Lhotse Cuts from raw audio bytes (Recording.from_bytes), resamples
 to target SR, and writes to Shar. Each worker processes a subset of tar
 shards and writes to its own ``worker_XX/`` sub-directory. After all workers
 finish, a merged ``shar_index.json`` is written.
 
-Usage (WDS mode):
-    python -m audio_tokenization.prepare.prepare_wds_to_shar \
-        --wds-shards '/path/to/shards/*.tar' \
-        --shar-dir /output/path/shar \
-        --target-sr 24000 \
-        --num-workers 288 \
-        --shard-size 2000 \
-        --shar-format flac \
-        --min-sr 16000
-
-Usage (external metadata mode — e.g. GigaSpeech2):
-    python -m audio_tokenization.prepare.prepare_wds_to_shar \
-        --wds-shards '/data/th/train/*.tar.gz' \
-        --external-metadata /data/th/train_refined.tsv \
-        --shar-dir /output/gigaspeech2_th/shar \
-        --target-sr 24000 \
-        --num-workers 64 \
-        --shard-size 5000 \
-        --shar-format flac
+Invocation goes through the Hydra stage adapter:
+``python -m audio_tokenization run dataset=<name> stage=convert`` with a
+``configs/pipeline/dataset/<name>.yaml`` that picks the WDS recipe.
 """
 
-import argparse
 from collections import Counter
 from dataclasses import dataclass
 import logging
@@ -49,16 +29,8 @@ from audio_tokenization.prepare.audio_ops import (
     build_recording_from_audio_bytes,
     write_cut_to_shar,
 )
-from audio_tokenization.prepare.cli import (
-    add_audio_processing_args,
-    add_external_metadata_args,
-    add_parallelism_args,
-    add_shar_output_args,
-    add_text_tokenizer_args,
-    expand_path_patterns,
-)
+from audio_tokenization.prepare.cli import expand_path_patterns
 from audio_tokenization.prepare.identity import (
-    add_input_clip_id_parser_arg,
     resolve_input_source_and_clip_num,
     set_interleave_metadata,
 )
@@ -586,43 +558,6 @@ def preflight(
             raise NotADirectoryError(f"VAD per-shard dir not found: {vad_dir}")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Convert standard WDS → Lhotse Shar (parallel)",
-    )
-
-    # Input
-    parser.add_argument("--wds-shards", type=str, nargs="+", default=None,
-                        help="Glob patterns or file paths for WDS tar shards")
-
-    add_shar_output_args(parser, shard_size_default=5000, shar_dir_required=False)
-    add_audio_processing_args(parser, include_min_sr=True, include_mono_downmix=True)
-
-    # Text / metadata
-    add_external_metadata_args(parser, include_custom_fields=True)
-    parser.add_argument("--language", type=str, default=None,
-                        help="Language tag to set on all supervisions (e.g. fi, en, zh)")
-    add_input_clip_id_parser_arg(parser)
-    add_text_tokenizer_args(parser)
-    add_parallelism_args(parser, num_workers_default=None)
-    parser.add_argument("--vad-segmentation", action="store_true",
-                        help="Split long recordings into speech-aware segments during prepare")
-    parser.add_argument("--vad-per-shard-dir", type=Path, default=None,
-                        help="Directory of per-shard VAD JSONL files (required with --vad-segmentation)")
-    parser.add_argument("--vad-max-chunk-sec", type=float, default=200.0,
-                        help="Target max duration while packing VAD segments")
-    parser.add_argument("--vad-min-chunk-sec", type=float, default=10.0,
-                        help="Drop chunks shorter than this duration")
-    parser.add_argument("--vad-sample-rate", type=int, default=16000,
-                        help="Sample rate used to decode VAD timestamp units")
-    parser.add_argument("--vad-max-merge-gap-sec", type=float, default=0.5,
-                        help="Merge adjacent VAD spans when silence gap <= this threshold")
-    parser.add_argument("--vad-max-duration-sec", type=float, default=None,
-                        help="Drop atomic speech segments longer than this "
-                             "(default: same as --vad-max-chunk-sec)")
-    return parser
-
-
 def run(spec, *, resolved_inputs: list[str] | None = None):
     """Execute WDS prepare for a typed PrepareSpec."""
     i, o, m = spec.input, spec.output, spec.metadata
@@ -714,46 +649,3 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
                           mp_start_method=mp_start_method)
 
 
-def _args_to_spec(args):
-    from audio_tokenization.config.schema import PrepareSpec
-
-    return PrepareSpec.from_mapping({
-        "family": "wds",
-        "input": {
-            "wds_shards": args.wds_shards or [],
-            "min_sr": args.min_sr,
-            "no_mono_downmix": args.no_mono_downmix,
-            "vad_segmentation": args.vad_segmentation,
-            "vad_per_shard_dir": str(args.vad_per_shard_dir) if args.vad_per_shard_dir else None,
-            "vad_max_chunk_sec": args.vad_max_chunk_sec,
-            "vad_min_chunk_sec": args.vad_min_chunk_sec,
-            "vad_sample_rate": args.vad_sample_rate,
-            "vad_max_merge_gap_sec": args.vad_max_merge_gap_sec,
-            "vad_max_duration_sec": args.vad_max_duration_sec,
-        },
-        "output": {
-            "shar_dir": str(args.shar_dir) if args.shar_dir else None,
-            "shard_size": args.shard_size,
-            "shar_format": args.shar_format,
-            "target_sr": args.target_sr,
-            "text_tokenizer": args.text_tokenizer,
-            "num_workers": args.num_workers,
-            "resampling_backend": args.resampling_backend,
-        },
-        "metadata": {
-            "external_metadata": args.external_metadata,
-            "custom_fields": args.custom_fields or [],
-            "id_field": args.id_field,
-            "text_field": args.text_field,
-            "language": args.language,
-            "input_clip_id_parser": args.input_clip_id_parser,
-        },
-    })
-
-
-def main(argv=None):
-    return run(_args_to_spec(build_parser().parse_args(argv)))
-
-
-if __name__ == "__main__":
-    main()
