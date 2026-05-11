@@ -106,16 +106,16 @@ def test_stage1_voxpopuli_vad_parquet_uses_generic_parquet_runner():
     assert spec.convert.family == "parquet"
     assert spec.convert.input.parquet_glob == "*/*.parquet"
     assert spec.convert.metadata.audio_column == "audio"
-    assert spec.convert.metadata.id_column == "id"
+    assert spec.convert.metadata.id_column == "source_id"
     assert spec.convert.metadata.custom_columns == [
-        "lang",
-        "source_recording_id",
-        "global_offset_sec",
+        "source_path",
+        "source_duration_sec",
+        "source_sample_rate",
+        "vad_jsonl",
+        "vad_sample_rate",
     ]
     assert spec.convert.metadata.source_id_column == "source_id"
-    assert spec.convert.metadata.clip_num_column == "clip_num"
-    assert spec.convert.metadata.clip_start_column == "clip_start_sec"
-    assert spec.convert.metadata.clip_duration_column == "clip_duration_sec"
+    assert spec.convert.metadata.chunks_column == "chunks"
 
 
 def test_load_dataset_spec_does_not_reconfigure_logging(monkeypatch):

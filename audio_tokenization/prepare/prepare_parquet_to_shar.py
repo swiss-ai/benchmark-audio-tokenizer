@@ -660,6 +660,7 @@ def _args_to_spec(args) -> PrepareSpec:
             "clip_start_column": args.clip_start_column,
             "clip_end_column": args.clip_end_column,
             "clip_duration_column": args.clip_duration_column,
+            "chunks_column": args.chunks_column,
             "id_column": args.id_column,
             "id_prefix": None,
             "language_column": args.language_column,

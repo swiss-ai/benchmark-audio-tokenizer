@@ -33,6 +33,7 @@ metadata:
   clip_start_column: null
   clip_end_column: null
   clip_duration_column: null
+  chunks_column: null
   id_column: null
   id_prefix: null
   language_column: null

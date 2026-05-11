@@ -86,6 +86,8 @@ def add_columnar_metadata_args(
                         help="Column name for segment end time in the source timeline")
     parser.add_argument("--clip-duration-column", type=str, default=None,
                         help="Column name for segment duration in the source timeline")
+    parser.add_argument("--chunks-column", type=str, default=None,
+                        help="Nested list column with VAD chunks for source-level parquet rows")
     parser.add_argument("--language-column", type=str, default=None,
                         help="Column name for per-row language code. "
                              "Takes precedence over --language when set.")

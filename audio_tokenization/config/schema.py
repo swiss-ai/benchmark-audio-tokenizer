@@ -403,6 +403,7 @@ class PrepareMetadataSpec(SchemaModel):
             self.source_id_column
             and not self.clip_num_column
             and not self.clip_start_column
+            and not self.chunks_column
         ):
             raise ValueError(
                 "source_id_column without clip_num_column requires clip_start_column "
