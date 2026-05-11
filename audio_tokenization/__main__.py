@@ -4,9 +4,12 @@
 Examples::
 
     python -m audio_tokenization run dataset=infore2 stage=convert
-    python -m audio_tokenization plan dataset=infore2 stage=all
+    python -m audio_tokenization plan dataset=infore2                    # all three
     python -m audio_tokenization status dataset=infore2 stage=tokenize
     python -m audio_tokenization clean dataset=infore2 stage=materialize
+
+``stage`` is always a single name. ``run`` and ``clean`` require it.
+``plan`` / ``status`` default to inspecting all three when ``stage`` is unset.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ def _execute_command(command: Command, cfg) -> dict[str, Any]:
         logger.info("Pipeline config:\n%s", OmegaConf.to_yaml(cfg))
 
     spec = load_dataset_spec(cfg.dataset)
-    stage = cfg.get("stage", "all")
+    stage = None if OmegaConf.is_missing(cfg, "stage") else cfg.get("stage")
     runtime = cfg.get("runtime") or {}
     resume = bool(runtime.get("resume", True))
 

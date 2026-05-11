@@ -44,9 +44,10 @@ def resolve_authoring_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     source_type = _str_value(source.get("type") or recipe.get("source_type"), "source.type")
     pipeline_mode = _str_value(recipe.get("mode"), "recipe.mode")
 
-    canonical: dict[str, Any] = {
-        "name": name,
-        "convert": _build_convert(
+    canonical: dict[str, Any] = {"name": name}
+
+    if outputs.get("shar_dir") is not None:
+        canonical["convert"] = _build_convert(
             source_type=source_type,
             source=source,
             columns=columns,
@@ -55,11 +56,9 @@ def resolve_authoring_config(payload: Mapping[str, Any]) -> dict[str, Any]:
             tokenizer=tokenizer,
             conversion=conversion,
             language=data.get("language"),
-        ),
-    }
+        )
 
-    tokenize_enabled = bool(tokenization.get("enabled", _get(recipe, "tokenize")))
-    if tokenize_enabled:
+    if outputs.get("tokenized_dir") is not None:
         canonical["tokenize"] = _build_tokenize(
             name=name,
             pipeline_mode=pipeline_mode,

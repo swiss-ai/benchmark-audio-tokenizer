@@ -1,8 +1,20 @@
-"""Stage adapters for the unified audio-pipeline entrypoint."""
+"""Stage adapters for the unified audio-pipeline entrypoint.
+
+Per-function stage semantics:
+
+* ``run_stages``: stage is a required single name. Multi-stage is not supported
+  because ``convert`` (CPU/IO-bound), ``tokenize`` (GPU-distributed) and
+  ``materialize`` (CPU-only) have different cluster resource profiles and
+  cannot share a Slurm allocation — each gets its own job.
+* ``plan_stages`` / ``status_stages``: stage is a single name or ``None``
+  (inspects all three).
+* ``clean_stages``: stage is a required single name (destructive — never
+  defaulted).
+"""
 
 from __future__ import annotations
 
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 
 from audio_tokenization.config.schema import DatasetSpec
 from ._plans import ResolvedStagePlan, clean_stage_plan, inspect_stage_plan
@@ -11,7 +23,6 @@ from .materialize import resolve_materialize_plan, run_materialize
 from .tokenize import resolve_tokenize_plan, run_tokenize
 
 
-Stage = Literal["convert", "tokenize", "materialize", "all"]
 _STAGES: tuple[str, ...] = ("convert", "tokenize", "materialize")
 
 
@@ -27,48 +38,44 @@ _STAGE_RESOLVE: dict[str, Callable[[DatasetSpec], ResolvedStagePlan]] = {
 }
 
 
-def _requested_stages(stage: Stage) -> tuple[str, ...]:
-    if stage not in _STAGES and stage != "all":
+def _check_known(stage: str) -> str:
+    if stage not in _STAGES:
+        raise ValueError(f"Unknown stage {stage!r}; valid: {list(_STAGES)}")
+    return stage
+
+
+def _require_single_stage(stage: str | None, *, command: str) -> str:
+    if not stage:
         raise ValueError(
-            f"Unknown stage {stage!r}; expected one of "
-            f"{_STAGES + ('all',)}"
+            f"{command} requires stage=<convert|tokenize|materialize> (got {stage!r})"
         )
-    return _STAGES if stage == "all" else (stage,)
+    return _check_known(stage)
 
 
-def resolve_stage_plans(
-    spec: DatasetSpec,
-    *,
-    stage: Stage = "all",
-) -> dict[str, ResolvedStagePlan]:
-    requested = _requested_stages(stage)
-    return {s: _STAGE_RESOLVE[s](spec) for s in requested}
+def _inspection_stages(stage: str | None) -> tuple[str, ...]:
+    if not stage:
+        return _STAGES
+    return (_check_known(stage),)
 
 
 def run_stages(
     spec: DatasetSpec,
     *,
-    stage: Stage = "all",
+    stage: str | None,
     resume: bool = True,
 ) -> dict[str, dict[str, Any]]:
-    """Run one or all pipeline stages for *spec*.
-
-    ``stage="all"`` runs convert → tokenize → materialize in order. Each
-    stage may raise if its input prerequisite is missing — the caller
-    must address that (e.g. run ``stage=convert`` first), not skip
-    silently.
-    """
-    requested = _requested_stages(stage)
-    return {s: _STAGE_DISPATCH[s](spec, resume=resume) for s in requested}
+    """Run exactly one pipeline stage for *spec*."""
+    name = _require_single_stage(stage, command="run")
+    return {name: _STAGE_DISPATCH[name](spec, resume=resume)}
 
 
 def plan_stages(
     spec: DatasetSpec,
     *,
-    stage: Stage = "all",
+    stage: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     payload: dict[str, dict[str, Any]] = {}
-    for name in _requested_stages(stage):
+    for name in _inspection_stages(stage):
         try:
             payload[name] = inspect_stage_plan(_STAGE_RESOLVE[name](spec))
         except Exception as exc:
@@ -85,7 +92,7 @@ def plan_stages(
 def status_stages(
     spec: DatasetSpec,
     *,
-    stage: Stage = "all",
+    stage: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     return plan_stages(spec, stage=stage)
 
@@ -93,17 +100,15 @@ def status_stages(
 def clean_stages(
     spec: DatasetSpec,
     *,
-    stage: Stage = "all",
+    stage: str | None,
 ) -> dict[str, dict[str, Any]]:
-    plans = resolve_stage_plans(spec, stage=stage)
-    order = tuple(reversed(list(plans))) if stage == "all" else tuple(plans)
-    return {name: clean_stage_plan(plans[name]) for name in order}
+    name = _require_single_stage(stage, command="clean")
+    plan = _STAGE_RESOLVE[name](spec)
+    return {name: clean_stage_plan(plan)}
 
 
 __all__ = [
-    "Stage",
     "ResolvedStagePlan",
-    "resolve_stage_plans",
     "plan_stages",
     "status_stages",
     "clean_stages",

@@ -3,8 +3,10 @@ defaults:
   - /tokenizer/apertus_wavtok@_here_
   - _self_
 
-# LibriHeavy large split: per-shard parquet → SHAR.
+# LibriHeavy large split: per-shard parquet -> SHAR (convert only).
 # The SLURM array driver overrides source.path + outputs.shar_dir per task.
+# No outputs.tokenized_dir -> the tokenize stage is intentionally absent;
+# tokenization runs on a separate GPU job against the produced SHAR root.
 
 name: libriheavy_large
 

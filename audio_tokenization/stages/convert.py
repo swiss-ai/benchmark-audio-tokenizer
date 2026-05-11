@@ -17,7 +17,10 @@ from audio_tokenization.prepare.runtime import (
     resolve_prepare_inputs,
     validate_prepare_runtime,
 )
-from audio_tokenization.stages._plans import ResolvedStagePlan, disabled_stage_plan
+from audio_tokenization.stages._plans import (
+    ResolvedStagePlan,
+    disabled_stage_plan,
+)
 from audio_tokenization.stages._resume import try_skip_if_complete
 
 
@@ -62,7 +65,12 @@ def resolve_convert_plan(spec: DatasetSpec) -> ResolvedStagePlan:
 
 
 def run_convert(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
-    if spec.convert is None or not spec.convert.enabled:
+    if spec.convert is None:
+        raise ValueError(
+            "stage=convert requested but DatasetSpec has no convert section. "
+            "Add outputs.shar_dir to the dataset YAML to enable this stage."
+        )
+    if not spec.convert.enabled:
         return {"skipped": True, "reason": "convert.disabled"}
 
     # Skip BEFORE plan resolution so a completed convert can be reused on

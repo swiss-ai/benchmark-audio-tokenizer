@@ -1,7 +1,6 @@
 recipe:
   mode: audio_only
   source_type: wds
-  tokenize: true
   materialize_interleave: false
 
 source:

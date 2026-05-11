@@ -8,7 +8,8 @@ import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from audio_tokenization.__main__ import _split_command
+from audio_tokenization import __main__ as audio_main
+from audio_tokenization.__main__ import _compose_pipeline_cfg, _split_command
 from audio_tokenization.config import load_dataset_spec
 from audio_tokenization.config.schema import (
     _INPUT_SPEC_BY_FAMILY,
@@ -1344,6 +1345,51 @@ def test_split_command_explicit_status():
         "status",
         ["dataset=infore2"],
     )
+
+
+def test_root_pipeline_config_leaves_stage_missing_without_override():
+    cfg = _compose_pipeline_cfg(["dataset=libriheavy_large"])
+
+    assert OmegaConf.is_missing(cfg, "stage")
+    assert cfg.dataset.name == "libriheavy_large"
+
+
+def test_root_pipeline_config_accepts_explicit_stage_override():
+    cfg = _compose_pipeline_cfg(["dataset=libriheavy_large", "stage=convert"])
+
+    assert cfg.stage == "convert"
+    assert cfg.dataset.name == "libriheavy_large"
+
+
+def test_plan_without_stage_override_inspects_all_stages(monkeypatch):
+    cfg = _compose_pipeline_cfg(["dataset=libriheavy_large"])
+    seen: dict[str, object] = {}
+
+    def _fake_plan(_spec, *, stage):
+        seen["stage"] = stage
+        return {"convert": {}, "tokenize": {}, "materialize": {}}
+
+    monkeypatch.setattr(audio_main, "plan_stages", _fake_plan)
+
+    result = audio_main._execute_command("plan", cfg)
+
+    assert seen["stage"] is None
+    assert result["stage"] is None
+    assert set(result["stages"]) == {"convert", "tokenize", "materialize"}
+
+
+def test_run_without_stage_override_fails_before_defaulting_to_convert(monkeypatch):
+    cfg = _compose_pipeline_cfg(["dataset=libriheavy_large"])
+
+    def _fake_run(_spec, *, stage, resume):
+        if stage is None:
+            raise ValueError("run requires stage=<convert|tokenize|materialize>")
+        raise AssertionError(f"unexpected stage default: {stage!r}")
+
+    monkeypatch.setattr(audio_main, "run_stages", _fake_run)
+
+    with pytest.raises(ValueError, match="run requires stage"):
+        audio_main._execute_command("run", cfg)
 
 
 def test_unsupported_family_raises_at_load_time():

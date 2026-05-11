@@ -1,7 +1,6 @@
 recipe:
   mode: audio_text_interleaved
   source_type: parquet
-  tokenize: true
   materialize_interleave: true
   audio_text_task: transcribe
 

@@ -66,15 +66,20 @@ def test_plan_and_status_for_disabled_stage_are_explicit():
     assert status_stages(_disabled_parquet_spec(), stage="convert")["convert"]["action"] == "skip"
 
 
-def test_run_stages_materialize_disabled_by_default():
-    """A spec without any enabled product should run the materialize stage
-    as a no-op, not raise. Replaces the old step-5 placeholder test."""
-    result = run_stages(_disabled_parquet_spec(), stage="materialize")
-    assert result == {
-        "materialize": {
-            "interleave": {"skipped": True, "reason": "interleave.disabled"},
-        }
-    }
+def test_run_stages_materialize_without_enabled_product_raises():
+    """Under explicit single-stage run, asking to materialize a spec with no
+    enabled product is a configuration error — not a silent no-op. A Slurm
+    job that did nothing while reporting success is the failure mode this
+    guard prevents."""
+    with pytest.raises(ValueError, match="no materialize section"):
+        run_stages(_disabled_parquet_spec(), stage="materialize")
+
+
+def test_run_stages_tokenize_without_section_raises():
+    """Same guard for tokenize: a spec without a tokenize section (no
+    outputs.tokenized_dir authored) must fail loudly, not silent-skip."""
+    with pytest.raises(ValueError, match="no tokenize section"):
+        run_stages(_disabled_parquet_spec(), stage="tokenize")
 
 
 def test_clean_stages_removes_resolved_tokenize_output_dir(tmp_path):
@@ -470,7 +475,10 @@ def _tokenize_spec_payload(shar_dir: str, output_dir: str) -> dict:
     }
 
 
-def test_run_tokenize_short_circuits_when_section_absent():
+def test_run_tokenize_raises_when_section_absent():
+    """Under explicit single-stage run, an absent tokenize section is a
+    user error (typoed stage or missing outputs.tokenized_dir), not a
+    silent no-op."""
     from audio_tokenization.stages.tokenize import run_tokenize
 
     spec = load_dataset_spec(
@@ -479,7 +487,8 @@ def test_run_tokenize_short_circuits_when_section_absent():
             "convert": _base_convert_payload(),
         }
     )
-    assert run_tokenize(spec) == {"skipped": True, "reason": "tokenize.disabled"}
+    with pytest.raises(ValueError, match="no tokenize section"):
+        run_tokenize(spec)
 
 
 def test_run_tokenize_does_not_call_plan_preflight_directly(tmp_path, monkeypatch):
@@ -1242,23 +1251,21 @@ def test_run_tokenize_resume_false_clears_partial_output_dir_before_rerun(
     assert result["skipped"] is False
 
 
-def test_run_stages_all_runs_in_order_and_short_circuits():
-    """stage='all' runs convert → tokenize → materialize in order; each
-    short-circuits cleanly when its section is disabled or absent."""
-    result = run_stages(_disabled_parquet_spec(), stage="all")
-    assert result == {
-        "convert": {"skipped": True, "reason": "convert.disabled"},
-        "tokenize": {"skipped": True, "reason": "tokenize.disabled"},
-        "materialize": {
-            "interleave": {"skipped": True, "reason": "interleave.disabled"},
-        },
-    }
+def test_run_stages_requires_single_stage():
+    """``run`` rejects multi-stage selection so convert/tokenize/materialize
+    cannot accidentally share a Slurm allocation."""
+    with pytest.raises(ValueError, match="stage="):
+        run_stages(_disabled_parquet_spec(), stage=None)
+    with pytest.raises(ValueError, match="Unknown stage"):
+        run_stages(_disabled_parquet_spec(), stage="convert,tokenize")
 
 
-def test_run_stages_all_end_to_end_control_plane(tmp_path, monkeypatch):
+def test_stage_chain_end_to_end_control_plane(tmp_path, monkeypatch):
     """Convert -> tokenize -> materialize works as an artifact-driven graph.
 
-    Heavy decode/GPU/product work is faked; the real state files and success
+    Each stage is launched as its own ``run_stages`` call (mirroring the
+    production Slurm model where each stage is a separate job). Heavy
+    decode/GPU/product work is faked; the real state files and success
     markers are still written so downstream stages consume upstream artifacts
     exactly as they do in production.
     """
@@ -1322,12 +1329,14 @@ def test_run_stages_all_end_to_end_control_plane(tmp_path, monkeypatch):
         lambda argv: None,
     )
 
-    result = run_stages(spec, stage="all", resume=False)
+    convert_result = run_stages(spec, stage="convert", resume=False)
+    tokenize_result = run_stages(spec, stage="tokenize", resume=False)
+    materialize_result = run_stages(spec, stage="materialize", resume=False)
 
     cache_dir = tokenized_dir / build_tokenize_output_subdir(spec.tokenize, dataset_name=spec.name)
-    assert result["convert"]["converted"] is True
-    assert result["tokenize"]["tokenized"] is True
-    assert result["materialize"]["interleave"]["skipped"] is False
+    assert convert_result["convert"]["converted"] is True
+    assert tokenize_result["tokenize"]["tokenized"] is True
+    assert materialize_result["materialize"]["interleave"]["skipped"] is False
     assert (shar_dir / "_SUCCESS").is_file()
     assert (cache_dir / "_SUCCESS").is_file()
     assert (materialized_dir / "_SUCCESS").is_file()
@@ -1385,15 +1394,16 @@ def _materialize_tokenize_stage_success(cache_dir, spec, *, input_shar_dirs=None
     mark_partition_success(cache_dir)
 
 
-def test_run_materialize_interleave_disabled_returns_skip():
+def test_run_materialize_raises_when_no_product_enabled():
+    """Under explicit single-stage run, materialize with no enabled product
+    is a user error, not a silent no-op."""
     from audio_tokenization.stages.materialize import run_materialize as run_materialize_impl
 
     spec = load_dataset_spec(
         {"name": "d", "convert": _base_convert_payload()}
     )
-    assert run_materialize_impl(spec) == {
-        "interleave": {"skipped": True, "reason": "interleave.disabled"},
-    }
+    with pytest.raises(ValueError, match="no materialize section"):
+        run_materialize_impl(spec)
 
 
 def test_run_materialize_does_not_call_plan_preflight_directly(tmp_path, monkeypatch):

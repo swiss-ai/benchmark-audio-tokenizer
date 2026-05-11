@@ -12,10 +12,12 @@ Policy:
   interleave metadata such as `clip_start` and `clip_duration`.
 - Convert into a new output path first; only promote after canary conversion,
   SHAR validation, canary tokenization, and full tokenization pass.
-- Use the unified stage graph for new rebuilds whenever possible:
-  `python -m audio_tokenization run dataset=<name> stage=all`. In that path,
-  tokenization reads `convert.output.shar_dir` automatically when
-  `tokenize.input_shar_dir: null`.
+- Use the unified stage entrypoint for new rebuilds: each stage is its own
+  Slurm job because convert is CPU/IO-bound, tokenize is GPU-distributed
+  (typically 4 ranks), and materialize is CPU-only. Run them in order:
+  `python -m audio_tokenization run dataset=<name> stage=convert`, then
+  `stage=tokenize`, then `stage=materialize`. Tokenization reads
+  `convert.output.shar_dir` automatically when `tokenize.input_shar_dir: null`.
 - Treat `rms_db` status below as sampled evidence. Re-check every dataset before
   launching the full job.
 

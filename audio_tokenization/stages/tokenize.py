@@ -14,7 +14,10 @@ from audio_tokenization.config.schema import DatasetSpec, TokenizeSpec
 from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
 from audio_tokenization.output_layout import resolve_tokenize_output_dir
 from audio_tokenization.utils.io import atomic_write_json
-from audio_tokenization.stages._plans import ResolvedStagePlan, disabled_stage_plan
+from audio_tokenization.stages._plans import (
+    ResolvedStagePlan,
+    disabled_stage_plan,
+)
 from audio_tokenization.stages._provenance import (
     build_tokenize_resume_fingerprint,
     read_prepare_provenance,
@@ -88,6 +91,11 @@ def resolve_tokenize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
 
 
 def run_tokenize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
+    if spec.tokenize is None:
+        raise ValueError(
+            "stage=tokenize requested but DatasetSpec has no tokenize section. "
+            "Add outputs.tokenized_dir to the dataset YAML to enable this stage."
+        )
     plan = resolve_tokenize_plan(spec)
     return plan.execute(resume)
 

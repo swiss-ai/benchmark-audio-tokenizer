@@ -12,7 +12,10 @@ from audio_tokenization.config.schema import (
 )
 from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.runtime import resolve_num_workers
-from audio_tokenization.stages._plans import ResolvedStagePlan, disabled_stage_plan
+from audio_tokenization.stages._plans import (
+    ResolvedStagePlan,
+    disabled_stage_plan,
+)
 from audio_tokenization.stages._provenance import (
     build_interleave_resume_fingerprint,
     read_stage_provenance,
@@ -85,18 +88,13 @@ def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
 
 
 def run_materialize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
-    results: dict[str, Any] = {}
-
+    if not spec.materialize.interleave.enabled:
+        raise ValueError(
+            "stage=materialize requested but DatasetSpec has no materialize section. "
+            "Add materialization.interleave.enabled=true with output_dir to enable this stage."
+        )
     interleave_plan = resolve_materialize_plan(spec)
-    if interleave_plan.enabled:
-        results.update(interleave_plan.execute(resume))
-    else:
-        results["interleave"] = {
-            "skipped": True,
-            "reason": interleave_plan.reason or "interleave.disabled",
-        }
-
-    return results
+    return interleave_plan.execute(resume)
 
 
 def _preflight_materialize_plan(
