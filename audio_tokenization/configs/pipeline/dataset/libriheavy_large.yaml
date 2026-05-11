@@ -29,6 +29,3 @@ conversion:
   num_workers: 32
   shard_size: 20000
   target_sr: 24000
-
-tokenization:
-  enabled: false
