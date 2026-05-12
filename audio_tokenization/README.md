@@ -399,10 +399,10 @@ Single-clip:       transcribe
 
 ```bash
 # Stage 1: Tokenize once (expensive, GPU)
-python -m audio_tokenization run dataset=infore2 stage=tokenize
+python -m audio_tokenization run dataset=cooldown/infore2 stage=tokenize
 
 # Stage 2: materialize final interleave product (cheap, CPU-only)
-python -m audio_tokenization run dataset=infore2 stage=materialize
+python -m audio_tokenization run dataset=cooldown/infore2 stage=materialize
 ```
 
 ---
@@ -418,7 +418,8 @@ configs/pipeline/
 ├── tokenize/*.yaml                   # reusable tokenization profiles
 ├── materialize/*.yaml                # reusable product profiles
 ├── stage/*.yaml                      # convert/tokenize/materialize/all
-└── dataset/*.yaml                    # one canonical spec per dataset
+└── dataset/{sft,cooldown,stage1,stage2,internal}/*.yaml
+                                      # one canonical spec per dataset
 ```
 
 **Dataset specs** configure the enabled stages directly:
@@ -433,7 +434,7 @@ configs/pipeline/
 ```bash
 # Override from CLI
 python -m audio_tokenization run \
-    dataset=stage1_suno_s1 \
+    dataset=stage1/suno_s1 \
     stage=tokenize \
     dataset.tokenize.tokenizer.trim_last_tokens=0 \
     dataset.tokenize.dataloader.max_batch_duration=2000

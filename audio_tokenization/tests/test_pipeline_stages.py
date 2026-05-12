@@ -13,6 +13,8 @@ import gzip
 import json
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from audio_tokenization.config import load_dataset_spec
@@ -278,8 +280,8 @@ def test_tokenize_defaults_canonical():
     )
     tok = spec.tokenize
     assert tok.mode == "audio_only"
-    assert tok.audio_text_format == "direct"
-    assert tok.audio_text_task == "transcribe"
+    assert tok.audio_text_format is None
+    assert tok.audio_text_task is None
     assert tok.input_shar_dir is None
     assert tok.filter.min_duration == 1.0
     assert tok.filter.max_duration == 200.0
@@ -287,6 +289,24 @@ def test_tokenize_defaults_canonical():
     assert tok.dataloader.sampler_seed == 42
     assert tok.tokenizer.sampling_rate == 24000
     assert tok.tokenizer.trim_last_tokens == 5
+
+
+def test_audio_text_defaults_canonical():
+    spec = load_dataset_spec(
+        {
+            "name": "d",
+            "convert": _base_convert_payload(),
+            "tokenize": {
+                "tokenizer": {"path": "/t"},
+                "output": {"output_dir": "/o"},
+                "mode": "audio_text",
+            },
+        }
+    )
+    tok = spec.tokenize
+    assert tok.mode == "audio_text"
+    assert tok.audio_text_format == "direct"
+    assert tok.audio_text_task == "transcribe"
 
 
 def test_tokenize_accepts_translate_task():
@@ -323,6 +343,164 @@ def test_tokenize_literal_fields_reject_unknown_values(key, bad):
                     "tokenizer": {"path": "/t"},
                     "output": {"output_dir": "/o"},
                     key: bad,
+                },
+            }
+        )
+
+
+def test_sft_schema_accepts_audio_cache_and_materialize_product():
+    spec = load_dataset_spec(
+        {
+            "name": "sft_dataset",
+            "tokenize": {
+                "input_shar_dir": ["/tmp/audio_assets_shar"],
+                "tokenizer": {"path": "/tmp/audio_tokenizer"},
+                "output": {"output_dir": "/tmp/audio_cache"},
+                "mode": "audio_cache",
+            },
+            "materialize": {
+                "sft": {
+                    "enabled": True,
+                    "conversations_dir": "/tmp/conversations",
+                    "cache_dir": "/tmp/audio_cache/audio_cache/sft_dataset",
+                    "output_dir": "/tmp/megatron",
+                    "tokenizer_path": "/tmp/text_tokenizer",
+                    "max_seq_len": 4096,
+                    "num_workers": 4,
+                }
+            },
+        }
+    )
+
+    assert spec.tokenize.mode == "audio_cache"
+    assert spec.materialize.sft.enabled is True
+    assert spec.materialize.sft.conversations_dir == "/tmp/conversations"
+    assert spec.materialize.sft.max_seq_len == 4096
+    assert spec.materialize.sft.num_workers == 4
+
+
+def test_audio_cache_rejects_audio_text_knobs():
+    with pytest.raises(ValueError, match="audio_text_format.*audio_text_task.*audio_text"):
+        load_dataset_spec(
+            {
+                "name": "sft_dataset",
+                "tokenize": {
+                    "input_shar_dir": ["/tmp/audio_assets_shar"],
+                    "tokenizer": {"path": "/tmp/audio_tokenizer"},
+                    "output": {"output_dir": "/tmp/audio_cache"},
+                    "mode": "audio_cache",
+                    "audio_text_format": "interleaved",
+                    "audio_text_task": "translate",
+                },
+            }
+        )
+
+
+def test_audio_cache_plan_effective_omits_audio_text_knobs(tmp_path):
+    from audio_tokenization.stages.tokenize import resolve_tokenize_plan
+
+    shar_dir = tmp_path / "shar"
+    _write_cut_shar_index(shar_dir)
+    spec = load_dataset_spec(
+        {
+            "name": "sft_dataset",
+            "tokenize": {
+                "input_shar_dir": [str(shar_dir)],
+                "tokenizer": {"path": "/tmp/audio_tokenizer"},
+                "output": {"output_dir": str(tmp_path / "audio_cache")},
+                "mode": "audio_cache",
+            },
+        }
+    )
+
+    effective = resolve_tokenize_plan(spec).effective
+
+    assert effective["mode"] == "audio_cache"
+    assert "audio_text_format" not in effective
+    assert "audio_text_task" not in effective
+
+
+def test_tokenize_preflight_does_not_validate_sft_package(tmp_path):
+    from audio_tokenization.stages.tokenize import resolve_tokenize_plan
+
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    pq.write_table(
+        pa.table({"audio_id": ["aud-too-long"], "duration_sec": [250.0]}),
+        media_dir / "_index.parquet",
+    )
+    conversations_dir = tmp_path / "conversations"
+    conversations_dir.mkdir()
+    messages = [
+        {"role": "user", "content": "<audio>\nWhat is this?", "audio": []},
+        {"role": "assistant", "content": "answer", "audio": []},
+    ]
+    pq.write_table(
+        pa.table({
+            "sample_id": ["sample-1"],
+            "messages_json": [json.dumps(messages)],
+            "audio_ids": pa.array([["aud-too-long"]], type=pa.list_(pa.string())),
+        }),
+        conversations_dir / "train.parquet",
+    )
+    shar_dir = tmp_path / "shar"
+    shar_dir.mkdir()
+    (shar_dir / "_SUCCESS").write_text("ok\n")
+    spec = load_dataset_spec(
+        {
+            "name": "sft_ds",
+            "convert": {
+                "family": "parquet",
+                "input": {"parquet_dir": str(media_dir), "parquet_glob": "audio-*.parquet"},
+                "output": {"shar_dir": str(shar_dir), "shard_size": 10},
+                "metadata": {"id_column": "audio_id", "duration_column": "duration_sec"},
+            },
+            "tokenize": {
+                "tokenizer": {"path": "/tmp/tokenizer"},
+                "output": {"output_dir": str(tmp_path / "tokenized"), "output_name": "sft_ds"},
+                "mode": "audio_cache",
+                "filter": {"min_duration": 1.0, "max_duration": 200.0},
+            },
+            "materialize": {
+                "sft": {
+                    "enabled": True,
+                    "conversations_dir": str(conversations_dir),
+                    "output_dir": str(tmp_path / "sft"),
+                    "tokenizer_path": "/tmp/tokenizer",
+                    "messages_column": "messages_json",
+                }
+            },
+        }
+    )
+
+    resolve_tokenize_plan(spec).preflight()
+
+
+def test_schema_rejects_multiple_materialize_products():
+    with pytest.raises(ValueError, match="exactly one materialize product"):
+        load_dataset_spec(
+            {
+                "name": "mixed_products",
+                "tokenize": {
+                    "input_shar_dir": ["/tmp/shar"],
+                    "tokenizer": {"path": "/tmp/tokenizer"},
+                    "output": {"output_dir": "/tmp/tokenized"},
+                    "mode": "audio_cache",
+                },
+                "materialize": {
+                    "interleave": {
+                        "enabled": True,
+                        "cache_dir": "/tmp/interleave_cache",
+                        "output_dir": "/tmp/interleave",
+                        "tokenizer_path": "/tmp/tokenizer",
+                    },
+                    "sft": {
+                        "enabled": True,
+                        "conversations_dir": "/tmp/conversations",
+                        "cache_dir": "/tmp/audio_cache",
+                        "output_dir": "/tmp/sft",
+                        "tokenizer_path": "/tmp/tokenizer",
+                    },
                 },
             }
         )
@@ -415,20 +593,22 @@ def test_interleave_derivation_requires_tokenize_section():
 
 @pytest.mark.parametrize(
     ("mode", "fmt"),
-    [("audio_only", "direct"), ("audio_text", "direct")],
+    [("audio_only", None), ("audio_text", "direct")],
 )
 def test_interleave_derivation_requires_interleaved_mode(mode, fmt):
+    tokenize = {
+        "tokenizer": {"path": "/t"},
+        "output": {"output_dir": "/o"},
+        "mode": mode,
+    }
+    if fmt is not None:
+        tokenize["audio_text_format"] = fmt
     with pytest.raises(ValueError, match="audio_text_format='interleaved'"):
         load_dataset_spec(
             {
                 "name": "d",
                 "convert": _base_convert_payload(),
-                "tokenize": {
-                    "tokenizer": {"path": "/t"},
-                    "output": {"output_dir": "/o"},
-                    "mode": mode,
-                    "audio_text_format": fmt,
-                },
+                "tokenize": tokenize,
                 "materialize": {"interleave": {"enabled": True, "output_dir": "/i"}},
             }
         )
@@ -976,6 +1156,47 @@ def test_run_tokenize_skips_on_marker_and_state_match(tmp_path, monkeypatch):
     assert result["output_dir"] == str(final_dir)
 
 
+def test_run_tokenize_accepts_legacy_state_missing_default_soxr_backend(tmp_path, monkeypatch):
+    """Old tokenize states omitted resampling_backend when soxr was implicit."""
+    from audio_tokenization.prepare.constants import CURRENT_STAGE_STATE_VERSION
+    from audio_tokenization.prepare.runtime import mark_partition_success
+    from audio_tokenization.output_layout import build_tokenize_output_subdir
+    from audio_tokenization.stages._provenance import build_tokenize_resume_fingerprint
+    from audio_tokenization.stages.tokenize import TOKENIZE_STATE_FILE, run_tokenize
+
+    shar_dir = tmp_path / "shar"
+    _write_cut_shar_index(shar_dir)
+    mark_partition_success(shar_dir)
+
+    output_dir = tmp_path / "out"
+    spec = load_dataset_spec(_tokenize_spec_payload(str(shar_dir), str(output_dir)))
+    fingerprint = build_tokenize_resume_fingerprint(spec, input_shar_dirs=[str(shar_dir)])
+    assert fingerprint["resampling_backend"] == "soxr"
+
+    legacy_state = {"version": CURRENT_STAGE_STATE_VERSION, **fingerprint}
+    legacy_state.pop("resampling_backend")
+
+    final_dir = output_dir / build_tokenize_output_subdir(spec.tokenize, dataset_name=spec.name)
+    final_dir.mkdir(parents=True, exist_ok=True)
+    (final_dir / TOKENIZE_STATE_FILE).write_text(json.dumps(legacy_state) + "\n")
+    mark_partition_success(final_dir)
+
+    monkeypatch.setattr(
+        "audio_tokenization.stages.tokenize._invoke_pipeline",
+        lambda _spec, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pipeline invoked for legacy soxr resume state")
+        ),
+    )
+
+    planned = plan_stages(spec, stage="tokenize")["tokenize"]
+    assert planned["status"] == "ready"
+    assert planned["action"] == "skip"
+
+    result = run_tokenize(spec, resume=True)
+    assert result["skipped"] is True
+    assert json.loads((final_dir / TOKENIZE_STATE_FILE).read_text()) == legacy_state
+
+
 def test_run_tokenize_rejects_resume_on_state_drift(tmp_path, monkeypatch):
     """If the on-disk state doesn't match the current spec, resume must
     fail loudly — never silently overwriting or falsely skipping."""
@@ -1432,7 +1653,7 @@ def test_run_materialize_does_not_call_plan_preflight_directly(tmp_path, monkeyp
         execute=lambda resume: {"interleave": {"resume": resume}},
     )
 
-    monkeypatch.setattr(materialize_stage, "resolve_materialize_plan", lambda _spec: plan)
+    monkeypatch.setattr(materialize_stage, "_resolve_interleave_materialize_plan", lambda _spec: plan)
 
     assert materialize_stage.run_materialize(spec, resume=False) == {
         "interleave": {"resume": False}
@@ -1776,6 +1997,76 @@ def test_run_materialize_interleave_requires_tokenize_success_for_derived_cache(
     )
     with pytest.raises(RuntimeError, match=r"missing _SUCCESS"):
         run_materialize_impl(spec, resume=False)
+
+
+def test_run_materialize_sft_requires_tokenize_success_for_derived_cache(tmp_path):
+    from audio_tokenization.stages.materialize import run_materialize as run_materialize_impl
+
+    conversations_dir = tmp_path / "conversations"
+    conversations_dir.mkdir()
+    tokenize_out = tmp_path / "tokenize"
+    derived_cache = tokenize_out / "audio_cache" / "sft_ds"
+    derived_cache.mkdir(parents=True)
+    spec = load_dataset_spec(
+        {
+            "name": "sft_ds",
+            "tokenize": {
+                "input_shar_dir": ["/tmp/shar"],
+                "tokenizer": {"path": "/tmp/tokenizer"},
+                "output": {"output_dir": str(tokenize_out)},
+                "mode": "audio_cache",
+            },
+            "materialize": {
+                "sft": {
+                    "enabled": True,
+                    "conversations_dir": str(conversations_dir),
+                    "output_dir": str(tmp_path / "sft"),
+                    "tokenizer_path": "/tmp/tokenizer",
+                }
+            },
+        }
+    )
+
+    with pytest.raises(RuntimeError, match=r"missing _SUCCESS"):
+        run_materialize_impl(spec, resume=False)
+
+
+def test_sft_materialize_preflight_defers_audio_cache_manifest_to_consumer(tmp_path):
+    from audio_tokenization.stages.materialize import resolve_materialize_plan
+
+    conversations_dir = tmp_path / "conversations"
+    conversations_dir.mkdir()
+    messages = [
+        {"role": "user", "content": "<audio>\nWhat is this?", "audio": []},
+        {"role": "assistant", "content": "answer", "audio": []},
+    ]
+    pq.write_table(
+        pa.table({
+            "sample_id": ["sample-1"],
+            "messages_json": [json.dumps(messages)],
+            "audio_ids": pa.array([["aud-a"]], type=pa.list_(pa.string())),
+        }),
+        conversations_dir / "train.parquet",
+    )
+    cache_dir = tmp_path / "audio_cache"
+    cache_dir.mkdir()
+    spec = load_dataset_spec(
+        {
+            "name": "sft_ds",
+            "materialize": {
+                "sft": {
+                    "enabled": True,
+                    "conversations_dir": str(conversations_dir),
+                    "cache_dir": str(cache_dir),
+                    "output_dir": str(tmp_path / "sft"),
+                    "tokenizer_path": "/tmp/tokenizer",
+                    "messages_column": "messages_json",
+                }
+            },
+        }
+    )
+
+    resolve_materialize_plan(spec).preflight()
 
 
 def test_run_materialize_explicit_missing_cache_dir_does_not_delete_existing_output(

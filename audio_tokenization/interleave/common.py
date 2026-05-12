@@ -1,7 +1,4 @@
-"""Shared utilities for interleaved-tokenization indexed dataset builders.
-
-Provides functions used by both the fixed-window *pattern* mode and the
-variable-length *accumulate* mode:
+"""Shared utilities for the shift-by-one interleave builder.
 
 - Token ID loading (BOS/EOS/transition tokens)
 - Consecutive-run detection
@@ -39,56 +36,25 @@ from audio_tokenization.utils.indexed_dataset.indexed_dataset_megatron import (
     get_idx_path,
 )
 
-# Re-export indexed dataset symbols so callers import from one place
 __all__ = [
-    "MEGATRON_INDEX_HEADER",
     "DType",
     "IndexedDatasetBuilder",
     "get_bin_path",
     "get_idx_path",
     "TR_KEY",
-    "_HIST_BINS",
-    "_HIST_LABELS",
-    "_PERCENTILES",
     "format_distribution",
     "load_token_ids",
-    "find_consecutive_runs",
     "_detect_runs",
     "_write_idx_file",
     "_merge_shards",
     "_partition_runs",
     "list_interleave_cache_partitions",
-    "summarize_partition_stats",
     "print_partition_stats",
     "load_interleave_cache",
     "prepare_interleave_cache_and_runs",
     "prepare_length_metadata",
     "compute_ratio_adjustment",
-    "_LazyArrowList",
 ]
-
-# ---------------------------------------------------------------------------
-# Lazy Arrow helper
-# ---------------------------------------------------------------------------
-
-
-class _LazyArrowList:
-    """Lazy list-like wrapper around an Arrow chunked array slice.
-
-    Converts one element at a time via ``as_py()`` on access instead of
-    materializing the entire slice upfront with ``to_pylist()``.
-    Reduces peak memory for long runs.
-    """
-    __slots__ = ("_arr",)
-
-    def __init__(self, arr):
-        self._arr = arr
-
-    def __getitem__(self, idx):
-        return self._arr[idx].as_py()
-
-    def __len__(self):
-        return len(self._arr)
 
 
 class _TokenRunView:
@@ -118,26 +84,6 @@ class _TokenRunView:
 
     def to_pylist(self) -> list[list[int]]:
         return [self._accessor.get(self._start + i) for i in range(self._length)]
-
-
-class _ArrowTokenAccessor:
-    __slots__ = ("_arr", "_lengths")
-
-    def __init__(self, arr):
-        import pyarrow.compute as pc
-
-        self._arr = arr
-        self._lengths = pc.list_value_length(arr).to_numpy()
-
-    def get(self, idx: int) -> list[int]:
-        return self._arr[idx].as_py()
-
-    def slice(self, start: int, length: int) -> _TokenRunView:
-        return _TokenRunView(self, start, length)
-
-    @property
-    def lengths(self) -> np.ndarray:
-        return self._lengths
 
 
 class _MemmapTokenAccessor:
@@ -343,24 +289,6 @@ def load_token_ids(tokenizer_path: str) -> tuple[int, int, int, int, int, int]:
     return bos_id, eos_id, st["stt_continue"], st["stt_transcribe"], st["tts_continue"], vocab_size
 
 
-def find_consecutive_runs(sorted_clip_nums: list[int]) -> list[list[int]]:
-    """Split sorted clip numbers into runs of consecutive integers.
-
-    >>> find_consecutive_runs([3, 4, 5, 8, 9, 15])
-    [[3, 4, 5], [8, 9], [15]]
-    """
-    if not sorted_clip_nums:
-        return []
-    runs: list[list[int]] = []
-    current: list[int] = [sorted_clip_nums[0]]
-    for prev, cur in zip(sorted_clip_nums, sorted_clip_nums[1:]):
-        if cur == prev + 1:
-            current.append(cur)
-        else:
-            runs.append(current)
-            current = [cur]
-    runs.append(current)
-    return runs
 
 
 # ---------------------------------------------------------------------------
@@ -619,8 +547,6 @@ def list_interleave_cache_partitions(cache_dir: Path) -> list[Path]:
             f"{cache_dir} is not a structured interleave cache: missing {INTERLEAVE_CACHE_LAYOUT_FILENAME}. "
             "Re-run tokenization to build the current cache format."
         )
-
-    _validate_cache_layout(layout, cache_dir / INTERLEAVE_CACHE_LAYOUT_FILENAME)
 
     if any(p.is_dir() and p.name.startswith("rank_") for p in cache_dir.iterdir()):
         return [cache_dir]

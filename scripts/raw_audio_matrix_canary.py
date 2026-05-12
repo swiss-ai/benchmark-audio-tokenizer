@@ -148,7 +148,7 @@ def _base_runtime_overrides() -> list[str]:
 def _samromur_overrides(shar_dir: Path, tokenized_dir: Path, output_name: str) -> list[str]:
     raw = "/capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___language-and-voice-lab___samromur_children"
     return [
-        "dataset=stage1_ups_all_lang_vad",
+        "dataset=stage1/ups_all_lang_vad",
         "dataset.name=canary_samromur_wds_direct",
         "dataset.recipe.mode=audio_text_direct",
         "dataset.source.shards=[" + f"{raw}/corpus/speech/dev.tar.gz" + "]",
@@ -198,7 +198,7 @@ def _rchiera_metadata(path: Path) -> Path:
 def _rchiera_overrides(shar_dir: Path, tokenized_dir: Path, output_name: str, metadata_path: Path) -> list[str]:
     raw = "/capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___rchiera___podcast-transcripts___downloaded/cleaned/000000617"
     return [
-        "dataset=stage1_ups_all_lang_vad",
+        "dataset=stage1/ups_all_lang_vad",
         "dataset.name=canary_rchiera_wds_interleave",
         "dataset.recipe.mode=audio_text_interleaved",
         "dataset.recipe.materialize_interleave=true",
@@ -230,7 +230,7 @@ def _rchiera_overrides(shar_dir: Path, tokenized_dir: Path, output_name: str, me
 def _spc_overrides(shar_dir: Path, tokenized_dir: Path, output_name: str, *, mode: str) -> list[str]:
     materialize_enabled = "true" if mode == "audio_text_interleaved" else "false"
     return [
-        "dataset=cooldown_ccpodcasts",
+        "dataset=cooldown/ccpodcasts",
         f"dataset.name=canary_spc_parquet_{mode}",
         f"dataset.recipe.mode={mode}",
         f"dataset.recipe.materialize_interleave={materialize_enabled}",
@@ -466,7 +466,7 @@ def main() -> None:
     cases = [
         TokenizeCase(
             name="samromur_wds_direct",
-            dataset="stage1_ups_all_lang_vad",
+            dataset="stage1/ups_all_lang_vad",
             output_name="samromur_wds_direct",
             output_kind="megatron",
             shar_dir=samromur_shar,
@@ -474,7 +474,7 @@ def main() -> None:
         ),
         TokenizeCase(
             name="rchiera_wds_interleave",
-            dataset="stage1_ups_all_lang_vad",
+            dataset="stage1/ups_all_lang_vad",
             output_name="rchiera_wds_interleave",
             output_kind="interleave",
             shar_dir=rchiera_shar,
@@ -483,7 +483,7 @@ def main() -> None:
         ),
         TokenizeCase(
             name="spc_parquet_direct",
-            dataset="cooldown_ccpodcasts",
+            dataset="cooldown/ccpodcasts",
             output_name="spc_parquet_direct",
             output_kind="megatron",
             shar_dir=spc_shar,
@@ -491,7 +491,7 @@ def main() -> None:
         ),
         TokenizeCase(
             name="spc_parquet_interleave",
-            dataset="cooldown_ccpodcasts",
+            dataset="cooldown/ccpodcasts",
             output_name="spc_parquet_interleave",
             output_kind="interleave",
             shar_dir=spc_shar,

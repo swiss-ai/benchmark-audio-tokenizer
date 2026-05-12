@@ -92,12 +92,12 @@ def validate_v2_chunks_complete(rank_dir: Path, *, error_label: str = "v2 struct
     return chunks
 
 
-def next_chunk_id(rank_dir: Path) -> int:
+def next_chunk_id(rank_dir: Path, *, commit_glob: str = "clips.*.parquet") -> int:
     """Monotonic chunk id for the next write into *rank_dir*."""
     if not rank_dir.exists():
         return 0
     stems: list[int] = []
-    for clips_path in rank_dir.glob("clips.*.parquet"):
+    for clips_path in rank_dir.glob(commit_glob):
         try:
             stems.append(int(_stem_for(clips_path)))
         except (IndexError, ValueError):
@@ -108,20 +108,30 @@ def next_chunk_id(rank_dir: Path) -> int:
 def prune_orphan_bin_files(
     rank_dir: Path,
     *,
+    commit_glob: str = "clips.*.parquet",
+    payload_globs: tuple[str, ...] = ("audio_tokens.*.bin", "text_tokens.*.bin"),
     logger: logging.Logger | None = None,
     label: str = "structured cache payload with no commit marker",
 ) -> list[Path]:
-    """Delete ``audio_tokens.*.bin`` / ``text_tokens.*.bin`` whose ``clips.*.parquet`` is missing.
+    """Delete token payloads whose commit marker is missing.
 
     Such files come from a writer crash between the bin commit and the
     clips-parquet commit; without the parquet they cannot be associated
     with any chunk. Returns the deleted paths.
     """
-    clip_stems = {_stem_for(p) for p in rank_dir.glob("clips.*.parquet")}
+    committed_stems = {_stem_for(p) for p in rank_dir.glob(commit_glob)}
     removed: list[Path] = []
-    for bin_path in list(rank_dir.glob("audio_tokens.*.bin")) + list(rank_dir.glob("text_tokens.*.bin")):
-        stem = bin_path.name.split(".")[1]
-        if stem in clip_stems:
+    payload_paths = [
+        path
+        for payload_glob in payload_globs
+        for path in rank_dir.glob(payload_glob)
+    ]
+    for bin_path in payload_paths:
+        try:
+            stem = bin_path.name.split(".")[1]
+        except IndexError:
+            continue
+        if stem in committed_stems:
             continue
         if logger is not None:
             logger.warning("Removing orphan %s: %s", label, bin_path.name)

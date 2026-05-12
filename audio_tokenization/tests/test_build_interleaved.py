@@ -1,4 +1,4 @@
-"""Tests for build_interleaved helper functions (pattern + common)."""
+"""Tests for interleave/common.py helper functions."""
 
 import json
 from pathlib import Path
@@ -8,7 +8,6 @@ import polars as pl
 import pytest
 
 from audio_tokenization.interleave.common import (
-    find_consecutive_runs,
     _detect_runs,
     compute_ratio_adjustment,
     list_interleave_cache_partitions,
@@ -16,231 +15,6 @@ from audio_tokenization.interleave.common import (
     prepare_interleave_cache_and_runs,
     prepare_length_metadata,
 )
-from audio_tokenization.interleave.pattern import (
-    build_sequence,
-    derive_sub_patterns,
-    group_patterns_by_size,
-    _pattern_constants,
-)
-
-
-# ── build_sequence ──────────────────────────────────────────────────────
-
-
-class TestBuildSequence:
-    """Tests for build_sequence()."""
-
-    BOS, EOS, STT_CONT, TTS_CONT = 1, 2, 99, 97
-
-    def _build(self, audio, text, pattern):
-        return build_sequence(
-            audio, text, pattern,
-            self.BOS, self.EOS, self.STT_CONT, self.TTS_CONT,
-        )
-
-    def test_at_pattern(self):
-        # 2 positions: pos0=A, pos1=T → audio[0], stt_continue, text[1]
-        seq = self._build([[10, 11], []], [[], [20, 21]], "AT")
-        assert seq == [1, 10, 11, 99, 20, 21, 2]
-
-    def test_ta_pattern(self):
-        # 2 positions: pos0=T, pos1=A → text[0], tts_continue, audio[1]
-        seq = self._build([[], [10, 11]], [[20, 21], []], "TA")
-        assert seq == [1, 20, 21, 97, 10, 11, 2]
-
-    def test_atat_pattern(self):
-        # 4 positions: A T A T — clips 0,1,2,3
-        audio = [[10, 11], [], [12, 13], []]
-        text = [[], [20, 21], [], [22, 23]]
-        seq = self._build(audio, text, "ATAT")
-        # A0 stt_cont T1 tts_cont A2 stt_cont T3
-        assert seq == [1, 10, 11, 99, 20, 21, 97, 12, 13, 99, 22, 23, 2]
-
-    def test_tata_pattern(self):
-        # 4 positions: T A T A — clips 0,1,2,3
-        audio = [[], [10, 11], [], [12, 13]]
-        text = [[20, 21], [], [22, 23], []]
-        seq = self._build(audio, text, "TATA")
-        # T0 tts_cont A1 stt_cont T2 tts_cont A3
-        assert seq == [1, 20, 21, 97, 10, 11, 99, 22, 23, 97, 12, 13, 2]
-
-    def test_aa_no_transition_token(self):
-        seq = self._build([[10], [20]], [[], []], "AA")
-        assert seq == [1, 10, 20, 2]
-
-    def test_tt_no_transition_token(self):
-        seq = self._build([[], []], [[10], [20]], "TT")
-        assert seq == [1, 10, 20, 2]
-
-    def test_bos_eos_always_present(self):
-        seq = self._build([[]], [[]], "A")
-        assert seq[0] == self.BOS
-        assert seq[-1] == self.EOS
-
-    def test_stt_count_matches_at_transitions(self):
-        """Number of stt_continue tokens == number of A→T transitions."""
-        for pattern, expected in [
-            ("AT", 1),
-            ("TA", 0),
-            ("ATAT", 2),
-            ("TATA", 1),
-            ("AAT", 1),
-            ("TAA", 0),
-            ("AATT", 1),
-        ]:
-            n_pos = len(pattern)
-            audio = [[100 + i] for i in range(n_pos)]
-            text = [[200 + i] for i in range(n_pos)]
-            seq = self._build(audio, text, pattern)
-            actual = seq.count(self.STT_CONT)
-            assert actual == expected, (
-                f"Pattern {pattern}: expected {expected} stt_continue, got {actual}"
-            )
-
-    def test_tts_count_matches_ta_transitions(self):
-        """Number of tts_continue tokens == number of T→A transitions."""
-        for pattern, expected in [
-            ("AT", 0),
-            ("TA", 1),
-            ("ATAT", 1),
-            ("TATA", 2),
-            ("AAT", 0),
-            ("TAA", 1),
-            ("TTAA", 1),
-        ]:
-            n_pos = len(pattern)
-            audio = [[100 + i] for i in range(n_pos)]
-            text = [[200 + i] for i in range(n_pos)]
-            seq = self._build(audio, text, pattern)
-            actual = seq.count(self.TTS_CONT)
-            assert actual == expected, (
-                f"Pattern {pattern}: expected {expected} tts_continue, got {actual}"
-            )
-
-    def test_single_a_no_transition(self):
-        """Single 'A' pattern should have no transition tokens."""
-        seq = self._build([[10, 11]], [[]], "A")
-        assert seq == [1, 10, 11, 2]
-
-    def test_single_t_no_transition(self):
-        """Single 'T' pattern should have no transition tokens."""
-        seq = self._build([[]], [[10, 11]], "T")
-        assert seq == [1, 10, 11, 2]
-
-
-# ── find_consecutive_runs ───────────────────────────────────────────────
-
-
-class TestFindConsecutiveRuns:
-    def test_docstring_example(self):
-        assert find_consecutive_runs([3, 4, 5, 8, 9, 15]) == [
-            [3, 4, 5],
-            [8, 9],
-            [15],
-        ]
-
-    def test_empty(self):
-        assert find_consecutive_runs([]) == []
-
-    def test_single(self):
-        assert find_consecutive_runs([7]) == [[7]]
-
-    def test_all_consecutive(self):
-        assert find_consecutive_runs([0, 1, 2, 3]) == [[0, 1, 2, 3]]
-
-    def test_all_disjoint(self):
-        assert find_consecutive_runs([0, 5, 10]) == [[0], [5], [10]]
-
-    def test_two_runs(self):
-        assert find_consecutive_runs([1, 2, 10, 11, 12]) == [[1, 2], [10, 11, 12]]
-
-
-# ── group_patterns_by_size ──────────────────────────────────────────────
-
-
-class TestGroupPatternsBySize:
-    def test_docstring_example(self):
-        result = group_patterns_by_size(["AT", "TA", "AAT", "TTA"])
-        assert result == {2: ["AT", "TA"], 3: ["AAT", "TTA"]}
-
-    def test_single_pattern(self):
-        assert group_patterns_by_size(["ATAT"]) == {4: ["ATAT"]}
-
-    def test_empty(self):
-        assert group_patterns_by_size([]) == {}
-
-    def test_same_size(self):
-        result = group_patterns_by_size(["AT", "TA"])
-        assert result == {2: ["AT", "TA"]}
-
-
-# ── derive_sub_patterns ────────────────────────────────────────────────
-
-
-class TestDeriveSubPatterns:
-    def test_docstring_example(self):
-        result = derive_sub_patterns(["ATAT", "TATA"], 4)
-        assert result == {3: ["ATA", "TAT"], 2: ["AT", "TA"]}
-
-    def test_min_window_2_no_sub_patterns(self):
-        result = derive_sub_patterns(["AT", "TA"], 2)
-        assert result == {}
-
-    def test_min_window_3(self):
-        result = derive_sub_patterns(["ATA", "TAT"], 3)
-        assert result == {2: ["AT", "TA"]}
-
-    def test_dedup(self):
-        # Both "AAT" and "AAT" truncated to 2 give "AA" — should deduplicate
-        result = derive_sub_patterns(["AAT", "AAT"], 3)
-        assert result == {2: ["AA"]}
-
-
-# ── _pattern_constants ──────────────────────────────────────────────────
-
-
-class TestPatternConstants:
-    def test_atat(self):
-        a_pos, t_pos, n_at, n_ta = _pattern_constants("ATAT")
-        assert a_pos == [0, 2]
-        assert t_pos == [1, 3]
-        assert n_at == 2
-        assert n_ta == 1
-
-    def test_tata(self):
-        a_pos, t_pos, n_at, n_ta = _pattern_constants("TATA")
-        assert a_pos == [1, 3]
-        assert t_pos == [0, 2]
-        assert n_at == 1
-        assert n_ta == 2
-
-    def test_at(self):
-        a_pos, t_pos, n_at, n_ta = _pattern_constants("AT")
-        assert a_pos == [0]
-        assert t_pos == [1]
-        assert n_at == 1
-        assert n_ta == 0
-
-    def test_ta(self):
-        a_pos, t_pos, n_at, n_ta = _pattern_constants("TA")
-        assert a_pos == [1]
-        assert t_pos == [0]
-        assert n_at == 0
-        assert n_ta == 1
-
-    def test_all_audio(self):
-        a_pos, t_pos, n_at, n_ta = _pattern_constants("AAA")
-        assert a_pos == [0, 1, 2]
-        assert t_pos == []
-        assert n_at == 0
-        assert n_ta == 0
-
-    def test_all_text(self):
-        a_pos, t_pos, n_at, n_ta = _pattern_constants("TTT")
-        assert a_pos == []
-        assert t_pos == [0, 1, 2]
-        assert n_at == 0
-        assert n_ta == 0
 
 
 # ── _detect_runs ────────────────────────────────────────────────────────
@@ -405,6 +179,9 @@ class TestInterleaveCacheReaders:
 
     def test_load_interleave_cache_raises_on_unknown_layout_version(self, tmp_path: Path):
         (tmp_path / "_CACHE_LAYOUT.json").write_text(json.dumps({"version": "v3"}))
+        (tmp_path / "rank_0000").mkdir()
+
+        assert list_interleave_cache_partitions(tmp_path) == [tmp_path]
 
         with pytest.raises(RuntimeError, match="Unsupported interleave cache layout version"):
             load_interleave_cache(tmp_path)

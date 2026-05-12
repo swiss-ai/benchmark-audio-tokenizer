@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-DATASET=cooldown_infore2
+DATASET=cooldown/infore2
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize|materialize> [hydra overrides...]" >&2

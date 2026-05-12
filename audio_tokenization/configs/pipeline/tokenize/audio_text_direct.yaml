@@ -4,6 +4,7 @@ tokenize:
   audio_text_task: transcribe
   input_shar_dir: null
   partitioning: null
+  resampling_backend: soxr
   tokenizer:
     sampling_rate: 24000
     torch_compile: false

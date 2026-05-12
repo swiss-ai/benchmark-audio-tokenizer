@@ -62,14 +62,7 @@ def resolve_tokenize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
             "state_file": str(final_output_dir / TOKENIZE_STATE_FILE),
             "success_marker": str(final_output_dir / SUCCESS_MARKER_FILE),
         },
-        effective={
-            "mode": spec.tokenize.mode,
-            "audio_text_format": spec.tokenize.audio_text_format,
-            "audio_text_task": spec.tokenize.audio_text_task,
-            "effective_tokenizer_path": spec.tokenize.tokenizer.path,
-            "effective_num_workers": spec.tokenize.dataloader.num_workers,
-            "resolved_output_dir": str(final_output_dir),
-        },
+        effective=_effective_tokenize_values(spec.tokenize, final_output_dir),
         fingerprint=fingerprint,
         output_dir=final_output_dir,
         state_path=final_output_dir / TOKENIZE_STATE_FILE,
@@ -88,6 +81,20 @@ def resolve_tokenize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
             resume=resume,
         ),
     )
+
+
+def _effective_tokenize_values(tokenize: TokenizeSpec, output_dir: Path) -> dict[str, Any]:
+    values = {
+        "mode": tokenize.mode,
+        "resampling_backend": tokenize.resampling_backend,
+        "effective_tokenizer_path": tokenize.tokenizer.path,
+        "effective_num_workers": tokenize.dataloader.num_workers,
+        "resolved_output_dir": str(output_dir),
+    }
+    if tokenize.mode == "audio_text":
+        values["audio_text_format"] = tokenize.audio_text_format
+        values["audio_text_task"] = tokenize.audio_text_task
+    return values
 
 
 def run_tokenize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:

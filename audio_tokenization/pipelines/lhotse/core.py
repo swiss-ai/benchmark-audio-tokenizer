@@ -9,7 +9,7 @@ Architecture (3 files per mode):
 Launch through the unified stage graph::
 
     srun --ntasks-per-node=4 --gpus-per-node=4 --kill-on-bad-exit=0 \\
-        python -m audio_tokenization run dataset=stage1_suno_s1 stage=tokenize
+        python -m audio_tokenization run dataset=stage1/suno_s1 stage=tokenize
 """
 
 import logging
@@ -671,6 +671,9 @@ def run_lhotse_pipeline(
     if spec.mode == "audio_only":
         from .audio_only import AudioOnlyHandler
         handler = AudioOnlyHandler(spec)
+    elif spec.mode == "audio_cache":
+        from .audio_cache import AudioCacheHandler
+        handler = AudioCacheHandler(spec)
     elif spec.mode == "audio_text":
         from .audio_text import AudioTextHandler
         handler = AudioTextHandler(spec, dataset_name=dataset_name)

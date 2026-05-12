@@ -39,10 +39,10 @@ HYDRA_OVERRIDES=("$@")
 
 case "${SPLIT}" in
     balanced)
-        DATASET=stage1_audioset_balanced
+        DATASET=stage1/audioset_balanced
         ;;
     unbalanced)
-        DATASET=stage1_audioset_unbalanced
+        DATASET=stage1/audioset_unbalanced
         ;;
     *)
         echo "Unsupported AudioSet split: ${SPLIT}" >&2

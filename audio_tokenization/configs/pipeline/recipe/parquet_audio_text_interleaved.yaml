@@ -1,7 +1,6 @@
 recipe:
   mode: audio_text_interleaved
   source_type: parquet
-  materialize_interleave: true
   audio_text_task: transcribe
 
 source:
@@ -47,6 +46,7 @@ conversion:
 tokenization:
   input_shar_dir: null
   partitioning: null
+  resampling_backend: soxr
   audio_text_task: transcribe
   min_duration: 1.0
   max_duration: 200.0
@@ -66,17 +66,3 @@ tokenization:
   shar_index_filename: shar_index.json
   wandb:
     enabled: true
-
-materialization:
-  interleave:
-    enabled: true
-    strategy: shift_by_one
-    cache_dir: null
-    output_dir: null
-    tokenizer_path: null
-    max_seq_len: 262144
-    max_gap_sec: null
-    seq_threshold: null
-    transcribe_ratio: null
-    num_workers: null
-    tmp_dir: null

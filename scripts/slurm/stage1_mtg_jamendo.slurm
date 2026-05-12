@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-DATASET=${DATASET:-stage1_mtg_jamendo}
+DATASET=${DATASET:-stage1/mtg_jamendo}
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize> [hydra overrides...]" >&2

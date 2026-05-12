@@ -71,6 +71,7 @@ def _authoring_interleaved_payload():
             "enabled": True,
             "input_shar_dir": None,
             "partitioning": None,
+            "resampling_backend": "soxr",
             "audio_text_task": "transcribe",
             "min_duration": 1.0,
             "max_duration": 200.0,
@@ -123,9 +124,55 @@ def test_authoring_materialize_null_interleave_defaults_do_not_suppress_override
     assert interleave.transcribe_ratio == 0.5
 
 
-def test_authoring_rejects_removed_sft_materialization_section():
+def test_authoring_sft_materialization_section_requires_conversations_dir():
     payload = _authoring_interleaved_payload()
-    payload["materialization"]["sft"] = {"enabled": True}
+    payload["recipe"]["materialize_interleave"] = False
+    payload["materialization"]["interleave"]["enabled"] = False
+    payload["materialization"]["sft"] = {}
 
-    with pytest.raises(ValueError, match=r"materialization\.sft.*not supported"):
+    with pytest.raises(ValueError, match=r"materialize\.sft requires conversations_dir"):
         load_dataset_spec(payload)
+
+
+def test_authoring_accepts_sft_materialization_section():
+    payload = _authoring_interleaved_payload()
+    payload["recipe"]["mode"] = "sft_audio"
+    payload["recipe"]["materialize_interleave"] = False
+    payload["outputs"]["sft_dir"] = "/out/sft"
+    payload["materialization"] = {
+        "sft": {
+            "conversations_dir": "/processed/sft/conversations",
+            "cache_dir": "/processed/audio_cache",
+            "tokenizer_path": "/tokenizer",
+            "max_seq_len": 4096,
+            "seq_threshold": 2048,
+            "num_workers": 3,
+        }
+    }
+
+    spec = load_dataset_spec(payload)
+
+    assert spec.tokenize.mode == "audio_cache"
+    assert spec.materialize.sft.enabled is True
+    assert spec.materialize.sft.conversations_dir == "/processed/sft/conversations"
+    assert spec.materialize.sft.output_dir == "/out/sft"
+    assert spec.materialize.sft.max_seq_len == 4096
+    assert spec.materialize.sft.seq_threshold == 2048
+    assert spec.materialize.sft.num_workers == 3
+
+
+def test_authoring_sft_defaults_tokenizer_path_to_tokenizer_dir():
+    payload = _authoring_interleaved_payload()
+    payload["recipe"]["mode"] = "sft_audio"
+    payload["recipe"]["materialize_interleave"] = False
+    payload["outputs"]["sft_dir"] = "/out/sft"
+    payload["materialization"] = {
+        "sft": {
+            "conversations_dir": "/processed/sft/conversations",
+            "cache_dir": "/processed/audio_cache",
+        }
+    }
+
+    spec = load_dataset_spec(payload)
+
+    assert spec.materialize.sft.tokenizer_path == "/tokenizer"

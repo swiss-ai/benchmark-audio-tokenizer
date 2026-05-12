@@ -99,11 +99,13 @@ def test_convert_common_mirrors_output_and_metadata_defaults():
     )
 
 
-def test_materialize_default_mirrors_schema_defaults():
-    materialize = _load("materialize/default.yaml")
+def test_materialize_interleave_preset_mirrors_schema_defaults():
+    materialize = _load("materialize/interleave.yaml")
+    expected = _schema_defaults(InterleaveProductSpec)
+    expected["enabled"] = True
     _assert_subset(
-        materialize["materialize"]["interleave"], _schema_defaults(InterleaveProductSpec),
-        "materialize/default.yaml materialize.interleave",
+        materialize["materialize"]["interleave"], expected,
+        "materialize/interleave.yaml materialize.interleave",
     )
 
 

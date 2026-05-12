@@ -3,7 +3,7 @@
 from .audio_only import WavTokenizerAudioOnly
 from .audio_text import WavTokenizerAudioText
 
-_SUPPORTED_MODES = ("audio_only", "audio_text")
+_SUPPORTED_MODES = ("audio_only", "audio_text", "audio_cache")
 
 
 def create_tokenizer(
@@ -16,14 +16,14 @@ def create_tokenizer(
 
     Args:
         omni_tokenizer_path: Path to omni_tokenizer (must have audio tokens added)
-        mode: ``"audio_only"`` or ``"audio_text"``
+        mode: ``"audio_only"``, ``"audio_text"``, or ``"audio_cache"``
         device: Device for tokenization
 
     Note:
         The audio token offset is automatically determined from the omni_tokenizer
         by querying: convert_tokens_to_ids("<|audio token 0|>")
     """
-    if mode == "audio_only":
+    if mode in ("audio_only", "audio_cache"):
         return WavTokenizerAudioOnly(
             omni_tokenizer_path=omni_tokenizer_path,
             device=device,

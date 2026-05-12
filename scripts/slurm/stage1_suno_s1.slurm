@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-DATASET=${DATASET:-stage1_suno_s1}
+DATASET=${DATASET:-stage1/suno_s1}
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize> [hydra overrides...]" >&2

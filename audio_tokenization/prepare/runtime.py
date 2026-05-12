@@ -11,8 +11,9 @@ import shutil
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence, get_args
 
+from audio_tokenization.config.schema import TokenizeMode
 from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.prepare.constants import (
     CURRENT_PREPARE_STATE_VERSION,
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 _PREPARE_TOTAL_FIELDS = ("written", "skipped", "errors", "total_duration_sec")
+_TOKENIZE_MODES = frozenset(get_args(TokenizeMode))
 
 
 def _state_version_for_path(state_path: Path) -> int:
@@ -228,13 +230,36 @@ def diff_fingerprint(
     (the ``version`` sentinel the state writer injects, plus any future
     additive on-disk fields).
     """
+    expected_norm = _with_legacy_fingerprint_defaults(expected)
+    on_disk_norm = _with_legacy_fingerprint_defaults(on_disk)
     drift: dict[str, tuple[object, object]] = {}
-    for k, v in expected.items():
-        if k not in on_disk:
+    for k, v in expected_norm.items():
+        if k not in on_disk_norm:
             drift[k] = (v, "<missing>")
-        elif on_disk[k] != v:
-            drift[k] = (v, on_disk[k])
+        elif on_disk_norm[k] != v:
+            drift[k] = (v, on_disk_norm[k])
     return drift
+
+
+def _with_legacy_fingerprint_defaults(value):
+    """Return *value* with known legacy fingerprint omissions filled in.
+
+    Tokenize originally hard-coded the Lhotse resampling backend to soxr but
+    did not record it in ``tokenize_state.json``. Once the backend became an
+    explicit fingerprint key, old completed outputs would otherwise look dirty
+    even though their effective backend matches the current default.
+    """
+    if isinstance(value, Mapping):
+        out = {
+            key: _with_legacy_fingerprint_defaults(item)
+            for key, item in value.items()
+        }
+        if out.get("mode") in _TOKENIZE_MODES and "resampling_backend" not in out:
+            out["resampling_backend"] = "soxr"
+        return out
+    if isinstance(value, list):
+        return [_with_legacy_fingerprint_defaults(item) for item in value]
+    return value
 
 
 def validate_or_write_prepare_state(
@@ -257,20 +282,22 @@ def validate_or_write_prepare_state(
             expected_version=state_version,
             state_label=state_label,
         )
+        expected_norm = _with_legacy_fingerprint_defaults(expected)
+        payload_norm = _with_legacy_fingerprint_defaults(payload)
 
         for key in invariant_keys:
-            if key not in payload:
+            if key not in payload_norm:
                 raise AssertionError(
                     "Unsafe resume detected: persisted configuration is missing "
                     "a required invariant.\n"
                     f"State file: {state_path}\n"
                     f"Key: {key}\n"
                     f"Existing value: '<missing>'\n"
-                    f"Current value: {expected.get(key)!r}\n"
+                    f"Current value: {expected_norm.get(key)!r}\n"
                     f"{guidance}"
                 )
-            prev = payload[key]
-            cur = expected.get(key)
+            prev = payload_norm[key]
+            cur = expected_norm.get(key)
             if prev != cur:
                 raise AssertionError(
                     "Unsafe resume detected: persisted configuration changed.\n"

@@ -1,0 +1,6 @@
+defaults:
+  - /recipe/parquet_audio_only@_here_
+  - _self_
+
+recipe:
+  mode: sft_audio

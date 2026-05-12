@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-DATASET=cooldown_localized_narratives
+DATASET=cooldown/localized_narratives
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize> [hydra overrides...]" >&2

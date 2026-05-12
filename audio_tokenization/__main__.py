@@ -3,10 +3,10 @@
 
 Examples::
 
-    python -m audio_tokenization run dataset=infore2 stage=convert
-    python -m audio_tokenization plan dataset=infore2                    # all three
-    python -m audio_tokenization status dataset=infore2 stage=tokenize
-    python -m audio_tokenization clean dataset=infore2 stage=materialize
+    python -m audio_tokenization run dataset=cooldown/infore2 stage=convert
+    python -m audio_tokenization plan dataset=cooldown/infore2                    # all three
+    python -m audio_tokenization status dataset=cooldown/infore2 stage=tokenize
+    python -m audio_tokenization clean dataset=cooldown/infore2 stage=materialize
 
 ``stage`` is always a single name. ``run`` and ``clean`` require it.
 ``plan`` / ``status`` default to inspecting all three when ``stage`` is unset.

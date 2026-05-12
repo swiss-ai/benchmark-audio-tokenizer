@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-DATASET=aozora_hurigana
+DATASET=cooldown/aozora_hurigana
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize|materialize> [hydra overrides...]" >&2

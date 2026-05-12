@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-DATASET=cooldown_tuda_de
+DATASET=cooldown/tuda_de
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize|materialize> [hydra overrides...]" >&2

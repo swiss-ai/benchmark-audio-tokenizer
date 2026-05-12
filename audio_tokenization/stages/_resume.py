@@ -16,10 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
 
-# Free-form labels caused two cycles of "is this a stage or a product?" already
-# (materialize calls itself "interleave" when invoking run_with_resume). Make
-# the allowed set explicit so adding a new stage forces a deliberate edit.
-StageLabel = Literal["convert", "tokenize", "interleave"]
+StageLabel = Literal["convert", "tokenize", "materialize"]
 
 from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.runtime import (

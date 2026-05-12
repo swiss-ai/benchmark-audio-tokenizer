@@ -45,7 +45,7 @@ ulimit -n 65536
 uv pip install --python /opt/venv/bin/python polars
 
 python -m audio_tokenization run \
-    dataset=libriheavy_large \
+    dataset=stage2/libriheavy_large \
     stage=convert \
     dataset.source.path="${PARQUET_ROOT}/${SHARD_ID}" \
     dataset.outputs.shar_dir="${NODE_SHAR_DIR}"

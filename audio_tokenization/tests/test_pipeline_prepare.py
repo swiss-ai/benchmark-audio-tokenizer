@@ -82,8 +82,8 @@ def _namespace_to_plain_dict(ns):
 
 
 def test_load_dataset_spec_infore2_and_aozora():
-    infore2 = load_dataset_spec(_load_dataset_cfg("cooldown_infore2"))
-    aozora = load_dataset_spec(_load_dataset_cfg("aozora_hurigana"))
+    infore2 = load_dataset_spec(_load_dataset_cfg("cooldown/infore2"))
+    aozora = load_dataset_spec(_load_dataset_cfg("cooldown/aozora_hurigana"))
 
     assert infore2.name == "cooldown_infore2"
     assert infore2.convert.family == "parquet"
@@ -99,6 +99,28 @@ def test_load_dataset_spec_infore2_and_aozora():
         "rendition",
         "line_num",
     ]
+
+
+def test_load_nested_sft_dataset_spec():
+    spec = load_dataset_spec(_load_dataset_cfg("sft/teleantifraud_matching"))
+
+    assert spec.name == "sft_teleantifraud_matching"
+    assert spec.convert.family == "parquet"
+    assert spec.tokenize.mode == "audio_cache"
+    assert spec.materialize.sft.enabled is True
+
+
+def test_load_nested_stage2_and_internal_specs():
+    stage2 = load_dataset_spec(_load_dataset_cfg("stage2/libriheavy_large"))
+    internal = load_dataset_spec(_load_dataset_cfg("internal/srg_apertus"))
+
+    assert stage2.name == "libriheavy_large"
+    assert stage2.convert.output.shar_dir.endswith("/SHAR/stage_2/libriheavy_large")
+    assert stage2.tokenize is None
+
+    assert internal.name == "internal_srg_apertus"
+    assert internal.convert.output.shar_dir.endswith("/SHAR/internal-only/srg_apertus")
+    assert internal.materialize.interleave.enabled is True
 
 
 def test_load_dataset_spec_does_not_reconfigure_logging(monkeypatch):
@@ -1337,32 +1359,37 @@ def test_run_convert_preflights_exactly_once_via_runner(tmp_path, monkeypatch):
 
 
 def test_split_command_defaults_to_run():
-    assert _split_command(["dataset=infore2"]) == ("run", ["dataset=infore2"])
+    assert _split_command(["dataset=cooldown/infore2"]) == ("run", ["dataset=cooldown/infore2"])
 
 
 def test_split_command_explicit_status():
-    assert _split_command(["status", "dataset=infore2"]) == (
+    assert _split_command(["status", "dataset=cooldown/infore2"]) == (
         "status",
-        ["dataset=infore2"],
+        ["dataset=cooldown/infore2"],
     )
 
 
 def test_root_pipeline_config_leaves_stage_missing_without_override():
-    cfg = _compose_pipeline_cfg(["dataset=libriheavy_large"])
+    cfg = _compose_pipeline_cfg(["dataset=stage2/libriheavy_large"])
 
     assert OmegaConf.is_missing(cfg, "stage")
     assert cfg.dataset.name == "libriheavy_large"
 
 
+def test_root_pipeline_config_requires_dataset_override():
+    with pytest.raises(Exception, match="dataset"):
+        _compose_pipeline_cfg([])
+
+
 def test_root_pipeline_config_accepts_explicit_stage_override():
-    cfg = _compose_pipeline_cfg(["dataset=libriheavy_large", "stage=convert"])
+    cfg = _compose_pipeline_cfg(["dataset=stage2/libriheavy_large", "stage=convert"])
 
     assert cfg.stage == "convert"
     assert cfg.dataset.name == "libriheavy_large"
 
 
 def test_plan_without_stage_override_inspects_all_stages(monkeypatch):
-    cfg = _compose_pipeline_cfg(["dataset=libriheavy_large"])
+    cfg = _compose_pipeline_cfg(["dataset=stage2/libriheavy_large"])
     seen: dict[str, object] = {}
 
     def _fake_plan(_spec, *, stage):
@@ -1379,7 +1406,7 @@ def test_plan_without_stage_override_inspects_all_stages(monkeypatch):
 
 
 def test_run_without_stage_override_fails_before_defaulting_to_convert(monkeypatch):
-    cfg = _compose_pipeline_cfg(["dataset=libriheavy_large"])
+    cfg = _compose_pipeline_cfg(["dataset=stage2/libriheavy_large"])
 
     def _fake_run(_spec, *, stage, resume):
         if stage is None:

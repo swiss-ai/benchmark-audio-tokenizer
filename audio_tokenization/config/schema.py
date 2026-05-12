@@ -27,7 +27,7 @@ from audio_tokenization.prepare.metadata import normalize_optional_path
 
 
 PrepareFamily = Literal["parquet", "hf", "wds", "audio_dir", "lhotse_recipe"]
-TokenizeMode = Literal["audio_only", "audio_text"]
+TokenizeMode = Literal["audio_only", "audio_text", "audio_cache"]
 AudioTextFormat = Literal["direct", "interleaved"]
 AudioTextTask = Literal["transcribe", "translate", "annotate"]
 
@@ -569,13 +569,28 @@ class TokenizeSpec(SchemaModel):
     tokenizer: TokenizerSpec
     output: TokenizeOutputSpec
     mode: TokenizeMode = "audio_only"
-    audio_text_format: AudioTextFormat = "direct"
-    audio_text_task: AudioTextTask = "transcribe"
+    audio_text_format: AudioTextFormat | None = None
+    audio_text_task: AudioTextTask | None = None
+    resampling_backend: str | None = "soxr"
     input_shar_dir: OptStrList = None
     partitioning: dict[str, Any] | None = None
     filter: TokenizeFilterSpec = Field(default_factory=TokenizeFilterSpec)
     dataloader: TokenizeDataloaderSpec = Field(default_factory=TokenizeDataloaderSpec)
     wandb: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_audio_text_fields_for_non_audio_text(cls, value: Any):
+        if not isinstance(value, Mapping):
+            return value
+        mode = value.get("mode", "audio_only")
+        if mode == "audio_text":
+            return value
+        leaked = sorted(k for k in ("audio_text_format", "audio_text_task") if k in value)
+        if leaked:
+            keys = ", ".join(leaked)
+            raise ValueError(f"{keys} only apply when tokenize.mode='audio_text'; got mode={mode!r}")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -592,7 +607,12 @@ class TokenizeSpec(SchemaModel):
     @model_validator(mode="after")
     def _normalize_runtime_dicts(self):
         update: dict[str, Any] = {"wandb": _normalize_wandb_config(self.wandb)}
-        is_interleaved = self.mode == "audio_text" and self.audio_text_format == "interleaved"
+        if self.mode == "audio_text":
+            update["audio_text_format"] = self.audio_text_format or "direct"
+            update["audio_text_task"] = self.audio_text_task or "transcribe"
+        is_interleaved = self.mode == "audio_text" and (
+            update.get("audio_text_format", self.audio_text_format) == "interleaved"
+        )
         if is_interleaved or self.partitioning is not None:
             update["partitioning"] = _normalize_interleave_partitioning(self.partitioning)
         return self.model_copy(update=update)
@@ -601,16 +621,16 @@ class TokenizeSpec(SchemaModel):
         """Output-shaping subset of the spec, for resume-safety checks."""
         f = self.filter
         d = self.dataloader
-        return {
+        uses_audio_text = self.mode == "audio_text"
+        payload = {
             "tokenizer_path": normalize_optional_path(self.tokenizer.path),
             "tokenizer_sampling_rate": self.tokenizer.sampling_rate,
             "trim_last_tokens": self.tokenizer.trim_last_tokens,
             "mode": self.mode,
-            "audio_text_format": self.audio_text_format,
-            "audio_text_task": self.audio_text_task,
+            "resampling_backend": self.resampling_backend,
             "partitioning": (
                 self.partitioning
-                if self.mode == "audio_text" and self.audio_text_format == "interleaved"
+                if uses_audio_text and self.audio_text_format == "interleaved"
                 else None
             ),
             "input_shar_dir": sorted(self.input_shar_dir) if self.input_shar_dir else None,
@@ -627,6 +647,10 @@ class TokenizeSpec(SchemaModel):
             "sampler_shuffle": d.sampler_shuffle,
             "quadratic_duration": d.quadratic_duration,
         }
+        if uses_audio_text:
+            payload["audio_text_format"] = self.audio_text_format
+            payload["audio_text_task"] = self.audio_text_task
+        return payload
 
 
 class InterleaveProductSpec(SchemaModel):
@@ -659,10 +683,44 @@ class InterleaveProductSpec(SchemaModel):
         }
 
 
+class SftProductSpec(SchemaModel):
+    """SFT materialization product."""
+
+    enabled: StrictBool = False
+    conversations_dir: str | None = None
+    conversations_glob: NonEmptyStr = "*.parquet"
+    cache_dir: str | None = None
+    output_dir: str | None = None
+    tokenizer_path: str | None = None
+    max_seq_len: IntLike = 262144
+    seq_threshold: OptIntLike = None
+    audio_placeholder: NonEmptyStr = "<audio>"
+    messages_column: NonEmptyStr = "messages"
+    audio_ids_column: NonEmptyStr = "audio_ids"
+    num_workers: OptIntLike = None
+
+    def fingerprint_payload(self) -> dict[str, Any]:
+        """Output-shaping subset: excludes num_workers (operational)."""
+        return {
+            "enabled": self.enabled,
+            "conversations_dir": normalize_optional_path(self.conversations_dir),
+            "conversations_glob": self.conversations_glob,
+            "cache_dir": normalize_optional_path(self.cache_dir),
+            "output_dir": normalize_optional_path(self.output_dir),
+            "tokenizer_path": normalize_optional_path(self.tokenizer_path),
+            "max_seq_len": self.max_seq_len,
+            "seq_threshold": self.seq_threshold,
+            "audio_placeholder": self.audio_placeholder,
+            "messages_column": self.messages_column,
+            "audio_ids_column": self.audio_ids_column,
+        }
+
+
 class ProductMatrixSpec(SchemaModel):
     """Post-tokenize materializations."""
 
     interleave: InterleaveProductSpec = Field(default_factory=InterleaveProductSpec)
+    sft: SftProductSpec = Field(default_factory=SftProductSpec)
 
 
 class DatasetSpec(SchemaModel):
@@ -674,6 +732,13 @@ class DatasetSpec(SchemaModel):
     @model_validator(mode="after")
     def _validate_cross_section_invariants(self):
         interleave = self.materialize.interleave
+        sft = self.materialize.sft
+        if interleave.enabled and sft.enabled:
+            raise ValueError(
+                "Enable exactly one materialize product per dataset spec for now; "
+                "materialize.interleave.enabled and materialize.sft.enabled cannot "
+                "both be true."
+            )
         if interleave.enabled and interleave.cache_dir is None:
             if self.tokenize is None:
                 raise ValueError(
@@ -693,6 +758,26 @@ class DatasetSpec(SchemaModel):
                     "Set materialize.interleave.cache_dir explicitly to consume a "
                     "cache built by a different pipeline."
                 )
+        if sft.enabled:
+            if sft.conversations_dir is None:
+                raise ValueError("materialize.sft requires conversations_dir")
+            if sft.output_dir is None:
+                raise ValueError("materialize.sft requires output_dir")
+            if sft.tokenizer_path is None:
+                raise ValueError("materialize.sft requires tokenizer_path")
+            if sft.cache_dir is None:
+                if self.tokenize is None:
+                    raise ValueError(
+                        "materialize.sft with no explicit cache_dir "
+                        "requires a tokenize section so the audio cache path can be derived."
+                    )
+                if self.tokenize.mode != "audio_cache":
+                    raise ValueError(
+                        "materialize.sft with no explicit cache_dir "
+                        "requires tokenize.mode='audio_cache' to derive the cache path; got "
+                        f"mode={self.tokenize.mode!r}. Set materialize.sft.cache_dir "
+                        "explicitly to consume an external audio cache."
+                    )
         return self
 
     @classmethod

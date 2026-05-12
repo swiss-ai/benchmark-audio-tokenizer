@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-DATASET=cooldown_ghana_english_speech
+DATASET=cooldown/ghana_english_speech
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize> [hydra overrides...]" >&2

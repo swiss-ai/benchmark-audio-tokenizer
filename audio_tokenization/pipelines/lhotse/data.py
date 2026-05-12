@@ -111,7 +111,7 @@ def build_cutset(
     stats=None,
 ):
     """Load prepared Shar into a CutSet and apply post-load filters."""
-    _set_resampling_backend(rank)
+    _set_resampling_backend(rank, spec.resampling_backend)
 
     cuts = _load_shar_cutset(
         input_shar_dirs=input_shar_dirs,
@@ -287,8 +287,10 @@ def _shar_exists(shar_dir: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _set_resampling_backend(rank: int) -> None:
+def _set_resampling_backend(rank: int, backend: str | None) -> None:
     from lhotse.audio.resampling_backend import set_current_resampling_backend
 
-    set_current_resampling_backend("soxr")
-    logger.info(f"[rank {rank}] Using soxr resampling backend")
+    if not backend:
+        return
+    set_current_resampling_backend(str(backend))
+    logger.info("[rank %s] Using %s resampling backend", rank, backend)

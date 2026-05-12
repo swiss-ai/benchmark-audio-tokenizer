@@ -35,11 +35,6 @@ def resolve_authoring_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     conversion = _mapping(data.get("conversion"), "conversion")
     tokenization = _mapping(data.get("tokenization"), "tokenization")
     materialization = _mapping(data.get("materialization"), "materialization")
-    if "sft" in materialization:
-        raise ValueError(
-            "materialization.sft is not supported. SFT config was removed "
-            "until the SFT assembler lands with its schema and tests."
-        )
 
     source_type = _str_value(source.get("type") or recipe.get("source_type"), "source.type")
     pipeline_mode = _str_value(recipe.get("mode"), "recipe.mode")
@@ -131,7 +126,7 @@ def _build_tokenize(
     recipe: Mapping[str, Any],
 ) -> dict[str, Any]:
     mode, audio_text_format = _tokenize_mode(pipeline_mode, recipe)
-    return {
+    payload = {
         "tokenizer": {
             "path": _require_str(tokenizer, "path"),
             "sampling_rate": _get(tokenizer, "sampling_rate"),
@@ -144,8 +139,7 @@ def _build_tokenize(
             "shar_index_filename": _get(tokenization, "shar_index_filename"),
         },
         "mode": mode,
-        "audio_text_format": audio_text_format,
-        "audio_text_task": tokenization.get("audio_text_task", recipe.get("audio_text_task")),
+        "resampling_backend": _get(tokenization, "resampling_backend"),
         "input_shar_dir": tokenization.get("input_shar_dir"),
         "partitioning": tokenization.get("partitioning"),
         "filter": {
@@ -169,6 +163,10 @@ def _build_tokenize(
         },
         "wandb": tokenization.get("wandb", {}),
     }
+    if mode == "audio_text":
+        payload["audio_text_format"] = audio_text_format
+        payload["audio_text_task"] = tokenization.get("audio_text_task", recipe.get("audio_text_task"))
+    return payload
 
 
 def _build_materialize(
@@ -181,6 +179,7 @@ def _build_materialize(
     recipe: Mapping[str, Any],
 ) -> dict[str, Any]:
     interleave_defaults = _mapping(materialization.get("interleave"), "materialization.interleave")
+    sft_defaults = _mapping(materialization.get("sft"), "materialization.sft")
     interleave_enabled = bool(_materialize_value(
         materialization,
         interleave_defaults,
@@ -191,35 +190,43 @@ def _build_materialize(
     interleaved_dir = outputs.get("interleaved_dir")
     if interleaved_dir is None and tokenized_dir is not None:
         interleaved_dir = f"{tokenized_dir}/{outputs.get('name', name)}_interleaved"
-    return {
-        "interleave": {
-            "enabled": interleave_enabled,
-            "strategy": _materialize_value(materialization, interleave_defaults, "strategy"),
-            "cache_dir": _materialize_value(materialization, interleave_defaults, "cache_dir"),
-            "output_dir": _materialize_value(
-                materialization,
-                interleave_defaults,
-                "output_dir",
-                interleaved_dir,
-            ),
-            "tokenizer_path": _materialize_value(
-                materialization,
-                interleave_defaults,
-                "tokenizer_path",
-                tokenizer.get("path"),
-            ),
-            "max_seq_len": _materialize_value(materialization, interleave_defaults, "max_seq_len"),
-            "max_gap_sec": _materialize_value(materialization, interleave_defaults, "max_gap_sec"),
-            "seq_threshold": _materialize_value(materialization, interleave_defaults, "seq_threshold"),
-            "transcribe_ratio": _materialize_value(
-                materialization,
-                interleave_defaults,
-                "transcribe_ratio",
-            ),
-            "num_workers": _materialize_value(materialization, interleave_defaults, "num_workers"),
-            "tmp_dir": _materialize_value(materialization, interleave_defaults, "tmp_dir"),
-        },
-    }
+    nested = lambda key, fallback=None: _nested_materialize_value(sft_defaults, key, fallback)
+    sft_payload = _compact(
+        enabled=bool(nested("enabled", "sft" in materialization)),
+        conversations_dir=nested("conversations_dir"),
+        conversations_glob=nested("conversations_glob"),
+        cache_dir=nested("cache_dir"),
+        output_dir=nested("output_dir", outputs.get("sft_dir")),
+        tokenizer_path=nested("tokenizer_path", tokenizer.get("path")),
+        max_seq_len=nested("max_seq_len"),
+        seq_threshold=nested("seq_threshold"),
+        audio_placeholder=nested("audio_placeholder"),
+        messages_column=nested("messages_column"),
+        audio_ids_column=nested("audio_ids_column"),
+        num_workers=nested("num_workers"),
+    )
+
+    top = lambda key, fallback=None: _materialize_value(materialization, interleave_defaults, key, fallback)
+    interleave_payload = _compact(
+        enabled=interleave_enabled,
+        strategy=top("strategy"),
+        cache_dir=top("cache_dir"),
+        output_dir=top("output_dir", interleaved_dir),
+        tokenizer_path=top("tokenizer_path", tokenizer.get("path")),
+        max_seq_len=top("max_seq_len"),
+        max_gap_sec=top("max_gap_sec"),
+        seq_threshold=top("seq_threshold"),
+        transcribe_ratio=top("transcribe_ratio"),
+        num_workers=top("num_workers"),
+        tmp_dir=top("tmp_dir"),
+    )
+
+    return {"interleave": interleave_payload, "sft": sft_payload}
+
+
+def _compact(**fields: Any) -> dict[str, Any]:
+    """Build a dict dropping keys whose value is ``None``."""
+    return {key: value for key, value in fields.items() if value is not None}
 
 
 def _source_family(source_type: str) -> str:
@@ -320,20 +327,24 @@ def _metadata(
     return out
 
 
-def _tokenize_mode(pipeline_mode: str, recipe: Mapping[str, Any]) -> tuple[str, str]:
+def _tokenize_mode(pipeline_mode: str, recipe: Mapping[str, Any]) -> tuple[str, str | None]:
     mode = recipe.get("tokenize_mode")
     fmt = recipe.get("audio_text_format")
     if mode and fmt:
         return str(mode), str(fmt)
+    if mode:
+        return str(mode), None
     if pipeline_mode == "audio_only":
-        return "audio_only", "direct"
+        return "audio_only", None
     if pipeline_mode == "audio_text_direct":
         return "audio_text", "direct"
     if pipeline_mode == "audio_text_interleaved":
         return "audio_text", "interleaved"
+    if pipeline_mode == "sft_audio":
+        return "audio_cache", None
     raise ValueError(
         "recipe.mode must be one of audio_only, audio_text_direct, "
-        f"audio_text_interleaved; got {pipeline_mode!r}"
+        f"audio_text_interleaved, sft_audio; got {pipeline_mode!r}"
     )
 
 
@@ -362,6 +373,18 @@ def _materialize_value(
     if value is not None:
         return value
     value = interleave_defaults.get(key)
+    if value is not None:
+        return value
+    return fallback
+
+
+def _nested_materialize_value(
+    product_defaults: Mapping[str, Any],
+    key: str,
+    fallback: Any = None,
+) -> Any:
+    """Resolve product-local materialize values without top-level leakage."""
+    value = product_defaults.get(key)
     if value is not None:
         return value
     return fallback

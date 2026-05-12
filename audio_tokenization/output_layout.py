@@ -25,6 +25,9 @@ def build_tokenize_output_subdir(spec: TokenizeSpec, *, dataset_name: str) -> Pa
             return Path(INTERLEAVE_CACHE_OUTPUT_STEM) / output_name
         return Path(spec.audio_text_task) / output_name
 
+    if spec.mode == "audio_cache":
+        return Path("audio_cache") / output_name
+
     return Path("audio_only") / output_name
 
 

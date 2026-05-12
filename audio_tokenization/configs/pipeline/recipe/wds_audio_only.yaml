@@ -1,7 +1,6 @@
 recipe:
   mode: audio_only
   source_type: wds
-  materialize_interleave: false
 
 source:
   type: wds
@@ -55,7 +54,7 @@ conversion:
 tokenization:
   input_shar_dir: null
   partitioning: null
-  audio_text_task: transcribe
+  resampling_backend: soxr
   min_duration: 1.0
   max_duration: 200.0
   min_sample_rate: 16000
@@ -74,17 +73,3 @@ tokenization:
   shar_index_filename: shar_index.json
   wandb:
     enabled: true
-
-materialization:
-  interleave:
-    enabled: false
-    strategy: shift_by_one
-    cache_dir: null
-    output_dir: null
-    tokenizer_path: null
-    max_seq_len: 262144
-    max_gap_sec: null
-    seq_threshold: null
-    transcribe_ratio: null
-    num_workers: null
-    tmp_dir: null

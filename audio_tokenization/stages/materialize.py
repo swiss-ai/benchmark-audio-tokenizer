@@ -9,6 +9,7 @@ from typing import Any
 from audio_tokenization.config.schema import (
     DatasetSpec,
     InterleaveProductSpec,
+    SftProductSpec,
 )
 from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.runtime import resolve_num_workers
@@ -18,6 +19,7 @@ from audio_tokenization.stages._plans import (
 )
 from audio_tokenization.stages._provenance import (
     build_interleave_resume_fingerprint,
+    build_sft_resume_fingerprint,
     read_stage_provenance,
 )
 from audio_tokenization.stages._resume import run_with_resume
@@ -28,14 +30,36 @@ logger = logging.getLogger(__name__)
 
 
 INTERLEAVE_STATE_FILE = "products_interleave_state.json"
+SFT_STATE_FILE = "products_sft_state.json"
 
 
 def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
     interleave = spec.materialize.interleave
-    if not interleave.enabled:
-        return disabled_stage_plan(stage="materialize", reason="interleave.disabled")
+    sft = spec.materialize.sft
+    if interleave.enabled:
+        return _resolve_interleave_materialize_plan(spec)
+    if sft.enabled:
+        return _resolve_sft_materialize_plan(spec)
+    return disabled_stage_plan(stage="materialize", reason="materialize.disabled")
 
-    parquet_dir = _resolve_parquet_dir(spec, interleave)
+
+def run_materialize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
+    interleave = spec.materialize.interleave
+    sft = spec.materialize.sft
+    if interleave.enabled:
+        return _resolve_interleave_materialize_plan(spec).execute(resume)
+    if sft.enabled:
+        return _resolve_sft_materialize_plan(spec).execute(resume)
+    raise ValueError(
+        "stage=materialize requested but DatasetSpec has no materialize section. "
+        "Add a materialization.interleave or materialization.sft product section "
+        "with output_dir to enable this stage."
+    )
+
+
+def _resolve_interleave_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
+    interleave = spec.materialize.interleave
+    parquet_dir = _resolve_product_cache_dir(spec, interleave)
     tokenizer_path = _resolve_tokenizer_path(spec, interleave)
     output_dir = Path(interleave.output_dir) if interleave.output_dir is not None else None
     if output_dir is None:
@@ -65,6 +89,7 @@ def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
             "success_marker": str(output_dir / SUCCESS_MARKER_FILE),
         },
         effective={
+            "product": "interleave",
             "strategy": interleave.strategy,
             "max_seq_len": interleave.max_seq_len,
             "max_gap_sec": interleave.max_gap_sec,
@@ -74,9 +99,8 @@ def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
         output_dir=output_dir,
         state_path=output_dir / INTERLEAVE_STATE_FILE,
         success_marker=output_dir / SUCCESS_MARKER_FILE,
-        preflight=lambda: _preflight_materialize_plan(spec, interleave, parquet_dir),
+        preflight=lambda: _preflight_materialize_plan(interleave, parquet_dir),
         execute=lambda resume: _execute_materialize_plan(
-            spec=spec,
             interleave=interleave,
             parquet_dir=parquet_dir,
             tokenizer_path=tokenizer_path,
@@ -87,28 +111,18 @@ def resolve_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
     )
 
 
-def run_materialize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
-    if not spec.materialize.interleave.enabled:
-        raise ValueError(
-            "stage=materialize requested but DatasetSpec has no materialize section. "
-            "Add materialization.interleave.enabled=true with output_dir to enable this stage."
-        )
-    interleave_plan = resolve_materialize_plan(spec)
-    return interleave_plan.execute(resume)
-
-
 def _preflight_materialize_plan(
-    spec: DatasetSpec, interleave: InterleaveProductSpec, parquet_dir: Path
+    interleave: InterleaveProductSpec, parquet_dir: Path
 ) -> None:
     if interleave.strategy != "shift_by_one":
         raise NotImplementedError(
-            f"materialize.interleave.strategy={interleave.strategy!r} is not wired "
-            "through the unified stage graph yet. Use the direct CLI: "
-            "`python -m audio_tokenization.interleave.pattern ...` or "
-            "`python -m audio_tokenization.interleave.greedy ...`."
+            f"materialize.interleave.strategy={interleave.strategy!r} is not supported. "
+            "Only 'shift_by_one' is wired through the stage graph. Legacy strategies "
+            "(greedy, pattern) were removed; recover the modules from git history "
+            "(`git log --diff-filter=D -- audio_tokenization/interleave/`) for ablation use."
         )
     if interleave.cache_dir is None:
-        _require_tokenize_success(parquet_dir)
+        _require_tokenize_success(parquet_dir, product="interleave")
     elif not parquet_dir.is_dir():
         raise FileNotFoundError(
             f"Explicit interleave cache_dir not found: {str(parquet_dir)!r}."
@@ -119,7 +133,6 @@ def _preflight_materialize_plan(
 
 def _execute_materialize_plan(
     *,
-    spec: DatasetSpec,
     interleave: InterleaveProductSpec,
     parquet_dir: Path,
     tokenizer_path: str,
@@ -127,7 +140,7 @@ def _execute_materialize_plan(
     fingerprint: dict[str, Any],
     resume: bool,
 ) -> dict[str, Any]:
-    _preflight_materialize_plan(spec, interleave, parquet_dir)
+    _preflight_materialize_plan(interleave, parquet_dir)
     argv = _build_interleave_argv(interleave, parquet_dir, tokenizer_path)
     return {
         "interleave": run_with_resume(
@@ -139,7 +152,7 @@ def _execute_materialize_plan(
                 "values. Either re-issue the matching config to resume, or remove "
                 f"{output_dir} and restart from scratch."
             ),
-            stage_label="interleave",
+            stage_label="materialize",
             resume=resume,
             work=lambda: _invoke_shift_by_one(argv),
             logger=logger,
@@ -147,9 +160,154 @@ def _execute_materialize_plan(
     }
 
 
-def _resolve_parquet_dir(spec: DatasetSpec, interleave: InterleaveProductSpec) -> Path:
-    if interleave.cache_dir is not None:
-        return Path(interleave.cache_dir)
+def _resolve_sft_materialize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
+    sft = spec.materialize.sft
+    conversations_dir = _resolve_sft_conversations_dir(sft)
+    cache_dir = _resolve_product_cache_dir(spec, sft)
+    tokenizer_path = _resolve_sft_tokenizer_path(sft)
+    output_dir = Path(sft.output_dir) if sft.output_dir is not None else None
+    if output_dir is None:
+        raise ValueError("materialize.sft.enabled=true requires output_dir.")
+
+    fingerprint = build_sft_resume_fingerprint(
+        sft,
+        conversations_dir=conversations_dir,
+        cache_dir=cache_dir,
+        tokenizer_path=tokenizer_path,
+        tokenize_provenance=read_stage_provenance(
+            [cache_dir], state_filename=TOKENIZE_STATE_FILE
+        ),
+    )
+
+    return ResolvedStagePlan(
+        stage="materialize",
+        enabled=True,
+        reason=None,
+        inputs={
+            "resolved_conversations_dir": str(conversations_dir),
+            "resolved_cache_dir": str(cache_dir),
+            "resolved_tokenizer_path": tokenizer_path,
+            "cache_was_explicit": sft.cache_dir is not None,
+        },
+        outputs={
+            "output_dir": str(output_dir),
+            "state_file": str(output_dir / SFT_STATE_FILE),
+            "success_marker": str(output_dir / SUCCESS_MARKER_FILE),
+        },
+        effective={
+            "product": "sft",
+            "max_seq_len": sft.max_seq_len,
+            "seq_threshold": sft.seq_threshold,
+            "audio_placeholder": sft.audio_placeholder,
+            "conversations_glob": sft.conversations_glob,
+            "messages_column": sft.messages_column,
+            "audio_ids_column": sft.audio_ids_column,
+            "num_workers": sft.num_workers,
+        },
+        fingerprint=fingerprint,
+        output_dir=output_dir,
+        state_path=output_dir / SFT_STATE_FILE,
+        success_marker=output_dir / SUCCESS_MARKER_FILE,
+        preflight=lambda: _preflight_sft_materialize_plan(
+            sft, conversations_dir, cache_dir
+        ),
+        execute=lambda resume: _execute_sft_materialize_plan(
+            sft=sft,
+            conversations_dir=conversations_dir,
+            cache_dir=cache_dir,
+            tokenizer_path=tokenizer_path,
+            output_dir=output_dir,
+            fingerprint=fingerprint,
+            resume=resume,
+        ),
+    )
+
+
+def _preflight_sft_materialize_plan(
+    sft: SftProductSpec,
+    conversations_dir: Path,
+    cache_dir: Path,
+) -> None:
+    """Validate SFT materialize inputs before resume creates output state."""
+    if not conversations_dir.is_dir():
+        raise FileNotFoundError(f"SFT conversations_dir not found: {str(conversations_dir)!r}.")
+    if sft.cache_dir is None:
+        _require_tokenize_success(cache_dir, product="sft")
+    elif not cache_dir.is_dir():
+        raise FileNotFoundError(f"SFT audio cache_dir not found: {str(cache_dir)!r}.")
+    if sft.output_dir is None:
+        raise ValueError("materialize.sft requires output_dir.")
+    if sft.tokenizer_path is None:
+        raise ValueError("materialize.sft requires tokenizer_path.")
+    from audio_tokenization.sft.preflight import validate_sft_package
+
+    validate_sft_package(
+        conversations_dir=conversations_dir,
+        conversations_glob=sft.conversations_glob,
+        messages_column=sft.messages_column,
+        audio_ids_column=sft.audio_ids_column,
+        audio_placeholder=sft.audio_placeholder,
+    )
+
+
+def _execute_sft_materialize_plan(
+    *,
+    sft: SftProductSpec,
+    conversations_dir: Path,
+    cache_dir: Path,
+    tokenizer_path: str,
+    output_dir: Path,
+    fingerprint: dict[str, Any],
+    resume: bool,
+) -> dict[str, Any]:
+    _preflight_sft_materialize_plan(sft, conversations_dir, cache_dir)
+
+    def _work() -> dict[str, Any]:
+        from audio_tokenization.sft.materialize import (
+            SftMaterializeConfig,
+            materialize_sft,
+        )
+
+        return materialize_sft(
+            SftMaterializeConfig(
+                conversations_dir=conversations_dir,
+                cache_dir=cache_dir,
+                output_dir=output_dir,
+                tokenizer_path=tokenizer_path,
+                max_seq_len=sft.max_seq_len,
+                seq_threshold=sft.seq_threshold,
+                audio_placeholder=sft.audio_placeholder,
+                conversations_glob=sft.conversations_glob,
+                messages_column=sft.messages_column,
+                audio_ids_column=sft.audio_ids_column,
+                num_workers=resolve_num_workers(sft.num_workers),
+            )
+        )
+
+    return {
+        "sft": run_with_resume(
+            output_dir=output_dir,
+            state_filename=SFT_STATE_FILE,
+            fingerprint=fingerprint,
+            guidance=(
+                "SFT product at this path was produced under different spec "
+                "values. Either re-issue the matching config to resume, or remove "
+                f"{output_dir} and restart from scratch."
+            ),
+            stage_label="materialize",
+            resume=resume,
+            work=_work,
+            logger=logger,
+        )
+    }
+
+
+def _resolve_product_cache_dir(
+    spec: DatasetSpec, product: InterleaveProductSpec | SftProductSpec
+) -> Path:
+    """Resolve a materialize product's cache dir: explicit, or derived from tokenize."""
+    if product.cache_dir is not None:
+        return Path(product.cache_dir)
 
     assert spec.tokenize is not None  # gated by DatasetSpec cross-section validator
     from audio_tokenization.output_layout import resolve_tokenize_output_dir
@@ -169,18 +327,30 @@ def _resolve_tokenizer_path(spec: DatasetSpec, interleave: InterleaveProductSpec
     )
 
 
-def _require_tokenize_success(cache_dir: Path) -> None:
+def _resolve_sft_conversations_dir(sft: SftProductSpec) -> Path:
+    if sft.conversations_dir is None:
+        raise ValueError("materialize.sft requires conversations_dir.")
+    return Path(sft.conversations_dir)
+
+
+def _resolve_sft_tokenizer_path(sft: SftProductSpec) -> str:
+    if sft.tokenizer_path is None:
+        raise ValueError("materialize.sft requires tokenizer_path.")
+    return sft.tokenizer_path
+
+
+def _require_tokenize_success(cache_dir: Path, *, product: str) -> None:
     marker = cache_dir / SUCCESS_MARKER_FILE
     if not marker.is_file():
         raise RuntimeError(
-            f"Derived interleave cache at {str(cache_dir)!r} is missing {SUCCESS_MARKER_FILE}. "
-            "Run `stage=tokenize` first, or set materialize.interleave.cache_dir "
+            f"Derived {product} cache at {str(cache_dir)!r} is missing {SUCCESS_MARKER_FILE}. "
+            f"Run `stage=tokenize` first, or set materialize.{product}.cache_dir "
             "explicitly to consume an externally built cache."
         )
     state_path = cache_dir / TOKENIZE_STATE_FILE
     if not state_path.is_file():
         raise RuntimeError(
-            f"Derived interleave cache at {str(cache_dir)!r} is missing {TOKENIZE_STATE_FILE}. "
+            f"Derived {product} cache at {str(cache_dir)!r} is missing {TOKENIZE_STATE_FILE}. "
             "Tokenize must complete successfully before materialize can derive its "
             "input cache from this pipeline."
         )

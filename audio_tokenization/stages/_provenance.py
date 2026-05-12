@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Sequence
 
-from audio_tokenization.config.schema import DatasetSpec, InterleaveProductSpec
+from audio_tokenization.config.schema import DatasetSpec, InterleaveProductSpec, SftProductSpec
 from audio_tokenization.prepare.constants import (
     PREPARE_STATE_FILE,
     state_version_for_filename,
@@ -69,6 +69,23 @@ def build_interleave_resume_fingerprint(
 ) -> dict[str, Any]:
     """Resume fingerprint for interleave, including resolved derived inputs."""
     fingerprint = dict(interleave.fingerprint_payload())
+    fingerprint["resolved_cache_dir"] = normalize_optional_path(cache_dir)
+    fingerprint["resolved_tokenizer_path"] = normalize_optional_path(tokenizer_path)
+    fingerprint["input_tokenize_state_by_cache_dir"] = dict(tokenize_provenance or {})
+    return fingerprint
+
+
+def build_sft_resume_fingerprint(
+    sft: SftProductSpec,
+    *,
+    conversations_dir: str | Path,
+    cache_dir: str | Path,
+    tokenizer_path: str | Path,
+    tokenize_provenance: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Resume fingerprint for SFT materialization."""
+    fingerprint = dict(sft.fingerprint_payload())
+    fingerprint["resolved_conversations_dir"] = normalize_optional_path(conversations_dir)
     fingerprint["resolved_cache_dir"] = normalize_optional_path(cache_dir)
     fingerprint["resolved_tokenizer_path"] = normalize_optional_path(tokenizer_path)
     fingerprint["input_tokenize_state_by_cache_dir"] = dict(tokenize_provenance or {})

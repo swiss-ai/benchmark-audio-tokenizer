@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-DATASET=${DATASET:-stage1_ups_all_lang_vad}
+DATASET=${DATASET:-stage1/ups_all_lang_vad}
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize> [hydra overrides...]" >&2

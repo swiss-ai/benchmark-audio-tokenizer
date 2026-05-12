@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-DATASET=stage1_gemeinderat
+DATASET=stage1/gemeinderat
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize> [hydra overrides...]" >&2

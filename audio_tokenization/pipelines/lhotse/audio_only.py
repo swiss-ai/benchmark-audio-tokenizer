@@ -9,6 +9,7 @@ import torch
 
 from audio_tokenization.config.schema import TokenizeSpec
 
+from ._unsupervised_batch import tokenize_unsupervised_batch
 from .checkpoint import finalize_shard_writer, open_chunk_writer
 
 
@@ -47,34 +48,16 @@ class AudioOnlyHandler:
         self.chunk_samples = 0
 
     def process_batch(self, batch, tokenizer, stats, target_sr, device):
-        # UnsupervisedWaveformDataset(collate=True) returns:
-        #   {"audio": tensor (B, T), "audio_lens": tensor (B,)}
-        audios = batch["audio"]           # (B, T) float
-        audio_lens = batch["audio_lens"]  # (B,) int -- original lengths
-        cuts = list(batch["cuts"])
+        encoded = tokenize_unsupervised_batch(
+            batch,
+            tokenizer,
+            target_sr=target_sr,
+            device=device,
+            dtype=torch.int64,
+        )
+        stats.errors += encoded.errors
 
-        batch_audio_secs = audio_lens.sum().item() / target_sr
-        audios_gpu = audios.to(device, non_blocking=True)
-
-        with torch.inference_mode():
-            token_list = tokenizer.tokenize_batch(
-                audios_gpu,
-                target_sr,
-                orig_audio_samples=audio_lens.tolist(),
-                pad_audio_samples=audios.shape[1],
-            )
-
-        # Single batched GPU→CPU transfer: cat, one sync, split
-        valid_pairs = [(t, cut) for t, cut in zip(token_list, cuts) if t is not None]
-        stats.errors += len(token_list) - len(valid_pairs)
-        if not valid_pairs:
-            return batch_audio_secs
-
-        lengths = [t.shape[0] for t, _ in valid_pairs]
-        all_cpu = torch.cat([t for t, _ in valid_pairs]).to(dtype=torch.int64).cpu()
-        cpu_tensors = all_cpu.split(lengths)
-
-        for t, (_, cut) in zip(cpu_tensors, valid_pairs):
+        for t, cut in encoded.tokens_and_cuts:
             self._builder.add_item(t)
             self._builder.end_document()
             self._cut_ids.write(cut.id)
@@ -82,7 +65,7 @@ class AudioOnlyHandler:
             stats.tokens_generated += len(t)
             self.chunk_samples += 1
 
-        return batch_audio_secs
+        return encoded.audio_seconds
 
     def checkpoint_writer(self) -> int:
         finalize_shard_writer(

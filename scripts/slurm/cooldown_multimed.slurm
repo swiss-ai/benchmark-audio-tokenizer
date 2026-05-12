@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-DATASET=cooldown_multimed
+DATASET=cooldown/multimed
 STAGE=${1:-}
 if [ -z "${STAGE}" ]; then
     echo "Usage: sbatch [resources] $0 <convert|tokenize|materialize> [hydra overrides...]" >&2

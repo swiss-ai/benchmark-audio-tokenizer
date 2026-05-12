@@ -11,9 +11,6 @@ from pathlib import Path
 import shutil
 from typing import Any, Callable
 
-from audio_tokenization.prepare.runtime import read_prepare_state
-from audio_tokenization.stages._resume import diff_fingerprint
-
 
 def _noop_preflight() -> None:
     return None
@@ -38,11 +35,11 @@ class ResolvedStagePlan:
     effective: dict[str, Any]
     fingerprint: dict[str, Any]
     output_dir: Path | None
-    state_path: Path | None
     success_marker: Path | None
     reason: str | None = None
+    state_path: Path | None = None  # deprecated; kept for caller compatibility during refactor
     preflight: Callable[[], None] = field(default=_noop_preflight, repr=False)
-    execute: Callable[[bool], dict[str, Any]] = field(default=lambda _resume: {}, repr=False)
+    execute: Callable[[bool], dict[str, Any]] = field(default=lambda _overwrite: {}, repr=False)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -55,10 +52,16 @@ class ResolvedStagePlan:
             "fingerprint": _serialize(self.fingerprint),
             "paths": {
                 "output_dir": _serialize(self.output_dir),
-                "state_path": _serialize(self.state_path),
                 "success_marker": _serialize(self.success_marker),
             },
         }
+
+
+def _disabled_execute_raises(_overwrite):
+    raise AssertionError(
+        "disabled_stage_plan.execute is not reachable from run_*; "
+        "use inspect_stage_plan for inspection paths."
+    )
 
 
 def disabled_stage_plan(*, stage: str, reason: str) -> ResolvedStagePlan:
@@ -71,9 +74,9 @@ def disabled_stage_plan(*, stage: str, reason: str) -> ResolvedStagePlan:
         effective={},
         fingerprint={},
         output_dir=None,
-        state_path=None,
         success_marker=None,
-        execute=lambda _resume: {"skipped": True, "reason": reason},
+        state_path=None,
+        execute=_disabled_execute_raises,
     )
 
 
@@ -91,7 +94,6 @@ def inspect_stage_plan(plan: ResolvedStagePlan) -> dict[str, Any]:
         preflight_error = f"{type(exc).__name__}: {exc}"
 
     output_dir = plan.output_dir
-    state_path = plan.state_path
     success_marker = plan.success_marker
 
     if preflight_error is not None:
@@ -105,21 +107,10 @@ def inspect_stage_plan(plan: ResolvedStagePlan) -> dict[str, Any]:
         payload["action"] = "skip"
         return payload
 
-    if success_marker is not None and success_marker.is_file() and state_path is not None and state_path.is_file():
-        on_disk = read_prepare_state(state_path)
-        drift = diff_fingerprint(plan.fingerprint, on_disk)
-        if drift:
-            payload["status"] = "dirty"
-            payload["action"] = "rebuild"
-            payload["drift"] = _serialize(
-                {k: {"expected": exp, "actual": act} for k, (exp, act) in drift.items()}
-            )
-        else:
-            payload["status"] = "ready"
-            payload["action"] = "skip"
-        return payload
-
-    if output_dir.exists():
+    if success_marker is not None and success_marker.is_file():
+        payload["status"] = "ready"
+        payload["action"] = "skip"
+    elif output_dir.exists():
         payload["status"] = "partial"
         payload["action"] = "rebuild"
     else:
