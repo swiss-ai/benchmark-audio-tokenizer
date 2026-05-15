@@ -37,7 +37,6 @@ class ResolvedStagePlan:
     output_dir: Path | None
     success_marker: Path | None
     reason: str | None = None
-    state_path: Path | None = None  # deprecated; kept for caller compatibility during refactor
     preflight: Callable[[], None] = field(default=_noop_preflight, repr=False)
     execute: Callable[[bool], dict[str, Any]] = field(default=lambda _overwrite: {}, repr=False)
 
@@ -64,18 +63,17 @@ def _disabled_execute_raises(_overwrite):
     )
 
 
-def disabled_stage_plan(*, stage: str, reason: str) -> ResolvedStagePlan:
+def disabled_stage_plan(*, stage: str, reason: str | None = None) -> ResolvedStagePlan:
     return ResolvedStagePlan(
         stage=stage,
         enabled=False,
-        reason=reason,
+        reason=reason if reason is not None else f"{stage}.disabled",
         inputs={},
         outputs={},
         effective={},
         fingerprint={},
         output_dir=None,
         success_marker=None,
-        state_path=None,
         execute=_disabled_execute_raises,
     )
 

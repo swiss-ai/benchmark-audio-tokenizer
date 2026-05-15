@@ -429,7 +429,7 @@ configs/pipeline/
 | `convert.*` | Raw source, conversion metadata, SHAR output, workers |
 | `tokenize.*` | SHAR input, tokenizer, filters, bucketing, DataLoader |
 | `materialize.interleave.*` | Interleave cache input and final sequence output |
-| `runtime.resume` | Resume only when `_SUCCESS` and state fingerprints match |
+| `runtime.overwrite` | Delete and rebuild an existing stage output instead of skipping `_SUCCESS` |
 
 ```bash
 # Override from CLI

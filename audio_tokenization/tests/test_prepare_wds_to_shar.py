@@ -232,7 +232,6 @@ def test_convert_worker_preserves_presegmented_clip_number_with_parser(monkeypat
         **kwargs,
     )
     monkeypatch.setitem(sys.modules, "lhotse.shar", fake_lhotse_shar)
-    monkeypatch.setattr(prepare_wds_to_shar, "check_worker_reuse", lambda *args, **kwargs: None)
     monkeypatch.setattr(prepare_wds_to_shar, "init_worker_process", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         prepare_wds_to_shar,
@@ -324,10 +323,9 @@ def test_run_uses_configured_mp_start_method_without_external_metadata(monkeypat
     )
 
     monkeypatch.setattr(prepare_wds_to_shar, "validate_prepare_runtime", lambda **_kwargs: None)
-    monkeypatch.setattr(prepare_wds_to_shar, "write_prepare_state_for_spec", lambda _spec: None)
     monkeypatch.setattr(
         prepare_wds_to_shar,
-        "ensure_worker_assignment",
+        "resolve_num_workers",
         lambda *_args, **_kwargs: 1,
     )
     monkeypatch.setattr(prepare_wds_to_shar, "load_text_tokenizer", lambda _path: None)

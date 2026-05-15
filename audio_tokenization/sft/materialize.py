@@ -56,6 +56,7 @@ class _SftWorkerArgs:
     worker_id: int
     row_groups: list[_SftRowGroup]
     config: SftMaterializeConfig
+    vocab_size: int
 
 
 class _SftShardWriter:
@@ -146,8 +147,20 @@ def materialize_sft(config: SftMaterializeConfig) -> dict[str, Any]:
     )
     num_workers = resolve_num_workers(config.num_workers, num_inputs=len(row_groups))
     assignments = _assign_sft_row_groups(row_groups, num_workers=num_workers)
+    # Existing caches without _MANIFEST.json are rejected deliberately: SFT
+    # materialization must not guess whether cached audio IDs use this tokenizer.
+    cache_manifest = validate_audio_token_cache_manifest(config.cache_dir, tokenizer_path=config.tokenizer_path)
+    cache = load_audio_token_cache(config.cache_dir)
+    _validate_conversation_audio_ids_in_cache(row_groups, config=config, cache=cache)
+    tokenizer = load_sft_chat_tokenizer(config.tokenizer_path)
+    vocab_size = _sft_output_vocab_size(tokenizer, cache_manifest)
     worker_args = [
-        _SftWorkerArgs(worker_id=worker_id, row_groups=items, config=config)
+        _SftWorkerArgs(
+            worker_id=worker_id,
+            row_groups=items,
+            config=config,
+            vocab_size=vocab_size,
+        )
         for worker_id, items in enumerate(assignments)
         if items
     ]
@@ -166,12 +179,6 @@ def materialize_sft(config: SftMaterializeConfig) -> dict[str, Any]:
             "success": True,
         }
 
-    # Existing caches without _MANIFEST.json are rejected deliberately: SFT
-    # materialization must not guess whether cached audio IDs use this tokenizer.
-    validate_audio_token_cache_manifest(config.cache_dir, tokenizer_path=config.tokenizer_path)
-    cache = load_audio_token_cache(config.cache_dir)
-    _validate_conversation_audio_ids_in_cache(row_groups, config=config, cache=cache)
-    tokenizer = load_sft_chat_tokenizer(config.tokenizer_path)
     _set_shared_audio_cache(cache)
     _set_shared_chat_tokenizer(tokenizer)
     try:
@@ -205,7 +212,7 @@ def _materialize_sft_worker(args: _SftWorkerArgs) -> dict[str, Any]:
     output_dir = Path(config.output_dir)
     cache = _require_shared_audio_cache()
     tokenizer = _require_shared_chat_tokenizer()
-    vocab_size = len(tokenizer)
+    vocab_size = args.vocab_size
 
     samples = 0
     tokens_written = 0
@@ -257,6 +264,13 @@ def _materialize_sft_worker(args: _SftWorkerArgs) -> dict[str, Any]:
         "stage2_tokens": bucket_tokens["stage2"],
         "lct_tokens": bucket_tokens["lct"],
     }
+
+
+def _sft_output_vocab_size(tokenizer: Any, cache_manifest: dict[str, Any]) -> int:
+    cache_vocab_size = cache_manifest.get("vocab_size")
+    if cache_vocab_size is None:
+        return len(tokenizer)
+    return max(len(tokenizer), int(cache_vocab_size))
 
 
 def _sft_output_bucket(

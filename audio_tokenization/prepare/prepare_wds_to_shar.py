@@ -30,6 +30,7 @@ from audio_tokenization.prepare.audio_ops import (
     write_cut_to_shar,
 )
 from audio_tokenization.prepare.cli import expand_path_patterns
+from audio_tokenization.prepare.constants import PREPARE_SHAR_COMMIT_MODE
 from audio_tokenization.prepare.identity import (
     resolve_input_source_and_clip_num,
     set_interleave_metadata,
@@ -39,15 +40,14 @@ from audio_tokenization.prepare.metadata import (
     lookup_external_metadata,
 )
 from audio_tokenization.prepare.runtime import (
-    check_worker_reuse,
     distribute_round_robin,
-    ensure_worker_assignment,
     init_worker_process,
     maybe_log_worker_progress,
     coerce_resolved_inputs,
+    resolve_num_workers,
     run_pool_and_finalize,
+    setup_partition_dir,
     validate_prepare_runtime,
-    write_prepare_state_for_spec,
     write_worker_result,
 )
 from audio_tokenization.prepare.text_ops import (
@@ -344,9 +344,9 @@ def iter_tar_cuts(
 def _convert_worker(args: WdsWorkerArgs):
     """Convert a subset of WDS tar shards to Shar.
 
-    Each worker writes to its own ``worker_XX/`` directory to avoid contention.
-    Resume is considered complete only when ``worker_XX/_SUCCESS`` exists.
-    Partial output (cuts manifests without marker) is deleted and recomputed.
+    Each worker writes to its own ``worker_XX/`` directory to avoid contention,
+    and marks completion with ``worker_XX/_SUCCESS``. The stage-level contract
+    is owned by ``run_stage``; partition success is a lower-level signal.
     """
     worker_id = args.worker_id
     tar_paths = args.tar_paths
@@ -369,9 +369,8 @@ def _convert_worker(args: WdsWorkerArgs):
     input_clip_id_parser_name = args.input_clip_id_parser_name
     language = args.language
 
-    reused = check_worker_reuse(worker_id, shar_dir)
-    if reused is not None:
-        return reused
+    worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
+    setup_partition_dir(worker_dir, worker_id=worker_id, logger=logger)
     init_worker_process(resampling_backend)
 
     from lhotse.shar import SharWriter
@@ -396,7 +395,6 @@ def _convert_worker(args: WdsWorkerArgs):
         vad_lookup = {}
         lang_lookup = {}
 
-    worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
     t0 = time.time()
     written = skipped = errors = 0
     next_log_at = 1000
@@ -417,6 +415,7 @@ def _convert_worker(args: WdsWorkerArgs):
         output_dir=str(worker_dir),
         fields={"recording": shar_format},
         shard_size=shard_size,
+        commit=PREPARE_SHAR_COMMIT_MODE,
     ) as writer:
         keep_ids = set(vad_lookup) if use_vad_segmenting else None
         for cut in iter_tar_cuts(tar_paths, provider=provider, stats=runtime_counts, keep_ids=keep_ids, language=language):
@@ -520,8 +519,6 @@ def _convert_worker(args: WdsWorkerArgs):
 # CLI
 # ---------------------------------------------------------------------------
 
-_ITEMS_KEY = "resolved_shards"
-
 
 def resolve(spec) -> tuple[list[str], dict]:
     """Resolve WebDataset tar shards for this prepare family."""
@@ -542,8 +539,10 @@ def preflight(
     spec,
     *,
     runtime_validator=validate_prepare_runtime,
+    resolved_inputs: list[str] | None = None,
 ) -> None:
     """Validate generic WDS prepare prerequisites."""
+    del resolved_inputs
     i, o = spec.input, spec.output
     runtime_validator(
         resampling_backend=o.resampling_backend,
@@ -567,7 +566,6 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
         raise ValueError("prepare.input.wds_shards is required")
 
     resolved = coerce_resolved_inputs(spec, resolved_inputs)
-    preflight(spec, runtime_validator=validate_prepare_runtime)
 
     vad_per_shard_dir = Path(i.vad_per_shard_dir) if i.vad_per_shard_dir else None
     if i.vad_segmentation and vad_per_shard_dir:
@@ -589,11 +587,8 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
         logger.info("VAD segmenting disabled; writing full recordings")
 
     shar_dir.mkdir(parents=True, exist_ok=True)
-    write_prepare_state_for_spec(spec)
 
-    num_workers = ensure_worker_assignment(
-        shar_dir, resolved, o.num_workers, _ITEMS_KEY, "WDS shards",
-    )
+    num_workers = resolve_num_workers(o.num_workers, num_inputs=len(resolved))
 
     logger.info(f"Found {len(resolved)} WDS shards, using {num_workers} workers")
     logger.info(f"Output: {shar_dir}")
@@ -647,5 +642,3 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
 
     run_pool_and_finalize(_convert_worker, worker_args, shar_dir, num_workers,
                           mp_start_method=mp_start_method)
-
-

@@ -254,7 +254,7 @@ class TokenizeAssignment:
 
     This object is intentionally not a dataset artifact: it depends on
     ``world_size``. It is written under the tokenization
-    output directory so resume/debug can inspect exactly what each rank owned.
+    output directory so debug tools can inspect exactly what each rank owned.
     """
 
     world_size: int

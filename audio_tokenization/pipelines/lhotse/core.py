@@ -298,19 +298,13 @@ def tokenize_loop(
             rank,
             world_size,
         )
-        result = cumulative_stats.finalize()
-        result["rank"] = rank
+        from .stats_reducer import write_rank_stats, zero_rank_stats
+
+        result = zero_rank_stats(rank=rank, world_size=world_size)
+        result.update(cumulative_stats.finalize())
         result["chunks_written"] = 0
         result["output_dir"] = output_dir
-        result["success"] = True
-        from .stats_reducer import (
-            maybe_publish_terminal_artifacts,
-            write_rank_stats,
-        )
-
         write_rank_stats(output_dir, result)
-        # Terminal publication failure must surface in exit code; don't swallow.
-        maybe_publish_terminal_artifacts(output_dir, expected_ranks=world_size)
         return result
 
     # ------------------------------------------------------------------
@@ -600,21 +594,11 @@ def tokenize_loop(
     result["output_dir"] = output_dir
     result["success"] = _loop_error is None
 
-    from .stats_reducer import (
-        maybe_publish_terminal_artifacts,
-        write_rank_stats,
-    )
+    from .stats_reducer import write_rank_stats
 
-    # Rank stats are the distributed success signal. If they cannot be written,
-    # no rank can safely publish _SUCCESS, so fail the rank loudly.
+    # Rank stats are the distributed success signal; rank 0 aggregates them
+    # after all ranks finish, then ``run_stage`` publishes ``_SUCCESS``.
     write_rank_stats(output_dir, result)
-    summary = maybe_publish_terminal_artifacts(output_dir, expected_ranks=world_size)
-    if summary is not None:
-        logger.info(
-            f"[rank {rank}] Stats summary: {summary['samples_processed']:,} samples, "
-            f"{summary['audio_tokens']:,} audio tokens, "
-            f"{summary['text_tokens']:,} text tokens across {summary['num_ranks']} ranks"
-        )
 
     # Re-raise after terminal cleanup so the exit code signals failure.
     if _loop_error is not None:

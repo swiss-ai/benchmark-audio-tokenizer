@@ -3,7 +3,7 @@
 The public YAML format describes the dataset: source, columns, timeline, and
 outputs. The runtime stages still consume the stricter ``DatasetSpec`` shape.
 Keeping this translation in one module prevents Hydra authoring ergonomics from
-leaking into planning, resume, and execution code.
+leaking into planning and execution code.
 """
 
 from __future__ import annotations

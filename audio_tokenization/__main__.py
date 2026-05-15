@@ -53,10 +53,10 @@ def _execute_command(command: Command, cfg) -> dict[str, Any]:
     spec = load_dataset_spec(cfg.dataset)
     stage = None if OmegaConf.is_missing(cfg, "stage") else cfg.get("stage")
     runtime = cfg.get("runtime") or {}
-    resume = bool(runtime.get("resume", True))
+    overwrite = bool(runtime.get("overwrite", False))
 
     if command == "run":
-        stages = run_stages(spec, stage=stage, resume=resume)
+        stages = run_stages(spec, stage=stage, overwrite=overwrite)
     elif command == "plan":
         stages = plan_stages(spec, stage=stage)
     elif command == "status":
@@ -70,7 +70,7 @@ def _execute_command(command: Command, cfg) -> dict[str, Any]:
         "command": command,
         "dataset": spec.name,
         "stage": stage,
-        "resume": resume,
+        "overwrite": overwrite,
         "stages": stages,
     }
 

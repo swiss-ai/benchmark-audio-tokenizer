@@ -25,14 +25,13 @@ from typing import Optional
 
 from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.prepare.audio_ops import make_rms_filter_fn, to_mono
-from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
+from audio_tokenization.prepare.constants import PREPARE_SHAR_COMMIT_MODE
 from audio_tokenization.prepare.identity import assign_interleave_metadata
 from audio_tokenization.prepare.runtime import (
     build_shar_index_from_parts,
     mark_partition_success,
     setup_partition_dir,
     validate_prepare_runtime,
-    write_prepare_state_for_spec,
 )
 from audio_tokenization.prepare.text_ops import (
     load_text_tokenizer,
@@ -45,9 +44,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-PART_SUCCESS_MARKER = SUCCESS_MARKER_FILE
-
 
 # ---------------------------------------------------------------------------
 # Recipe helpers
@@ -97,20 +93,13 @@ def convert_worker(
     from lhotse import CutSet
 
     output_dir = shar_dir / f"part-{rank:05d}"
-    if setup_partition_dir(
-        output_dir,
-        success_marker_name=PART_SUCCESS_MARKER,
-        reuse_log=f"[worker {rank}] Reusing completed Shar in {output_dir}",
-        reset_log=f"[worker {rank}] Removing partial Shar output in {output_dir}",
-        logger=logger,
-    ):
-        return
+    setup_partition_dir(output_dir, worker_id=rank, logger=logger)
 
     logger.info(f"[worker {rank}] Processing {len(my_cuts)} cuts")
 
     if len(my_cuts) == 0:
         logger.warning(f"[worker {rank}] Empty partition, skipping")
-        mark_partition_success(output_dir, success_marker_name=PART_SUCCESS_MARKER)
+        mark_partition_success(output_dir)
         return
 
     cuts = CutSet.from_cuts(my_cuts)
@@ -145,11 +134,12 @@ def convert_worker(
         shard_size=shar_shard_size,
         num_jobs=1,
         verbose=(rank == 0),
+        commit=PREPARE_SHAR_COMMIT_MODE,
     )
 
     if stats_dir is not None:
         atomic_write_json(stats_dir / f"part-{rank:05d}.json", stats, indent=None)
-    mark_partition_success(output_dir, success_marker_name=PART_SUCCESS_MARKER)
+    mark_partition_success(output_dir)
     logger.info(f"[worker {rank}] Done → {output_dir}")
 
 
@@ -163,7 +153,6 @@ def build_shar_index(shar_root: Path, index_filename: str, world_size: int):
         shar_root=shar_root,
         part_dirs=part_dirs,
         index_filename=index_filename,
-        success_marker_name=PART_SUCCESS_MARKER,
     )
     logger.info(f"Wrote merged index: {index_path} ({cuts_count} cut shards)")
 
@@ -184,8 +173,10 @@ def preflight(
     spec,
     *,
     runtime_validator=validate_prepare_runtime,
+    resolved_inputs: list[str] | None = None,
 ) -> None:
     """Validate generic lhotse_recipe prepare prerequisites."""
+    del resolved_inputs
     i, o = spec.input, spec.output
     corpus_dir = Path(i.corpus_dir)
     if not corpus_dir.exists():
@@ -213,10 +204,7 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
 
     extra_kwargs = json.loads(i.recipe_kwargs)
 
-    preflight(spec, runtime_validator=validate_prepare_runtime)
-
     shar_dir.mkdir(parents=True, exist_ok=True)
-    write_prepare_state_for_spec(spec)
 
     # Step 1: Run Lhotse recipe to build manifests
     logger.info(f"Running lhotse recipe: prepare_{i.recipe}")
@@ -295,7 +283,8 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
             sum(counts.values()), len(counts),
         )
 
-        mark_partition_success(shar_dir, success_marker_name=PART_SUCCESS_MARKER)
+        # Stage-root _SUCCESS is owned exclusively by run_stage(stage="convert").
+        # The lhotse_recipe runner only marks its per-worker partitions complete.
 
         total = {"num_cuts": 0, "total_duration": 0.0, "num_text_tokens": 0}
         for stats_path in sorted(stats_dir.glob("*.json")):
@@ -313,5 +302,3 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
         logger.info(summary)
 
     logger.info("All done!")
-
-

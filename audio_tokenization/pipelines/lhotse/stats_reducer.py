@@ -1,7 +1,9 @@
 """Reduce per-rank stats into a single ``stats_summary.json``.
 
-Each rank writes ``rank_XXXX_stats.json`` at the end of tokenization.
-The last rank to finish aggregates all per-rank files into one summary.
+Each rank writes ``rank_XXXX_stats.json`` at the end of tokenization. Rank 0
+(through ``run_stage``) polls until all expected rank stats are present, then
+aggregates them. The stage-level ``_SUCCESS`` + ``_STAGE_MANIFEST.json`` are
+written exclusively by ``run_stage`` — this module no longer publishes them.
 
 CLI for recomputing summaries on old runs::
 
@@ -11,6 +13,7 @@ CLI for recomputing summaries on old runs::
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from audio_tokenization.utils.io import atomic_write_json
@@ -63,34 +66,97 @@ def write_rank_stats(output_dir: str | Path, result: dict) -> Path:
     return stats_path
 
 
-def maybe_publish_terminal_artifacts(
-    output_dir: str | Path,
-    expected_ranks: int,
-) -> dict | None:
-    """Convoy-leader publish: write ``stats_summary.json`` and, if every rank
-    reported ``success=True``, the partition ``_SUCCESS`` marker.
+def zero_rank_stats(*, rank: int, world_size: int) -> dict:
+    """Per-rank stats template with all aggregated keys zeroed.
 
-    Each rank calls this after ``write_rank_stats``. The single rank whose
-    call observes that all ranks have reported wins the race and publishes
-    both artifacts. ``_SUCCESS`` is never written when any rank's stats
-    record ``success=False``; the failed rank's process re-raises so the
-    job exit code signals failure.
+    Single source of truth for the rank-stats schema: keys come from
+    ``_SUM_FIELDS`` so a new aggregated key can't drift past fallback writers.
+    """
+    stats: dict = {source: 0 for _, source in _SUM_FIELDS}
+    stats["elapsed_time"] = 0.0
+    stats["rank"] = rank
+    stats["world_size"] = world_size
+    stats["success"] = True
+    return stats
+
+
+RANK_STATS_WAIT_TIMEOUT_SEC = 14_400.0  # 4h: covers an entire SLURM allocation
+
+
+def wait_for_rank_stats(
+    output_dir: str | Path,
+    *,
+    expected_ranks: int,
+    timeout_sec: float = RANK_STATS_WAIT_TIMEOUT_SEC,
+    poll_interval_sec: float = 2.0,
+) -> list[dict]:
+    """Block until every rank in ``range(expected_ranks)`` has written stats.
+
+    Called by rank 0 (through ``run_stage(work=...)``) after it finishes its
+    own slice. Non-zero ranks write their stats and exit; only rank 0 polls.
+
+    Tracks parsed records across polls so each ``rank_XXXX_stats.json`` is
+    read exactly once even on long waits. Identity (rank IDs), not count,
+    is the completion contract: a stray ``rank_9999_stats.json`` doesn't
+    satisfy a missing rank 1.
+
+    Raises ``RuntimeError`` after ``timeout_sec`` listing the missing rank
+    IDs. ``run_stage``'s ``work`` then aborts, so ``_SUCCESS`` is not
+    published and the job exits with a clear diagnostic instead of hanging
+    until the allocation runs out.
     """
     output_dir = Path(output_dir)
-    rank_stats = load_rank_stats(output_dir)
-    if len(rank_stats) < expected_ranks:
-        return None
+    expected = set(range(expected_ranks))
+    parsed: dict[int, dict] = {}
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        # Probe each missing rank by exact path instead of globbing the dir.
+        # On Lustre at world_size=128 over hours of polling this matters:
+        # readdir cost scales with N, per-name stat is constant.
+        for r in list(expected - parsed.keys()):
+            path = output_dir / f"rank_{r:04d}_stats.json"
+            if not path.is_file():
+                continue
+            for record in load_json_records([path], required_key="rank", logger=logger):
+                parsed[int(record["rank"])] = record
+        if expected <= parsed.keys():
+            return [parsed[r] for r in sorted(expected)]
+        if time.monotonic() >= deadline:
+            missing = sorted(expected - parsed.keys())
+            raise RuntimeError(
+                f"Timed out after {timeout_sec:.0f}s waiting for rank stats at "
+                f"{output_dir}; missing ranks: {missing} "
+                f"(saw {sorted(parsed.keys())} of {expected_ranks}). "
+                "A rank likely crashed before writing rank_XXXX_stats.json; "
+                "check that rank's SLURM stderr."
+            )
+        time.sleep(poll_interval_sec)
+
+
+def aggregate_rank_stats(
+    output_dir: str | Path,
+    *,
+    rank_stats: list[dict] | None = None,
+) -> dict:
+    """Aggregate rank stats into ``stats_summary.json`` (writes the summary).
+
+    Accepts pre-parsed *rank_stats* (e.g. from ``wait_for_rank_stats``) to
+    avoid re-globbing and re-parsing the same files on Lustre right before
+    publishing ``_SUCCESS``. The CLI / standalone recompute path passes
+    ``None`` and falls back to ``load_rank_stats``.
+
+    Does NOT publish ``_SUCCESS`` or ``_STAGE_MANIFEST.json`` — those are owned
+    by ``run_stage``. Raises if any rank's stats record ``success != True``.
+    """
+    output_dir = Path(output_dir)
+    if rank_stats is None:
+        rank_stats = load_rank_stats(output_dir)
     aggregate = build_aggregate(rank_stats)
     atomic_write_json(output_dir / "stats_summary.json", aggregate, sort_keys=False)
-    if all(s.get("success") is True for s in aggregate["per_rank"]):
-        from audio_tokenization.prepare.runtime import mark_partition_success
-
-        mark_partition_success(output_dir)
-    else:
-        failed = [s.get("rank") for s in aggregate["per_rank"] if s.get("success") is not True]
-        logger.warning(
-            "Skipping _SUCCESS publication; ranks reported failure: %s",
-            failed,
+    failed = [s.get("rank") for s in rank_stats if s.get("success") is not True]
+    if failed:
+        raise RuntimeError(
+            f"Tokenize ranks reported failure: {failed}. See per-rank stats files for details."
         )
     return aggregate
 

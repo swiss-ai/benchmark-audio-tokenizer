@@ -188,7 +188,7 @@ def resolve_sample_text_and_custom(
 
 
 def normalize_optional_path(path: str | Path | None) -> str | None:
-    """Normalize an optional path for stable resume-state comparisons."""
+    """Normalize an optional path for stable manifest payloads."""
     if path is None:
         return None
     return str(Path(path).expanduser().resolve())

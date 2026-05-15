@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -11,42 +10,38 @@ from pathlib import Path
 from typing import Any, Literal
 
 from audio_tokenization.config.schema import DatasetSpec, TokenizeSpec
-from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
+from audio_tokenization.contracts.artifacts import SUCCESS_MARKER_FILE
 from audio_tokenization.output_layout import resolve_tokenize_output_dir
+from audio_tokenization.pipelines.lhotse.planning import TOKENIZE_ASSIGNMENT_FILE
 from audio_tokenization.utils.io import atomic_write_json
 from audio_tokenization.stages._plans import (
     ResolvedStagePlan,
     disabled_stage_plan,
 )
-from audio_tokenization.stages._provenance import (
-    build_tokenize_resume_fingerprint,
-    read_prepare_provenance,
-)
-from audio_tokenization.stages._resume import (
-    prepare_output_for_work,
-    try_skip_if_complete,
+from audio_tokenization.stages._stage_runner import (
+    MANIFEST_FILE,
+    check_stage_output,
+    run_stage,
 )
 
 
 logger = logging.getLogger(__name__)
 
 
-TOKENIZE_STATE_FILE = "tokenize_state.json"
 TOKENIZE_START_FILE = ".tokenize_start.json"
 
 
 def resolve_tokenize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
     if spec.tokenize is None:
-        return disabled_stage_plan(stage="tokenize", reason="tokenize.disabled")
+        return disabled_stage_plan(stage="tokenize")
 
     tokenize_spec = spec.tokenize
     input_shar_dirs = _resolve_input_shar_dirs(spec)
     final_output_dir = resolve_tokenize_output_dir(tokenize_spec, dataset_name=spec.name)
-    fingerprint = build_tokenize_resume_fingerprint(
-        spec,
-        input_shar_dirs=input_shar_dirs,
-        prepare_provenance=read_prepare_provenance(input_shar_dirs),
-    )
+    fingerprint = {
+        **tokenize_spec.fingerprint_payload(),
+        "resolved_input_shar_dirs": list(input_shar_dirs),
+    }
     input_was_explicit = spec.tokenize.input_shar_dir is not None
 
     return ResolvedStagePlan(
@@ -59,26 +54,25 @@ def resolve_tokenize_plan(spec: DatasetSpec) -> ResolvedStagePlan:
         },
         outputs={
             "output_dir": str(final_output_dir),
-            "state_file": str(final_output_dir / TOKENIZE_STATE_FILE),
+            "manifest": str(final_output_dir / MANIFEST_FILE),
             "success_marker": str(final_output_dir / SUCCESS_MARKER_FILE),
         },
         effective=_effective_tokenize_values(spec.tokenize, final_output_dir),
         fingerprint=fingerprint,
         output_dir=final_output_dir,
-        state_path=final_output_dir / TOKENIZE_STATE_FILE,
         success_marker=final_output_dir / SUCCESS_MARKER_FILE,
         preflight=lambda: _preflight_tokenize_plan(
             input_shar_dirs,
             input_was_explicit,
         ),
-        execute=lambda resume: _execute_tokenize_plan(
+        execute=lambda overwrite: _execute_tokenize_plan(
             spec=tokenize_spec,
             dataset_name=spec.name,
             input_shar_dirs=input_shar_dirs,
             input_was_explicit=input_was_explicit,
             final_output_dir=final_output_dir,
             fingerprint=fingerprint,
-            resume=resume,
+            overwrite=overwrite,
         ),
     )
 
@@ -97,14 +91,24 @@ def _effective_tokenize_values(tokenize: TokenizeSpec, output_dir: Path) -> dict
     return values
 
 
-def run_tokenize(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
+def run_tokenize(spec: DatasetSpec, *, overwrite: bool = False) -> dict[str, Any]:
     if spec.tokenize is None:
         raise ValueError(
             "stage=tokenize requested but DatasetSpec has no tokenize section. "
             "Add outputs.tokenized_dir to the dataset YAML to enable this stage."
         )
+    final_output_dir = resolve_tokenize_output_dir(spec.tokenize, dataset_name=spec.name)
+    _, world_size = _distributed_rank_and_world()
+    if world_size == 1:
+        skipped = check_stage_output(
+            stage="tokenize",
+            output_dir=final_output_dir,
+            overwrite=overwrite,
+        )
+        if skipped is not None:
+            return skipped
     plan = resolve_tokenize_plan(spec)
-    return plan.execute(resume)
+    return plan.execute(overwrite)
 
 
 def _resolve_input_shar_dirs(spec: DatasetSpec) -> list[str]:
@@ -159,9 +163,8 @@ def _execute_tokenize_plan(
     input_was_explicit: bool,
     final_output_dir: Path,
     fingerprint: dict[str, Any],
-    resume: bool,
+    overwrite: bool,
 ) -> dict[str, Any]:
-    _preflight_tokenize_plan(input_shar_dirs, input_was_explicit)
     rank, world_size, local_rank = _distributed_rank_info()
     if world_size > 1:
         return _execute_tokenize_plan_distributed(
@@ -171,43 +174,42 @@ def _execute_tokenize_plan(
             spec=spec,
             dataset_name=dataset_name,
             input_shar_dirs=input_shar_dirs,
+            input_was_explicit=input_was_explicit,
             final_output_dir=final_output_dir,
             fingerprint=fingerprint,
-            resume=resume,
+            overwrite=overwrite,
         )
 
-    guidance = (
-        "Tokenize output at this path was produced under different spec "
-        "values. Either re-issue the matching config to resume, or remove "
-        f"{final_output_dir} and restart from scratch."
-    )
-    skipped = prepare_output_for_work(
+    def _work() -> dict[str, Any]:
+        assignment = _write_tokenize_assignment(
+            spec,
+            input_shar_dirs=input_shar_dirs,
+            final_output_dir=final_output_dir,
+            world_size=1,
+        )
+        return _invoke_pipeline_for_assignment(
+            spec,
+            dataset_name=dataset_name,
+            input_shar_dirs=input_shar_dirs,
+            final_output_dir=final_output_dir,
+            rank_assignment=assignment.assignment_for_rank(0),
+            world_size=1,
+            local_rank=local_rank,
+        )
+
+    return run_stage(
+        stage="tokenize",
         output_dir=final_output_dir,
-        state_filename=TOKENIZE_STATE_FILE,
         fingerprint=fingerprint,
-        guidance=guidance,
-        stage_label="tokenize",
-        resume=resume,
+        work=_work,
+        overwrite=overwrite,
         logger=logger,
+        preflight=lambda: _preflight_tokenize_plan(input_shar_dirs, input_was_explicit),
+        finalize=lambda _result: _finalize_tokenize_stats(
+            final_output_dir,
+            expected_ranks=1,
+        ),
     )
-    if skipped is not None:
-        return skipped
-    assignment = _write_tokenize_assignment(
-        spec,
-        input_shar_dirs=input_shar_dirs,
-        final_output_dir=final_output_dir,
-        world_size=1,
-    )
-    result = _invoke_pipeline_for_assignment(
-        spec,
-        dataset_name=dataset_name,
-        input_shar_dirs=input_shar_dirs,
-        final_output_dir=final_output_dir,
-        rank_assignment=assignment.assignment_for_rank(0),
-        world_size=1,
-        local_rank=local_rank,
-    )
-    return {**result, "skipped": False, "output_dir": str(final_output_dir)}
 
 
 def _execute_tokenize_plan_distributed(
@@ -218,69 +220,142 @@ def _execute_tokenize_plan_distributed(
     spec: TokenizeSpec,
     dataset_name: str,
     input_shar_dirs: list[str],
+    input_was_explicit: bool,
     final_output_dir: Path,
     fingerprint: dict[str, Any],
-    resume: bool,
+    overwrite: bool,
 ) -> dict[str, Any]:
-    guidance = (
-        "Tokenize output at this path was produced under different spec "
-        "values. Either re-issue the matching config to resume, or remove "
-        f"{final_output_dir} and restart from scratch."
-    )
+    """Dispatch by rank. Rank 0 owns the stage contract via ``run_stage``;
+    non-zero ranks wait for the assignment, process their slice, and exit."""
     start_marker = final_output_dir / TOKENIZE_START_FILE
+    run_id = _distributed_launch_id(world_size=world_size)
 
     if rank == 0:
-        try:
-            skipped = prepare_output_for_work(
-                output_dir=final_output_dir,
-                state_filename=TOKENIZE_STATE_FILE,
-                fingerprint=fingerprint,
-                guidance=guidance,
-                stage_label="tokenize",
-                resume=resume,
-                logger=logger,
-            )
-            if skipped is not None:
-                return skipped
-            assignment = _write_tokenize_assignment(
-                spec,
-                input_shar_dirs=input_shar_dirs,
-                final_output_dir=final_output_dir,
-                world_size=world_size,
-            )
-            _write_start_marker(
-                start_marker,
-                payload=_build_start_marker_payload(fingerprint, world_size=world_size),
-            )
-        except Exception as exc:
-            try:
-                final_output_dir.mkdir(parents=True, exist_ok=True)
-                _write_start_marker(
-                    start_marker,
-                    payload=_build_start_marker_payload(
-                        fingerprint,
-                        world_size=world_size,
-                        status="aborted",
-                        error=f"{type(exc).__name__}: {exc}",
-                    ),
-                )
-            except Exception:
-                logger.warning("Failed to publish tokenize abort marker", exc_info=True)
-            raise
-    else:
-        skipped = _wait_for_rank0_tokenize_start(
+        return _execute_tokenize_rank0_distributed(
+            spec=spec,
+            dataset_name=dataset_name,
+            input_shar_dirs=input_shar_dirs,
+            input_was_explicit=input_was_explicit,
             final_output_dir=final_output_dir,
-            state_filename=TOKENIZE_STATE_FILE,
             fingerprint=fingerprint,
-            start_marker=start_marker,
+            overwrite=overwrite,
             world_size=world_size,
-            resume=resume,
-            rank=rank,
+            local_rank=local_rank,
+            run_id=run_id,
+            start_marker=start_marker,
         )
-        if skipped is not None:
-            return skipped
-        assignment = _read_tokenize_assignment(final_output_dir)
+    return _execute_tokenize_worker_rank(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        spec=spec,
+        dataset_name=dataset_name,
+        input_shar_dirs=input_shar_dirs,
+        final_output_dir=final_output_dir,
+        fingerprint=fingerprint,
+        overwrite=overwrite,
+        run_id=run_id,
+        start_marker=start_marker,
+    )
 
+
+def _execute_tokenize_rank0_distributed(
+    *,
+    spec: TokenizeSpec,
+    dataset_name: str,
+    input_shar_dirs: list[str],
+    input_was_explicit: bool,
+    final_output_dir: Path,
+    fingerprint: dict[str, Any],
+    overwrite: bool,
+    world_size: int,
+    local_rank: int,
+    run_id: str,
+    start_marker: Path,
+) -> dict[str, Any]:
+    def _work() -> dict[str, Any]:
+        assignment = _write_tokenize_assignment(
+            spec,
+            input_shar_dirs=input_shar_dirs,
+            final_output_dir=final_output_dir,
+            world_size=world_size,
+        )
+        _write_start_marker(
+            start_marker,
+            payload=_build_start_marker_payload(
+                run_id=run_id,
+                fingerprint=fingerprint,
+                world_size=world_size,
+            ),
+        )
+
+        # Rank 0 processes its own slice (writes its own rank stats inside).
+        return _invoke_pipeline_for_assignment(
+            spec,
+            dataset_name=dataset_name,
+            input_shar_dirs=input_shar_dirs,
+            final_output_dir=final_output_dir,
+            rank_assignment=assignment.assignment_for_rank(0),
+            world_size=world_size,
+            local_rank=local_rank,
+        )
+
+    def _on_failure(exc: Exception) -> None:
+        _publish_tokenize_abort_marker(
+            start_marker,
+            run_id=run_id,
+            fingerprint=fingerprint,
+            world_size=world_size,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    return run_stage(
+        stage="tokenize",
+        output_dir=final_output_dir,
+        fingerprint=fingerprint,
+        work=_work,
+        overwrite=overwrite,
+        logger=logger,
+        preflight=lambda: _preflight_tokenize_plan(input_shar_dirs, input_was_explicit),
+        finalize=lambda _result: _finalize_tokenize_stats(
+            final_output_dir,
+            expected_ranks=world_size,
+        ),
+        on_failure=_on_failure,
+    )
+
+
+def _execute_tokenize_worker_rank(
+    *,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    spec: TokenizeSpec,
+    dataset_name: str,
+    input_shar_dirs: list[str],
+    final_output_dir: Path,
+    fingerprint: dict[str, Any],
+    overwrite: bool,
+    run_id: str,
+    start_marker: Path,
+) -> dict[str, Any]:
+    """Wait for rank 0's assignment, process this rank's slice, exit.
+
+    Writes ``rank_NNNN_stats.json`` via the pipeline; never touches
+    ``_SUCCESS`` or the stage manifest (rank 0 owns those).
+    """
+    skipped = _wait_for_rank0_tokenize_start(
+        final_output_dir=final_output_dir,
+        start_marker=start_marker,
+        run_id=run_id,
+        world_size=world_size,
+        fingerprint=fingerprint,
+        overwrite=overwrite,
+        rank=rank,
+    )
+    if skipped is not None:
+        return skipped
+    assignment = _read_tokenize_assignment(final_output_dir)
     rank_assignment = assignment.assignment_for_rank(rank)
     result = _invoke_pipeline_for_assignment(
         spec,
@@ -291,8 +366,6 @@ def _execute_tokenize_plan_distributed(
         world_size=world_size,
         local_rank=local_rank,
     )
-    # _SUCCESS publication is convoy-leader-driven: whichever rank's stats
-    # write completes the rank set checks all-rank success and publishes.
     return {**result, "skipped": False, "output_dir": str(final_output_dir)}
 
 
@@ -307,8 +380,8 @@ def _write_tokenize_assignment(
 
     The input SHAR manifest is durable and rank-independent. This assignment is
     not: it depends on the current ``world_size`` and tokenization filters, so
-    it belongs under the tokenized output directory and participates in resume
-    debugging rather than conversion provenance.
+    it belongs under the tokenized output directory as launch-local debug data
+    rather than conversion provenance.
     """
 
     from audio_tokenization.pipelines.lhotse.planning import (
@@ -362,7 +435,7 @@ def _invoke_pipeline_for_assignment(
             world_size=world_size,
         )
 
-    return _invoke_pipeline(
+    result = _invoke_pipeline(
         spec,
         dataset_name=dataset_name,
         input_shar_dirs=input_shar_dirs,
@@ -373,13 +446,51 @@ def _invoke_pipeline_for_assignment(
         final_output_dir=final_output_dir,
         assigned_cut_count=rank_assignment.cut_count,
     ) or {}
+    _ensure_rank_stats(
+        final_output_dir,
+        result,
+        rank=rank_assignment.rank,
+        world_size=world_size,
+    )
+    return result
+
+
+def _ensure_rank_stats(
+    output_dir: Path,
+    result: dict[str, Any],
+    *,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Ensure a successful pipeline invocation leaves rank stats behind."""
+    stats_path = output_dir / f"rank_{rank:04d}_stats.json"
+    if stats_path.is_file():
+        return
+    from audio_tokenization.pipelines.lhotse.stats_reducer import (
+        write_rank_stats,
+        zero_rank_stats,
+    )
+
+    fallback = zero_rank_stats(rank=rank, world_size=world_size)
+    fallback.update(result)
+    fallback["rank"] = rank
+    fallback["world_size"] = world_size
+    fallback.setdefault("success", True)
+    write_rank_stats(output_dir, fallback)
+
+
+def _finalize_tokenize_stats(output_dir: Path, *, expected_ranks: int) -> None:
+    from audio_tokenization.pipelines.lhotse.stats_reducer import (
+        aggregate_rank_stats,
+        wait_for_rank_stats,
+    )
+
+    rank_stats = wait_for_rank_stats(output_dir, expected_ranks=expected_ranks)
+    aggregate_rank_stats(output_dir, rank_stats=rank_stats)
 
 
 def _read_tokenize_assignment(final_output_dir: Path):
-    from audio_tokenization.pipelines.lhotse.planning import (
-        TOKENIZE_ASSIGNMENT_FILE,
-        read_tokenize_assignment,
-    )
+    from audio_tokenization.pipelines.lhotse.planning import read_tokenize_assignment
 
     return read_tokenize_assignment(final_output_dir / TOKENIZE_ASSIGNMENT_FILE)
 
@@ -398,34 +509,25 @@ def _write_inactive_rank_stats(
     """
 
     from audio_tokenization.pipelines.lhotse.stats_reducer import (
-        maybe_publish_terminal_artifacts,
         write_rank_stats,
+        zero_rank_stats,
     )
 
-    result: dict[str, Any] = {
-        "rank": rank,
-        "world_size": world_size,
-        "inactive": True,
-        "success": True,
-        "samples_processed": 0,
-        "tokens_generated": 0,
-        "text_tokens_generated": 0,
-        "errors": 0,
-        "samples_skipped": 0,
-        "rms_skipped": 0,
-        "no_text_skipped": 0,
-        "chunks_written": 0,
-        "elapsed_time": 0.0,
-        "output_dir": str(output_dir),
-    }
+    result = zero_rank_stats(rank=rank, world_size=world_size)
+    result["inactive"] = True
+    result["output_dir"] = str(output_dir)
     write_rank_stats(output_dir, result)
-    maybe_publish_terminal_artifacts(output_dir, expected_ranks=world_size)
     return result
 
 
-def _distributed_rank_info() -> tuple[int, int, int]:
+def _distributed_rank_and_world() -> tuple[int, int]:
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
     world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
+    return rank, world_size
+
+
+def _distributed_rank_info() -> tuple[int, int, int]:
+    rank, world_size = _distributed_rank_and_world()
     if "LOCAL_RANK" in os.environ or "SLURM_LOCALID" in os.environ:
         local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
     else:
@@ -440,17 +542,17 @@ def _distributed_rank_info() -> tuple[int, int, int]:
 
 
 def _build_start_marker_payload(
-    fingerprint: dict[str, Any],
     *,
+    run_id: str,
+    fingerprint: dict[str, Any],
     world_size: int,
     status: str = "ready",
     error: str | None = None,
 ) -> dict[str, Any]:
-    fingerprint_hash = _fingerprint_hash(fingerprint)
     payload = {
-        "run_id": _distributed_launch_id(fingerprint_hash, world_size=world_size),
+        "run_id": run_id,
         "world_size": world_size,
-        "fingerprint_hash": fingerprint_hash,
+        "spec_fingerprint": fingerprint,
         "status": status,
     }
     if error is not None:
@@ -459,18 +561,33 @@ def _build_start_marker_payload(
 
 
 def _write_start_marker(path: Path, *, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, payload)
 
 
-def _fingerprint_hash(fingerprint: dict[str, Any]) -> str:
-    payload = json.dumps(fingerprint, sort_keys=True, default=str)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def _publish_tokenize_abort_marker(
+    path: Path,
+    *,
+    run_id: str,
+    fingerprint: dict[str, Any],
+    world_size: int,
+    error: str,
+) -> None:
+    _write_start_marker(
+        path,
+        payload=_build_start_marker_payload(
+            run_id=run_id,
+            fingerprint=fingerprint,
+            world_size=world_size,
+            status="aborted",
+            error=error,
+        ),
+    )
 
 
-def _distributed_launch_id(fingerprint_hash: str, *, world_size: int) -> str:
+def _distributed_launch_id(*, world_size: int) -> str:
     explicit = (
         os.environ.get("AUDIO_TOKENIZATION_RUN_ID")
-        or os.environ.get("TOKENIZE_RUN_ID")
         or os.environ.get("TORCHELASTIC_RUN_ID")
     )
     if explicit:
@@ -484,9 +601,16 @@ def _distributed_launch_id(fingerprint_hash: str, *, world_size: int) -> str:
     if any(part is not None for part in slurm_parts):
         return "slurm:" + ":".join(part or "none" for part in slurm_parts)
 
-    # No common launch identifier is available outside a launcher. This still
-    # keeps mismatched config/world-size stale markers from releasing ranks.
-    return f"manual:{world_size}:{fingerprint_hash}"
+    if world_size > 1:
+        raise RuntimeError(
+            "Manual distributed tokenize (world_size > 1, no SLURM/torchelastic env) "
+            "requires AUDIO_TOKENIZATION_RUN_ID so all ranks agree on a launch-unique "
+            "identifier. Without it, workers cannot distinguish a fresh start marker "
+            "from one left by a prior crashed run with the same world size and spec. "
+            "Export a unique value (e.g. `AUDIO_TOKENIZATION_RUN_ID=$(uuidgen)`) "
+            "before launching."
+        )
+    return f"manual:{world_size}"
 
 
 def _read_start_marker(path: Path) -> dict[str, Any] | None:
@@ -520,51 +644,70 @@ def _read_start_marker(path: Path) -> dict[str, Any] | None:
 def _start_marker_matches(
     payload: dict[str, Any] | None,
     *,
-    fingerprint_hash: str,
     run_id: str,
     world_size: int,
+    fingerprint: dict[str, Any],
     status: Literal["ready", "aborted"],
 ) -> bool:
     if payload is None:
         return False
     return (
         payload.get("world_size") == world_size
-        and payload.get("fingerprint_hash") == fingerprint_hash
         and payload.get("run_id") == run_id
+        and payload.get("spec_fingerprint") == fingerprint
         and payload.get("status") == status
     )
+
+
+TOKENIZE_START_WAIT_TIMEOUT_SEC = 3_600.0  # 1h: covers rank-0 preflight + assignment
 
 
 def _wait_for_rank0_tokenize_start(
     *,
     final_output_dir: Path,
-    state_filename: str,
-    fingerprint: dict[str, Any],
     start_marker: Path,
+    run_id: str,
     world_size: int,
-    resume: bool,
+    fingerprint: dict[str, Any],
+    overwrite: bool,
     rank: int,
+    timeout_sec: float = TOKENIZE_START_WAIT_TIMEOUT_SEC,
 ) -> dict[str, Any] | None:
-    expected_hash = _fingerprint_hash(fingerprint)
-    expected_run_id = _distributed_launch_id(expected_hash, world_size=world_size)
-    assignment_path = final_output_dir / "_tokenize_assignment.json"
+    """Block until rank 0 publishes a fresh start marker, or fail loud on timeout.
+
+    Bounded to avoid the same hang class as ``wait_for_rank_stats``: if rank 0
+    OOMs or stalls before writing the start marker, worker ranks would
+    otherwise loop forever and consume the SLURM allocation.
+    """
+    assignment_path = final_output_dir / TOKENIZE_ASSIGNMENT_FILE
+    deadline = time.monotonic() + timeout_sec
+    # Cache the parsed marker by (mtime_ns, size); rank 0 writes via atomic
+    # rename, so a stable (mtime, size) means the payload is unchanged. At
+    # 0.5s poll over a 1h timeout this avoids ~7200 redundant Lustre reads
+    # per worker.
+    last_key: tuple[int, int] | None = None
+    payload: dict[str, Any] | None = None
     while True:
-        skipped = try_skip_if_complete(
-            output_dir=final_output_dir,
-            state_filename=state_filename,
-            fingerprint=fingerprint,
-            stage_label="tokenize",
-            resume=resume,
-            logger=logger,
-        )
-        if skipped is not None:
-            return skipped
-        payload = _read_start_marker(start_marker)
+        if (final_output_dir / SUCCESS_MARKER_FILE).is_file() and not overwrite:
+            return {
+                "stage": "tokenize",
+                "skipped": True,
+                "reason": "tokenize._SUCCESS present",
+                "output_dir": str(final_output_dir),
+            }
+        try:
+            st = start_marker.stat()
+            key: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            key = None
+        if key != last_key:
+            payload = _read_start_marker(start_marker) if key is not None else None
+            last_key = key
         if _start_marker_matches(
             payload,
-            fingerprint_hash=expected_hash,
-            run_id=expected_run_id,
+            run_id=run_id,
             world_size=world_size,
+            fingerprint=fingerprint,
             status="aborted",
         ):
             raise RuntimeError(
@@ -573,9 +716,9 @@ def _wait_for_rank0_tokenize_start(
             )
         if _start_marker_matches(
             payload,
-            fingerprint_hash=expected_hash,
-            run_id=expected_run_id,
+            run_id=run_id,
             world_size=world_size,
+            fingerprint=fingerprint,
             status="ready",
         ):
             if assignment_path.is_file():
@@ -584,6 +727,13 @@ def _wait_for_rank0_tokenize_start(
                 "[rank %s] fresh start marker is visible but assignment is not "
                 "published yet; continuing to wait",
                 rank,
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"[rank {rank}] timed out after {timeout_sec:.0f}s waiting for "
+                f"rank 0's tokenize start marker at {start_marker}. Rank 0 likely "
+                "crashed or stalled before publishing the assignment; check rank "
+                "0's SLURM stderr."
             )
         logger.debug("[rank %s] waiting for rank 0 tokenize start marker", rank)
         time.sleep(0.5)

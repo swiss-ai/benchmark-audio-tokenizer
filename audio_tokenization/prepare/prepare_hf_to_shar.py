@@ -22,27 +22,28 @@ from audio_tokenization.prepare.audio_ops import (
 from audio_tokenization.prepare.cli import expand_path_patterns
 from audio_tokenization.prepare.columnar import (
     ColumnarWorkerArgs,
+    _get_field,
     external_metadata_lookup_id,
     extract_clip_timestamps,
     extract_interleave_identity,
     extract_row_metadata,
     validate_columnar_schema_roots,
 )
+from audio_tokenization.prepare.constants import _MISSING, PREPARE_SHAR_COMMIT_MODE
 from audio_tokenization.prepare.identity import set_interleave_metadata
 from audio_tokenization.prepare.metadata import (
     load_external_metadata,
     resolve_sample_text_and_custom,
 )
 from audio_tokenization.prepare.runtime import (
-    check_worker_reuse,
     distribute_round_robin,
-    ensure_worker_assignment,
     init_worker_process,
     maybe_log_worker_progress,
     coerce_resolved_inputs,
+    resolve_num_workers,
     run_pool_and_finalize,
+    setup_partition_dir,
     validate_prepare_runtime,
-    write_prepare_state_for_spec,
     write_worker_result,
 )
 from audio_tokenization.prepare.text_ops import (
@@ -62,7 +63,6 @@ logger = logging.getLogger(__name__)
 # Worker
 # ---------------------------------------------------------------------------
 
-_ITEMS_KEY = "resolved_arrows"
 _EXTERNAL_METADATA = None
 _DEFAULT_READ_BATCH_SIZE = 256
 
@@ -70,8 +70,9 @@ _DEFAULT_READ_BATCH_SIZE = 256
 def _convert_worker(args: ColumnarWorkerArgs):
     """Convert rows from assigned arrow files to Shar.
 
-    Each worker writes to its own ``worker_XX/`` directory. Resume is complete
-    only when ``worker_XX/_SUCCESS`` exists.
+    Each worker writes to its own ``worker_XX/`` directory and marks it complete
+    with ``worker_XX/_SUCCESS`` after the last row. The stage-level contract is
+    owned by ``run_stage``; partition success is a lower-level signal.
     """
     worker_id = args.worker_id
     arrow_paths = args.input_paths
@@ -99,15 +100,13 @@ def _convert_worker(args: ColumnarWorkerArgs):
     clip_duration_column = args.clip_duration_column
     read_batch_size = args.read_batch_size
 
-    reused = check_worker_reuse(worker_id, shar_dir)
-    if reused is not None:
-        return reused
+    worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
+    setup_partition_dir(worker_dir, worker_id=worker_id, logger=logger)
     init_worker_process(resampling_backend)
 
     from lhotse import SupervisionSegment
     from lhotse.shar import SharWriter
 
-    worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
     t0 = time.time()
     written = skipped = errors = 0
     next_log_at = 1000
@@ -125,6 +124,7 @@ def _convert_worker(args: ColumnarWorkerArgs):
         output_dir=str(worker_dir),
         fields={"recording": shar_format},
         shard_size=shard_size,
+        commit=PREPARE_SHAR_COMMIT_MODE,
     ) as writer:
         for arrow_path in arrow_paths:
             arrow_name = Path(arrow_path).name
@@ -148,7 +148,10 @@ def _convert_worker(args: ColumnarWorkerArgs):
                     fallback_id=fallback_id,
                 )
                 try:
-                    audio_bytes = extract_audio_bytes(row[audio_column])
+                    audio_value = _get_field(row, audio_column)
+                    if audio_value is _MISSING:
+                        raise KeyError(audio_column)
+                    audio_bytes = extract_audio_bytes(audio_value)
                     if not audio_bytes:
                         skipped += 1
                         runtime_counts["skipped_empty_audio"] += 1
@@ -282,6 +285,7 @@ def preflight(
     spec,
     *,
     runtime_validator=validate_prepare_runtime,
+    resolved_inputs: list[str] | None = None,
 ) -> None:
     """Validate generic HF Arrow prepare prerequisites."""
     i, o = spec.input, spec.output
@@ -294,6 +298,8 @@ def preflight(
         require_ffmpeg=True,
         text_tokenizer_path=o.text_tokenizer,
     )
+    if resolved_inputs is not None:
+        _preflight_prepare(spec, list(resolved_inputs))
 
 
 def _preflight_prepare(spec, resolved: list[str]) -> None:
@@ -325,8 +331,6 @@ def _preflight_prepare(spec, resolved: list[str]) -> None:
         logger=logger,
     )
 
-    preflight(spec, runtime_validator=validate_prepare_runtime)
-
 
 def run(spec, *, resolved_inputs: list[str] | None = None):
     """Execute HF arrow prepare for a typed PrepareSpec."""
@@ -335,14 +339,9 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
 
     resolved = coerce_resolved_inputs(spec, resolved_inputs)
 
-    _preflight_prepare(spec, resolved)
-
     shar_dir.mkdir(parents=True, exist_ok=True)
-    write_prepare_state_for_spec(spec)
 
-    num_workers = ensure_worker_assignment(
-        shar_dir, resolved, o.num_workers, _ITEMS_KEY, "arrow files",
-    )
+    num_workers = resolve_num_workers(o.num_workers, num_inputs=len(resolved))
 
     logger.info(f"Found {len(resolved)} arrow files, using {num_workers} workers")
     logger.info(f"Output: {shar_dir}")
@@ -406,5 +405,3 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
         num_workers,
         mp_start_method=mp_start_method,
     )
-
-

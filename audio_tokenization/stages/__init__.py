@@ -62,11 +62,11 @@ def run_stages(
     spec: DatasetSpec,
     *,
     stage: str | None,
-    resume: bool = True,
+    overwrite: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Run exactly one pipeline stage for *spec*."""
     name = _require_single_stage(stage, command="run")
-    return {name: _STAGE_DISPATCH[name](spec, resume=resume)}
+    return {name: _STAGE_DISPATCH[name](spec, overwrite=overwrite)}
 
 
 def plan_stages(

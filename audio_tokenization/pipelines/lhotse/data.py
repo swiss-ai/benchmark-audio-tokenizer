@@ -32,7 +32,7 @@ def resolve_shar_dirs(shar_dir, *, index_name: str = SHAR_INDEX_FILENAME) -> lis
     Accepts a single directory, a list of directories, glob patterns such as
     ``/path/to/root/node_*``, and partitioned roots containing child directories
     with ``shar_index.json``. Returned paths are sorted and de-duplicated for
-    stable resume fingerprints.
+    stable audit manifests.
     """
     if not shar_dir:
         raise ValueError("Lhotse tokenization requires 'shar_dir' with prepared Shar data.")

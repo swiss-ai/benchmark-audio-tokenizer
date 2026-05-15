@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
-from audio_tokenization.utils.io import atomic_streaming_write, atomic_write_json
+from audio_tokenization.utils.io import atomic_write_json, write_success_marker
 
 LOG = logging.getLogger("merge_shar")
 SHAR_NAME_RE = re.compile(r"^(?P<field>.+)\.(?P<idx>\d{6})(?P<suffix>\..+)$")
@@ -388,8 +388,7 @@ def main() -> None:
     if args.copy_sidecars:
         _copy_sidecars(input_dir, output_dir, args.copy_sidecars)
 
-    with atomic_streaming_write(output_dir / "_SUCCESS", mode="w") as f:
-        f.write("ok\n")
+    write_success_marker(output_dir)
     LOG.info("Wrote %s", index_path)
     LOG.info("Done: %s", output_dir)
 

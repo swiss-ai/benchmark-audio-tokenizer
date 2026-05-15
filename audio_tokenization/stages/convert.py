@@ -3,25 +3,26 @@
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
 from audio_tokenization.config.schema import DatasetSpec, PrepareSpec
-from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
-from audio_tokenization.prepare.constants import PREPARE_STATE_FILE, SUCCESS_MARKER_FILE
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME, SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.runtime import (
     get_prepare_runner,
     preflight_prepare_spec,
     resolve_num_workers,
     resolve_prepare_inputs,
-    validate_prepare_runtime,
 )
 from audio_tokenization.stages._plans import (
     ResolvedStagePlan,
     disabled_stage_plan,
 )
-from audio_tokenization.stages._resume import try_skip_if_complete
+from audio_tokenization.stages._stage_runner import (
+    MANIFEST_FILE,
+    check_stage_output,
+    run_stage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,6 @@ def resolve_convert_plan(spec: DatasetSpec) -> ResolvedStagePlan:
     prepare_spec = _resolve_prepare_spec(spec.convert)
     resolved_inputs, input_summary = resolve_prepare_inputs(prepare_spec)
     output_dir = Path(prepare_spec.output.shar_dir)
-    state_path = output_dir / PREPARE_STATE_FILE
     success_marker = output_dir / SUCCESS_MARKER_FILE
 
     return ResolvedStagePlan(
@@ -44,27 +44,23 @@ def resolve_convert_plan(spec: DatasetSpec) -> ResolvedStagePlan:
         inputs=input_summary,
         outputs={
             "shar_dir": str(output_dir),
-            "state_file": str(state_path),
+            "manifest": str(output_dir / MANIFEST_FILE),
             "success_marker": str(success_marker),
         },
         effective=_effective_convert_values(prepare_spec, resolved_inputs),
         fingerprint=prepare_spec.fingerprint_payload(),
         output_dir=output_dir,
-        state_path=state_path,
         success_marker=success_marker,
-        preflight=lambda: preflight_prepare_spec(
-            prepare_spec,
-            runtime_validator=validate_prepare_runtime,
-        ),
-        execute=lambda resume: _execute_convert_plan(
+        preflight=lambda: preflight_prepare_spec(prepare_spec, resolved_inputs=resolved_inputs),
+        execute=lambda overwrite: _execute_convert_plan(
             prepare_spec,
             resolved_inputs=resolved_inputs,
-            resume=resume,
+            overwrite=overwrite,
         ),
     )
 
 
-def run_convert(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
+def run_convert(spec: DatasetSpec, *, overwrite: bool = False) -> dict[str, Any]:
     if spec.convert is None:
         raise ValueError(
             "stage=convert requested but DatasetSpec has no convert section. "
@@ -77,31 +73,23 @@ def run_convert(spec: DatasetSpec, *, resume: bool = True) -> dict[str, Any]:
     # nodes that no longer have the raw inputs mounted or the prepare-time
     # runtime deps (ffmpeg, polars, ...) installed. Plan resolution eagerly
     # globs raw inputs and preflight loads the text tokenizer; both fail
-    # loudly in those environments and would block legitimate resumes.
-    skipped = try_skip_if_complete(
-        output_dir=Path(spec.convert.output.shar_dir),
-        state_filename=PREPARE_STATE_FILE,
-        fingerprint=spec.convert.fingerprint_payload(),
-        stage_label="convert",
-        resume=resume,
-        logger=logger,
-    )
+    # loudly in those environments and would block legitimate skips.
+    shar_dir = Path(spec.convert.output.shar_dir)
+    skipped = check_stage_output(stage="convert", output_dir=shar_dir, overwrite=overwrite)
     if skipped is not None:
         _ensure_convert_shar_manifest(spec.convert)
         return skipped
 
     plan = resolve_convert_plan(spec)
-    return plan.execute(resume)
+    return plan.execute(overwrite)
 
 
 def _resolve_prepare_spec(spec: PrepareSpec) -> PrepareSpec:
     # The lhotse_recipe runner does ``range(num_workers)`` directly, so it
-    # needs a concrete int when None comes through. Hardcoded to 64 (not the
-    # SLURM-aware resolver) because lhotse_recipe is the only family that
-    # fingerprints num_workers; a SLURM-derived value would invalidate resume
-    # across nodes with different ``SLURM_CPUS_PER_TASK``. Other families
-    # call ensure_worker_assignment which resolves None at runtime without
-    # touching the fingerprint.
+    # needs a concrete int when None comes through. Hardcoded to 64 instead of
+    # the SLURM-aware resolver so the plan stays stable across nodes with
+    # different ``SLURM_CPUS_PER_TASK``. Other families resolve None inside the
+    # runner because their worker count only affects execution.
     if spec.family != "lhotse_recipe" or spec.output.num_workers is not None:
         return spec
     return spec.model_copy(
@@ -128,41 +116,34 @@ def _execute_convert_plan(
     spec: PrepareSpec,
     *,
     resolved_inputs: list[str] | None = None,
-    resume: bool,
+    overwrite: bool,
 ) -> dict[str, Any]:
     shar_dir = Path(spec.output.shar_dir)
-    # Mirrors run_with_resume's skip path for tokenize/materialize: avoids
-    # the slow validate_shar_directory pass on every restart of a completed
-    # convert. On drift we still fall through to the runner, which raises
-    # via write_prepare_state_for_spec.
-    skipped = try_skip_if_complete(
-        output_dir=shar_dir,
-        state_filename=PREPARE_STATE_FILE,
-        fingerprint=spec.fingerprint_payload(),
-        stage_label="convert",
-        resume=resume,
-        logger=logger,
-    )
-    if skipped is not None:
-        _ensure_convert_shar_manifest(spec)
-        return skipped
+    runner_module = get_prepare_runner(spec)
 
-    if not resume and shar_dir.is_dir():
-        logger.warning("Removing %s for resume=false re-run.", shar_dir)
-        shutil.rmtree(shar_dir)
-    runner = get_prepare_runner(spec).run
-    result = runner(spec, resolved_inputs=resolved_inputs) or {}
-    _ensure_convert_shar_manifest(spec)
-    return result
+    def _work() -> dict[str, Any]:
+        result = runner_module.run(spec, resolved_inputs=resolved_inputs) or {}
+        _ensure_convert_shar_manifest(spec)
+        return result
+
+    return run_stage(
+        stage="convert",
+        output_dir=shar_dir,
+        fingerprint=spec.fingerprint_payload(),
+        work=_work,
+        overwrite=overwrite,
+        logger=logger,
+        preflight=lambda: runner_module.preflight(spec, resolved_inputs=resolved_inputs),
+    )
 
 
 def _ensure_convert_shar_manifest(spec: PrepareSpec) -> None:
-    """Backfill the durable SHAR manifest after convert success or resume skip.
+    """Backfill the durable SHAR manifest after convert success or skip.
 
     Prepare runners are still family-specific, so the stage adapter owns the
     cross-family handoff contract: every completed SHAR root should expose
-    ``_shar_work_manifest.json`` for tokenization planning, regardless of
-    whether the run was fresh or skipped by resume.
+    ``_shar_work_manifest.json`` for tokenization planning, whether the run was
+    fresh or skipped because ``_SUCCESS`` already existed.
     """
 
     from audio_tokenization.pipelines.lhotse.planning import (

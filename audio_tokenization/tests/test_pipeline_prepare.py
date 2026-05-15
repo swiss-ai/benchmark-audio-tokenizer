@@ -1,7 +1,9 @@
 import json
 import copy
 import gzip
-import re
+import subprocess
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -26,16 +28,9 @@ from audio_tokenization.prepare import (
     prepare_parquet_to_shar,
     prepare_wds_to_shar,
 )
-from audio_tokenization.prepare.constants import (
-    CURRENT_PREPARE_STATE_VERSION,
-    CURRENT_STAGE_STATE_VERSION,
-    PREPARE_STATE_FILE,
-)
 from audio_tokenization.prepare.runtime import (
     preflight_prepare_spec,
-    read_prepare_state,
     resolve_prepare_inputs,
-    validate_or_write_prepare_state,
 )
 
 
@@ -183,6 +178,52 @@ def test_prepare_runtime_delegates_resolution_to_family_runner(monkeypatch):
         ["resolved.parquet"],
         {"family": "parquet"},
     )
+
+
+def test_source_lhotse_runtime_defaults_repo_dir_to_repo_root():
+    repo = Path(__file__).resolve().parents[2]
+    script = repo / "scripts" / "utils" / "source_lhotse_runtime.sh"
+
+    proc = subprocess.run(
+        [
+            "bash",
+            "-lc",
+            (
+                "unset REPO_DIR; "
+                "INSTALL_TORCHCODEC=0 INSTALL_TORCHAUDIO=0 PRINT_LHOTSE_RUNTIME=0 "
+                f"source {script}; "
+                'printf "%s" "$REPO_DIR"'
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.stdout == str(repo)
+
+
+def test_prepare_runtime_requires_dev_lhotse_shar_features(monkeypatch):
+    from audio_tokenization.prepare.runtime import require_lhotse_shar_features
+
+    fake_lhotse = types.ModuleType("lhotse")
+    fake_shar = types.ModuleType("lhotse.shar")
+
+    class _CutSet:
+        def to_shar(self, output_dir):  # pragma: no cover - inspected only
+            raise AssertionError
+
+    class _SharWriter:
+        def __init__(self, output_dir):  # pragma: no cover - inspected only
+            raise AssertionError
+
+    fake_lhotse.CutSet = _CutSet
+    fake_shar.SharWriter = _SharWriter
+    monkeypatch.setitem(sys.modules, "lhotse", fake_lhotse)
+    monkeypatch.setitem(sys.modules, "lhotse.shar", fake_shar)
+
+    with pytest.raises(RuntimeError, match="requires dev Lhotse"):
+        require_lhotse_shar_features()
 
 
 def test_prepare_family_runners_canary_resolve_and_preflight(tmp_path):
@@ -438,109 +479,6 @@ def test_id_column_rejects_invalid_shape():
 
 
 # ---------------------------------------------------------------------------
-# state versioning
-# ---------------------------------------------------------------------------
-
-
-def test_prepare_state_rejects_unversioned_payload(tmp_path):
-    state_path = tmp_path / "_PREPARE_STATE.json"
-    state_path.write_text(
-        json.dumps(
-            {
-                "parquet_dir": "/tmp/data",
-                "text_tokenizer": None,
-            }
-        )
-        + "\n"
-    )
-
-    with pytest.raises(RuntimeError, match="has no version"):
-        read_prepare_state(state_path)
-
-
-def test_prepare_state_rejects_stale_version(tmp_path):
-    state_path = tmp_path / "_PREPARE_STATE.json"
-    state_path.write_text(json.dumps({"version": 0, "parquet_dir": "/tmp/data"}) + "\n")
-
-    with pytest.raises(RuntimeError, match="stale version"):
-        read_prepare_state(state_path)
-
-
-def test_validate_or_write_prepare_state_rejects_missing_invariant(tmp_path):
-    state_path = tmp_path / "stage_state.json"
-    stale_payload = {
-        "version": CURRENT_STAGE_STATE_VERSION,
-        "parquet_dir": "/tmp/data",
-        "text_tokenizer": None,
-    }
-    state_path.write_text(json.dumps(stale_payload) + "\n")
-
-    with pytest.raises(AssertionError, match="missing a required invariant"):
-        validate_or_write_prepare_state(
-            state_path,
-            expected={**stale_payload, "metadata.text_column": "text"},
-            invariant_keys=("parquet_dir", "metadata.text_column"),
-            guidance="remove output dir to reset",
-        )
-
-
-def test_prepare_state_rejects_unknown_future_version(tmp_path):
-    state_path = tmp_path / "_PREPARE_STATE.json"
-    state_path.write_text(
-        json.dumps({"version": CURRENT_PREPARE_STATE_VERSION + 99}) + "\n"
-    )
-    with pytest.raises(RuntimeError, match="only knows how to read up to"):
-        read_prepare_state(state_path)
-
-
-def test_validate_or_write_prepare_state_first_run_writes_versioned(tmp_path):
-    state_path = tmp_path / "stage_state.json"
-    expected = {"parquet_dir": "/tmp/data", "text_tokenizer": None}
-
-    wrote = validate_or_write_prepare_state(
-        state_path,
-        expected=expected,
-        invariant_keys=("parquet_dir", "text_tokenizer"),
-        guidance="remove the output dir to restart fresh.",
-    )
-    assert wrote is True
-
-    payload = json.loads(state_path.read_text())
-    assert payload["version"] == CURRENT_STAGE_STATE_VERSION
-    assert CURRENT_STAGE_STATE_VERSION != CURRENT_PREPARE_STATE_VERSION
-    assert payload["parquet_dir"] == "/tmp/data"
-
-
-def test_write_prepare_state_for_spec_uses_prepare_specific_version(tmp_path):
-    out = tmp_path / "out"
-    out.mkdir()
-    spec = _minimal_parquet_spec(tmp_path)
-
-    _write_state_via_runtime_helper(spec)
-
-    payload = json.loads((out / PREPARE_STATE_FILE).read_text())
-    assert payload["version"] == CURRENT_PREPARE_STATE_VERSION
-
-
-def test_validate_or_write_prepare_state_detects_invariant_drift(tmp_path):
-    state_path = tmp_path / "stage_state.json"
-    validate_or_write_prepare_state(
-        state_path,
-        expected={"parquet_dir": "/tmp/data"},
-        invariant_keys=("parquet_dir",),
-        guidance="remove output dir to reset",
-    )
-
-    with pytest.raises(AssertionError, match="Unsafe resume"):
-        validate_or_write_prepare_state(
-            state_path,
-            expected={"parquet_dir": "/tmp/OTHER"},
-            invariant_keys=("parquet_dir",),
-            guidance="remove output dir to reset",
-        )
-
-
-# ---------------------------------------------------------------------------
 # Schema-semantic contract: canonical defaults, null-rejection, semantic-null
 # ---------------------------------------------------------------------------
 
@@ -558,20 +496,6 @@ def _minimal_payload(family: str, **output_overrides):
     out = {"shar_dir": "/tmp/out", "shard_size": 2000}
     out.update(output_overrides)
     return {"name": f"{family}_test", "convert": {"family": family, **bases[family], "output": out}}
-
-
-def _write_state_via_runtime_helper(spec):
-    """Test wrapper around the hoisted ``write_prepare_state_for_spec``.
-    All five family runners now delegate to this single helper, so the
-    parametrized drift tests no longer need a per-family writer map."""
-    from audio_tokenization.prepare.runtime import write_prepare_state_for_spec
-    return write_prepare_state_for_spec(spec)
-
-
-_PREPARE_STATE_WRITERS = {
-    family: _write_state_via_runtime_helper
-    for family in ("parquet", "hf", "wds", "audio_dir", "lhotse_recipe")
-}
 
 
 def _set_convert_field(payload: dict, path: tuple[str, ...], value):
@@ -834,126 +758,7 @@ def _minimal_parquet_spec(tmp_path, **metadata_overrides) -> PrepareSpec:
     })
 
 
-@pytest.mark.parametrize(
-    ("flag", "v1", "v2"),
-    [
-        ("text_column", None, "transcription"),
-        ("id_column", "row_id", ["session", "seg"]),
-        ("language", "ja", "vi"),
-    ],
-)
-def test_e2e_parquet_prepare_state_rejects_drift(tmp_path, flag, v1, v2):
-    """Resume with any output-affecting field changed must be rejected by
-    the real parquet backend, not just the isolated helper. v1=None means
-    omit the field for the first run."""
-    out = tmp_path / "out"
-    out.mkdir()
-
-    spec_v1 = (
-        _minimal_parquet_spec(tmp_path)
-        if v1 is None
-        else _minimal_parquet_spec(tmp_path, **{flag: v1})
-    )
-    _write_state_via_runtime_helper(spec_v1)
-
-    spec_v2 = _minimal_parquet_spec(tmp_path, **{flag: v2})
-
-    with pytest.raises(
-        AssertionError, match=rf"(?s)Unsafe resume.*Key: metadata\.{re.escape(flag)}"
-    ):
-        _write_state_via_runtime_helper(spec_v2)
-
-
-def test_e2e_parquet_prepare_state_rejects_missing_expanded_invariant(tmp_path):
-    """Current state files must contain the full invariant set.
-
-    If a previous run lacks a newly required field, we rebuild instead of
-    backfilling it silently.
-    """
-    out = tmp_path / "out"
-    out.mkdir()
-
-    spec_v1 = _minimal_parquet_spec(tmp_path, text_column="transcription")
-    stale_state = {
-        "version": CURRENT_PREPARE_STATE_VERSION,
-        **spec_v1.fingerprint_payload(),
-    }
-    stale_state.pop("metadata.text_column")
-    (out / PREPARE_STATE_FILE).write_text(json.dumps(stale_state) + "\n")
-
-    with pytest.raises(AssertionError, match=r"(?s)Unsafe resume.*metadata\.text_column"):
-        _write_state_via_runtime_helper(spec_v1)
-
-
-@pytest.mark.parametrize(
-    ("family", "path", "old", "new", "expected_key"),
-    [
-        ("parquet", ("metadata", "text_column"), None, "transcription", "metadata.text_column"),
-        ("hf", ("input", "arrow_glob"), "*.arrow", "train-*.arrow", "input.arrow_glob"),
-        ("wds", ("input", "vad_max_chunk_sec"), 200.0, 123.0, "input.vad_max_chunk_sec"),
-        ("audio_dir", ("input", "vad_max_chunk_sec"), 200.0, 123.0, "input.vad_max_chunk_sec"),
-        ("lhotse_recipe", ("input", "recipe_kwargs"), "{}", '{"lang":"en"}', "input.recipe_kwargs"),
-    ],
-)
-def test_prepare_state_drift_detected_for_each_family(
-    tmp_path, family, path, old, new, expected_key
-):
-    out = tmp_path / family / "out"
-    out.mkdir(parents=True)
-
-    payload_v1 = _minimal_payload(family, shar_dir=str(out))
-    if old is not None:
-        _set_convert_field(payload_v1, path, old)
-    spec_v1 = PrepareSpec.from_mapping(payload_v1["convert"])
-    _PREPARE_STATE_WRITERS[family](spec_v1)
-
-    payload_v2 = copy.deepcopy(payload_v1)
-    _set_convert_field(payload_v2, path, new)
-    spec_v2 = PrepareSpec.from_mapping(payload_v2["convert"])
-
-    with pytest.raises(
-        AssertionError,
-        match=rf"(?s)Unsafe resume.*Key: {re.escape(expected_key)}",
-    ):
-        _PREPARE_STATE_WRITERS[family](spec_v2)
-
-
-@pytest.mark.parametrize("family", ["parquet", "hf", "wds", "audio_dir"])
-def test_prepare_state_ignores_operational_knobs(tmp_path, family):
-    out = tmp_path / family / "out"
-    out.mkdir(parents=True)
-
-    payload_v1 = _minimal_payload(family, shar_dir=str(out))
-    spec_v1 = PrepareSpec.from_mapping(payload_v1["convert"])
-    _PREPARE_STATE_WRITERS[family](spec_v1)
-
-    payload_v2 = copy.deepcopy(payload_v1)
-    payload_v2["convert"]["output"]["num_workers"] = 123
-    spec_v2 = PrepareSpec.from_mapping(payload_v2["convert"])
-
-    _PREPARE_STATE_WRITERS[family](spec_v2)
-
-
-def test_lhotse_recipe_prepare_state_rejects_num_workers_drift(tmp_path):
-    out = tmp_path / "lhotse_recipe" / "out"
-    out.mkdir(parents=True)
-
-    payload_v1 = _minimal_payload("lhotse_recipe", shar_dir=str(out))
-    spec_v1 = PrepareSpec.from_mapping(payload_v1["convert"])
-    _PREPARE_STATE_WRITERS["lhotse_recipe"](spec_v1)
-
-    payload_v2 = copy.deepcopy(payload_v1)
-    payload_v2["convert"]["output"]["num_workers"] = 123
-    spec_v2 = PrepareSpec.from_mapping(payload_v2["convert"])
-
-    with pytest.raises(
-        AssertionError,
-        match=r"(?s)Unsafe resume.*Key: output\.num_workers",
-    ):
-        _PREPARE_STATE_WRITERS["lhotse_recipe"](spec_v2)
-
-
-def test_audio_dir_prepare_does_not_write_state_before_audio_index_succeeds(
+def test_audio_dir_prepare_does_not_create_output_before_audio_index_succeeds(
     tmp_path, monkeypatch
 ):
     audio_root = tmp_path / "audio"
@@ -982,7 +787,7 @@ def test_audio_dir_prepare_does_not_write_state_before_audio_index_succeeds(
     with pytest.raises(FileNotFoundError, match=r"No \*\.ogg files found"):
         prepare_audio_dir_to_shar.run(spec)
 
-    assert not (out / PREPARE_STATE_FILE).exists()
+    assert not out.exists()
 
 
 def test_expand_path_patterns_resolves_globs_and_literals(tmp_path):
@@ -1005,9 +810,7 @@ def test_expand_path_patterns_rejects_unmatched_pattern(tmp_path):
 def test_resolve_convert_plan_canonicalizes_lhotse_recipe_num_workers(tmp_path):
     """When num_workers is unset, the lhotse_recipe runner needs a concrete
     int (it does ``range(num_workers)`` directly). Hardcoded to 64 so the
-    fingerprint stays stable across nodes with different ``SLURM_CPUS_PER_TASK``
-    — lhotse_recipe is the only family that includes num_workers in the
-    resume fingerprint."""
+    resolved plan stays stable across nodes with different ``SLURM_CPUS_PER_TASK``."""
     spec = load_dataset_spec(
         {
             "name": "recipe_ds",
@@ -1031,30 +834,6 @@ def test_resolve_convert_plan_canonicalizes_lhotse_recipe_num_workers(tmp_path):
     assert plan.fingerprint["output.num_workers"] == 64
 
 
-@pytest.mark.parametrize(
-    ("family", "path", "value"),
-    [
-        ("hf", ("metadata", "duration_column"), "duration"),
-        ("wds", ("metadata", "audio_column"), "audio"),
-        ("audio_dir", ("metadata", "text_column"), "transcription"),
-        ("lhotse_recipe", ("output", "resampling_backend"), None),
-    ],
-)
-def test_prepare_state_ignores_unused_family_specific_knobs(tmp_path, family, path, value):
-    out = tmp_path / family / "out"
-    out.mkdir(parents=True)
-
-    payload_v1 = _minimal_payload(family, shar_dir=str(out))
-    spec_v1 = PrepareSpec.from_mapping(payload_v1["convert"])
-    _PREPARE_STATE_WRITERS[family](spec_v1)
-
-    payload_v2 = copy.deepcopy(payload_v1)
-    _set_convert_field(payload_v2, path, value)
-    spec_v2 = PrepareSpec.from_mapping(payload_v2["convert"])
-
-    _PREPARE_STATE_WRITERS[family](spec_v2)
-
-
 def test_parquet_run_builds_typed_columnar_worker_args(tmp_path, monkeypatch):
     in_dir = tmp_path / "parquet"
     out_dir = tmp_path / "shar"
@@ -1069,8 +848,7 @@ def test_parquet_run_builds_typed_columnar_worker_args(tmp_path, monkeypatch):
     )
 
     monkeypatch.setattr(prepare_parquet_to_shar, "_preflight_prepare", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prepare_parquet_to_shar, "write_prepare_state_for_spec", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prepare_parquet_to_shar, "ensure_worker_assignment", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(prepare_parquet_to_shar, "resolve_num_workers", lambda *_args, **_kwargs: 1)
     monkeypatch.setattr(
         prepare_parquet_to_shar,
         "distribute_round_robin",
@@ -1108,8 +886,7 @@ def test_hf_run_builds_typed_columnar_worker_args(tmp_path, monkeypatch):
     )
 
     monkeypatch.setattr(prepare_hf_to_shar, "_preflight_prepare", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prepare_hf_to_shar, "write_prepare_state_for_spec", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prepare_hf_to_shar, "ensure_worker_assignment", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(prepare_hf_to_shar, "resolve_num_workers", lambda *_args, **_kwargs: 1)
     monkeypatch.setattr(
         prepare_hf_to_shar,
         "distribute_round_robin",
@@ -1156,8 +933,7 @@ def test_audio_dir_run_uses_shared_audio_index_with_fork(tmp_path, monkeypatch):
 
     monkeypatch.setattr(prepare_audio_dir_to_shar, "validate_prepare_runtime", lambda **_kwargs: None)
     monkeypatch.setattr(prepare_audio_dir_to_shar, "build_audio_index", lambda *_args, **_kwargs: {"clip": "/audio.wav"})
-    monkeypatch.setattr(prepare_audio_dir_to_shar, "write_prepare_state_for_spec", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prepare_audio_dir_to_shar, "ensure_worker_assignment", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(prepare_audio_dir_to_shar, "resolve_num_workers", lambda *_args, **_kwargs: 1)
     monkeypatch.setattr(
         prepare_audio_dir_to_shar,
         "distribute_round_robin",
@@ -1200,7 +976,7 @@ def test_run_convert_dispatch_skips_when_disabled():
     assert result == {"skipped": True, "reason": "convert.disabled"}
 
 
-def test_run_convert_resume_false_removes_existing_output_dir(tmp_path, monkeypatch):
+def test_run_convert_overwrite_removes_existing_output_dir(tmp_path, monkeypatch):
     out = tmp_path / "out"
     out.mkdir()
     (out / "stale.txt").write_text("stale\n")
@@ -1223,6 +999,10 @@ def test_run_convert_resume_false_removes_existing_output_dir(tmp_path, monkeypa
 
     class _RunnerModule:
         @staticmethod
+        def preflight(_prepare_spec, **_kwargs):
+            return None
+
+        @staticmethod
         def run(prepare_spec, *, resolved_inputs=None):
             del resolved_inputs
             captured["exists_on_entry"] = Path(prepare_spec.output.shar_dir).exists()
@@ -1230,15 +1010,64 @@ def test_run_convert_resume_false_removes_existing_output_dir(tmp_path, monkeypa
             return {"ran": True}
 
     monkeypatch.setattr(convert_stage, "get_prepare_runner", lambda _spec: _RunnerModule)
-    monkeypatch.setattr(convert_stage, "validate_prepare_runtime", lambda **_kwargs: None)
 
-    result = convert_stage.run_convert(spec, resume=False)
-    assert result == {"ran": True}
-    assert captured["exists_on_entry"] is False
+    result = convert_stage.run_convert(spec, overwrite=True)
+    assert result["ran"] is True
+    assert result["skipped"] is False
+    assert result["stage"] == "convert"
+    assert captured["exists_on_entry"] is True
+    assert not (out / "stale.txt").exists()
     assert (out / "_shar_work_manifest.json").is_file()
 
 
-def test_run_convert_reuses_stage_resolved_inputs_without_stage_preflight(tmp_path, monkeypatch):
+def test_run_convert_overwrite_preflights_before_deleting_existing_output(
+    tmp_path, monkeypatch
+):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "_SUCCESS").write_text("ok\n")
+    kept = out / "usable_shar.bin"
+    kept.write_text("keep\n")
+    parquet_dir = tmp_path / "parquet"
+    parquet_dir.mkdir()
+    parquet_path = parquet_dir / "data.parquet"
+    parquet_path.write_text("stub\n")
+
+    spec = load_dataset_spec(
+        {
+            "name": "validate_before_delete",
+            "convert": {
+                "family": "parquet",
+                "input": {"parquet_dir": str(parquet_dir)},
+                "output": {"shar_dir": str(out), "shard_size": 2000},
+            },
+        }
+    )
+
+    monkeypatch.setattr(
+        convert_stage,
+        "resolve_prepare_inputs",
+        lambda _spec: ([str(parquet_path)], {"resolved_inputs": [str(parquet_path)]}),
+    )
+    class _RunnerModule:
+        @staticmethod
+        def preflight(_prepare_spec, **_kwargs):
+            raise FileNotFoundError("missing tokenizer runtime")
+
+        @staticmethod
+        def run(_prepare_spec, *, resolved_inputs=None):
+            raise AssertionError("runner must not execute when preflight fails")
+
+    monkeypatch.setattr(convert_stage, "get_prepare_runner", lambda _spec: _RunnerModule)
+
+    with pytest.raises(FileNotFoundError, match="missing tokenizer runtime"):
+        convert_stage.run_convert(spec, overwrite=True)
+
+    assert kept.read_text() == "keep\n"
+    assert (out / "_SUCCESS").is_file()
+
+
+def test_run_convert_preflights_and_runs_with_same_resolved_inputs(tmp_path, monkeypatch):
     out = tmp_path / "out"
     resolved_inputs = [str(tmp_path / "inputs" / "data.parquet")]
     spec = load_dataset_spec(
@@ -1260,10 +1089,12 @@ def test_run_convert_reuses_stage_resolved_inputs_without_stage_preflight(tmp_pa
             "resolved_inputs": resolved_inputs,
         }
 
-    def _unexpected_stage_preflight(*_args, **_kwargs):
-        raise AssertionError("convert stage must not preflight before runner")
-
     class _RunnerModule:
+        @staticmethod
+        def preflight(prepare_spec, **kwargs):
+            captured["preflight_spec"] = prepare_spec
+            captured["preflight_resolved_inputs"] = kwargs["resolved_inputs"]
+
         @staticmethod
         def run(prepare_spec, *, resolved_inputs=None):
             captured["runner_spec"] = prepare_spec
@@ -1272,13 +1103,15 @@ def test_run_convert_reuses_stage_resolved_inputs_without_stage_preflight(tmp_pa
             return {"ran": True}
 
     monkeypatch.setattr(convert_stage, "resolve_prepare_inputs", _resolve_inputs_once)
-    monkeypatch.setattr(convert_stage, "preflight_prepare_spec", _unexpected_stage_preflight)
     monkeypatch.setattr(convert_stage, "get_prepare_runner", lambda _spec: _RunnerModule)
 
     result = convert_stage.run_convert(spec)
 
-    assert result == {"ran": True}
+    assert result["ran"] is True
+    assert result["skipped"] is False
     assert captured["resolved_spec"] is spec.convert
+    assert captured["preflight_spec"] is spec.convert
+    assert captured["preflight_resolved_inputs"] == resolved_inputs
     assert captured["runner_spec"] is spec.convert
     assert captured["runner_resolved_inputs"] == resolved_inputs
     assert (out / "_shar_work_manifest.json").is_file()
@@ -1301,6 +1134,10 @@ def test_convert_execution_loads_runner_from_input_spec(tmp_path, monkeypatch):
 
     class _RunnerModule:
         @staticmethod
+        def preflight(_prepare_spec, **_kwargs):
+            return None
+
+        @staticmethod
         def run(prepare_spec, *, resolved_inputs=None):
             captured["runner_spec"] = prepare_spec
             captured["runner_resolved_inputs"] = resolved_inputs
@@ -1312,13 +1149,14 @@ def test_convert_execution_loads_runner_from_input_spec(tmp_path, monkeypatch):
 
     result = convert_stage.run_convert(spec)
 
-    assert result == {"ran": True}
+    assert result["ran"] is True
+    assert result["skipped"] is False
     assert captured["runner_spec"] is spec.convert
     assert captured["runner_resolved_inputs"] == resolved_inputs
 
 
-def test_run_convert_preflights_exactly_once_via_runner(tmp_path, monkeypatch):
-    """Stage does not preflight; runner preflights once. Together: exactly one call."""
+def test_run_convert_preflights_exactly_once_before_runner(tmp_path, monkeypatch):
+    """Convert preflight runs once in run_stage before runner work."""
     out = tmp_path / "out"
     resolved_inputs = [str(tmp_path / "inputs" / "data.parquet")]
     spec = load_dataset_spec(
@@ -1333,20 +1171,19 @@ def test_run_convert_preflights_exactly_once_via_runner(tmp_path, monkeypatch):
     )
     preflight_calls: list[dict[str, Any]] = []
 
-    def _track_preflight(prepare_spec, **kwargs):
-        preflight_calls.append({"family": prepare_spec.family, "kwargs": kwargs})
-
     monkeypatch.setattr(
         convert_stage,
         "resolve_prepare_inputs",
         lambda prepare_spec: (resolved_inputs, {"family": prepare_spec.family}),
     )
-    monkeypatch.setattr(convert_stage, "preflight_prepare_spec", _track_preflight)
 
     class _RunnerModule:
         @staticmethod
+        def preflight(prepare_spec, **kwargs):
+            preflight_calls.append({"family": prepare_spec.family, "kwargs": kwargs})
+
+        @staticmethod
         def run(prepare_spec, *, resolved_inputs=None):
-            convert_stage.preflight_prepare_spec(prepare_spec)
             _write_cut_shar_index(Path(prepare_spec.output.shar_dir))
             return {"ran": True}
 
@@ -1356,6 +1193,7 @@ def test_run_convert_preflights_exactly_once_via_runner(tmp_path, monkeypatch):
 
     assert len(preflight_calls) == 1, f"expected exactly one preflight, got {len(preflight_calls)}"
     assert preflight_calls[0]["family"] == "parquet"
+    assert preflight_calls[0]["kwargs"]["resolved_inputs"] == resolved_inputs
 
 
 def test_split_command_defaults_to_run():
@@ -1408,7 +1246,8 @@ def test_plan_without_stage_override_inspects_all_stages(monkeypatch):
 def test_run_without_stage_override_fails_before_defaulting_to_convert(monkeypatch):
     cfg = _compose_pipeline_cfg(["dataset=stage2/libriheavy_large"])
 
-    def _fake_run(_spec, *, stage, resume):
+    def _fake_run(_spec, *, stage, overwrite):
+        del overwrite
         if stage is None:
             raise ValueError("run requires stage=<convert|tokenize|materialize>")
         raise AssertionError(f"unexpected stage default: {stage!r}")

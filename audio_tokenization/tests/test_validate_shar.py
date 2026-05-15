@@ -6,6 +6,7 @@ import gzip
 import json
 import subprocess
 import sys
+import types
 from io import BytesIO
 from pathlib import Path
 
@@ -83,6 +84,17 @@ def _write_cuts(cuts_path: Path, cuts: list[dict]) -> None:
     with gzip.open(cuts_path, "wt") as f:
         for c in cuts:
             f.write(json.dumps(c) + "\n")
+
+
+def _rewrite_tar(path: Path, entries: list[tuple[str, bytes]]) -> None:
+    """Overwrite *path* with the given (name, bytes) tar members in order."""
+    import tarfile as _tarfile
+
+    with _tarfile.open(path, "w:") as dst:
+        for name, data in entries:
+            info = _tarfile.TarInfo(name=name)
+            info.size = len(data)
+            dst.addfile(info, BytesIO(data))
 
 
 def _add_jsonl_sidecar(
@@ -226,6 +238,44 @@ def test_validate_parallel_path_returns_same_counts(tmp_path):
     parallel = validate_shar_directory(shar, num_workers=4)
     assert inline == parallel
     assert sum(inline.values()) == 12
+
+
+def test_validate_worker_returns_serializable_error_envelope(tmp_path):
+    from audio_tokenization.prepare.validate_shar import _validate_shard_worker
+
+    shar = _write_test_shar(tmp_path, num_cuts=2)
+    cuts_path = shar / "cuts.000000.jsonl.gz"
+    cuts = _read_cuts(cuts_path)
+    cuts[0]["id"] = "definitely-not-the-tar-stem"
+    _write_cuts(cuts_path, cuts)
+    fields = json.loads((shar / "shar_index.json").read_text())["fields"]
+    slice_fields = {name: [str(shar / paths[0])] for name, paths in fields.items()}
+
+    result = _validate_shard_worker(("cuts.000000.jsonl.gz", slice_fields))
+
+    json.dumps(result)
+    assert result["ok"] is False
+    assert result["shard_name"] == "cuts.000000.jsonl.gz"
+    assert "out of lockstep" in result["message"]
+
+
+def test_validate_parallel_corruption_raises_parent_validation_error(tmp_path):
+    from audio_tokenization.prepare.validate_shar import (
+        SharValidationError,
+        validate_shar_directory,
+    )
+
+    shar = _write_test_shar(tmp_path, num_cuts=4, shard_size=2)
+    cuts_path = shar / "cuts.000000.jsonl.gz"
+    cuts = _read_cuts(cuts_path)
+    cuts[0]["id"] = "definitely-not-the-tar-stem"
+    _write_cuts(cuts_path, cuts)
+
+    with pytest.raises(SharValidationError) as ei:
+        validate_shar_directory(shar, num_workers=2)
+
+    assert ei.value.shard_name == "cuts.000000.jsonl.gz"
+    assert "out of lockstep" in str(ei.value)
 
 
 def test_validate_wraps_malformed_jsonl_in_validation_error(tmp_path):
@@ -596,25 +646,74 @@ def test_validate_wraps_truncated_tar_in_validation_error(tmp_path):
     assert ei.value.shard_name.endswith("cuts.000000.jsonl.gz")
 
 
-def test_count_jsonl_entries_handles_gzipped(tmp_path):
-    """Regression for P2: jsonl sidecar fields (.jsonl.gz) must be counted
-    via gzip-aware reader, not sent through tarfile.open."""
-    from audio_tokenization.prepare.validate_shar import (
-        _count_jsonl_entries,
+def test_validate_passes_on_nodata_nometa_placeholder_pair(tmp_path):
+    """Lhotse encodes 'optional field omitted for this cut' as a paired
+    ``.nodata`` data member + ``.nometa`` metadata member, both empty.
+    ``parse_tarinfo_metadata`` returns ``(None, path)`` for both, so a
+    valid placeholder pair must NOT be rejected as 'both/neither metadata'.
+    """
+    import tarfile as _tarfile
+
+    from audio_tokenization.prepare.validate_shar import validate_shar_directory
+
+    shar = _write_test_shar(tmp_path, num_cuts=2)
+    tar_path = shar / "recording.000000.tar"
+
+    # Replace the second cut's (.opus + .json) pair with placeholder
+    # (.nodata + .nometa) entries that share the same stem. Filter on
+    # ``not .endswith(".json")`` to pick the data member regardless of the
+    # writer's intra-pair ordering.
+    cuts = _read_cuts(shar / "cuts.000000.jsonl.gz")
+    stem = cuts[1]["id"]
+    first_stem = cuts[0]["id"]
+    with _tarfile.open(tar_path, "r:") as src:
+        members = src.getmembers()
+        first_data_info = next(
+            m for m in members
+            if m.name.startswith(f"{first_stem}.") and not m.name.endswith(".json")
+        )
+        first_meta_info = next(m for m in members if m.name == f"{first_stem}.json")
+        first_data_bytes = src.extractfile(first_data_info).read()
+        first_meta_bytes = src.extractfile(first_meta_info).read()
+
+    _rewrite_tar(
+        tar_path,
+        [
+            (first_data_info.name, first_data_bytes),
+            (first_meta_info.name, first_meta_bytes),
+            (f"{stem}.nodata", b""),
+            (f"{stem}.nometa", b""),
+        ],
     )
-    p = tmp_path / "captions.000000.jsonl.gz"
-    with gzip.open(p, "wt") as f:
-        f.write('{"a":1}\n{"b":2}\n{"c":3}\n')
-    assert _count_jsonl_entries(p) == 3
+
+    counts = validate_shar_directory(shar)
+    assert sum(counts.values()) == 2
 
 
-def test_count_jsonl_entries_handles_plain(tmp_path):
+def test_validate_wraps_uneven_tar_in_validation_error(tmp_path):
+    """Upstream ``iterate_tarfile_pairwise_metadata`` raises bare
+    ``RuntimeError("Uneven number of files...")`` on odd member counts.
+    The validator must wrap that as ``SharValidationError`` so the CLI's
+    'FAIL: validation error' path fires instead of a raw traceback.
+    """
+    import tarfile as _tarfile
+
     from audio_tokenization.prepare.validate_shar import (
-        _count_jsonl_entries,
+        SharValidationError,
+        validate_shar_directory,
     )
-    p = tmp_path / "captions.000000.jsonl"
-    p.write_text('{"a":1}\n{"b":2}\n')
-    assert _count_jsonl_entries(p) == 2
+
+    shar = _write_test_shar(tmp_path, num_cuts=2)
+    tar_path = shar / "recording.000000.tar"
+
+    with _tarfile.open(tar_path, "r:") as src:
+        members = src.getmembers()
+        kept = [(m.name, src.extractfile(m).read()) for m in members[:3]]
+    _rewrite_tar(tar_path, kept)
+
+    with pytest.raises(SharValidationError) as ei:
+        validate_shar_directory(shar)
+    assert "Uneven" in str(ei.value) or "malformed" in str(ei.value)
 
 
 def test_validate_raises_on_missing_index(tmp_path):
@@ -626,6 +725,32 @@ def test_validate_raises_on_missing_index(tmp_path):
     empty.mkdir()
     with pytest.raises(FileNotFoundError, match="shar_index.json"):
         validate_shar_directory(empty)
+
+
+def test_tar_pair_iterator_requires_metadata_iterator(monkeypatch, tmp_path):
+    import audio_tokenization.prepare.validate_shar as validate_mod
+
+    fake_shar = types.ModuleType("lhotse.shar")
+
+    monkeypatch.setitem(sys.modules, "lhotse.shar", fake_shar)
+
+    with pytest.raises(RuntimeError, match="iterate_tarfile_pairwise_metadata"):
+        next(validate_mod._iter_tar_pair_stems(tmp_path / "missing.tar"))
+
+
+def test_tar_pair_iterator_only_imports_metadata_iterator(monkeypatch, tmp_path):
+    """The validator's only symbol-level dependency on ``lhotse.shar`` is
+    ``iterate_tarfile_pairwise_metadata``. Faking the module with just that
+    attribute must be enough to reach ``tarfile.open`` (which then fails on
+    a missing path — proving we got past the import gate)."""
+    import audio_tokenization.prepare.validate_shar as validate_mod
+
+    fake_shar = types.ModuleType("lhotse.shar")
+    fake_shar.iterate_tarfile_pairwise_metadata = lambda _tar: iter(())
+    monkeypatch.setitem(sys.modules, "lhotse.shar", fake_shar)
+
+    with pytest.raises(FileNotFoundError):
+        next(validate_mod._iter_tar_pair_stems(tmp_path / "missing.tar"))
 
 
 # ---------------------------------------------------------------------------

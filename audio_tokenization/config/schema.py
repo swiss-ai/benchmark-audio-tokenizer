@@ -462,7 +462,7 @@ class PrepareSpec(SchemaModel):
         return cls.model_validate(data)
 
     def fingerprint_payload(self) -> dict[str, Any]:
-        """Canonical fingerprint dict for resume-invariant checks."""
+        """Canonical payload written to stage audit manifests."""
         return {
             "family": self.family,
             **{
@@ -618,7 +618,7 @@ class TokenizeSpec(SchemaModel):
         return self.model_copy(update=update)
 
     def fingerprint_payload(self) -> dict[str, Any]:
-        """Output-shaping subset of the spec, for resume-safety checks."""
+        """Output-shaping subset of the spec for audit manifests."""
         f = self.filter
         d = self.dataloader
         uses_audio_text = self.mode == "audio_text"

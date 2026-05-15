@@ -119,17 +119,6 @@ def _shard_slices(
     return slices
 
 
-def _count_jsonl_entries(path: Path) -> int:
-    with open_compressed(path, "rt") as f:
-        return sum(1 for line in f if line.strip())
-
-
-# Mirrors the .nodata / .nometa convention defined inline at
-# lhotse/shar/readers/tar.py (parse_tarinfo) and the writers at
-# lhotse/shar/writers/{audio,array}.py — Lhotse does not export this set.
-_META_SUFFIXES = {".json", ".nometa"}
-
-
 def _member_id(raw_path: str) -> str:
     """Return the logical SHAR item id from a tar/jsonl member path.
 
@@ -221,115 +210,108 @@ def _iter_jsonl_sidecar_ids(path: Path):
 def _iter_tar_pair_stems(path: Path):
     """Yield one cut-equivalent stem per (data, metadata) tar member pair.
 
-    Walks tar headers in lockstep, reads ONLY the metadata blob's bytes
-    (audio payload bytes are skipped — the next iteration step seeks past
-    them) and deserializes the JSON into a real Lhotse manifest object
-    (Recording / Features / Array / …). A malformed metadata entry, an
-    unrecognised manifest type, or a stem mismatch within a pair raises
-    ``_StructuralReadError``.
+    Uses Lhotse's metadata-only SHAR tar iterator, which reads ONLY metadata
+    bytes, then deserializes the JSON into a real Lhotse manifest object
+    (Recording / Features / Array / …). Malformed metadata, unrecognised
+    manifest types, stem mismatches within a pair, or uneven member counts
+    raise ``_StructuralReadError``.
 
-    Why we don't reuse ``lhotse.shar.readers.tar.iterate_tarfile_pairwise``:
-    that helper unconditionally calls ``tar.extractfile(...).read()`` on
-    every non-``.nodata``/``.nometa`` member, which would force us to read
-    every audio payload — defeating the entire point of this validator
-    (cheap deserialization without payload decode). We pair manually so we
-    can skip data members.
+    Lhotse encodes "optional field omitted for this cut" as a paired
+    ``.nodata`` data member + ``.nometa`` metadata member (both empty);
+    ``parse_tarinfo_metadata`` returns ``(None, path)`` for both, so they're
+    detected by path suffix here, not by metadata presence.
 
     Tar mode is dispatched on extension: ``.tar.gz`` → ``r:gz`` (the only
     compressed shape this repo emits, via ``merge_shar.py`` with
     ``kind == "tar.gz"``), plain ``.tar`` → ``r:`` (skips a
     compression-probe header read).
     """
+    try:
+        from lhotse.shar import iterate_tarfile_pairwise_metadata
+    except ImportError as exc:
+        raise RuntimeError(
+            "validate_shar requires Lhotse with "
+            "lhotse.shar.iterate_tarfile_pairwise_metadata; source "
+            "scripts/utils/source_lhotse_runtime.sh or set LHOTSE_DIR."
+        ) from exc
+
     lower_name = path.name.lower()
     mode = "r:gz" if lower_name.endswith((".tar.gz", ".tgz")) else "r:"
     with tarfile.open(path, mode=mode) as tar:
-        pending: list[tuple[str, bytes | None]] = []
-        for tarinfo in tar:
-            if not tarinfo.isfile():
-                continue
-            tar_path = tarinfo.name
-            if any(tar_path.endswith(suffix) for suffix in _META_SUFFIXES):
-                f = tar.extractfile(tarinfo)
-                if f is None:
-                    meta_bytes = b""
-                else:
-                    with f:
-                        meta_bytes = f.read()
-            else:
-                meta_bytes = None
-            pending.append((tar_path, meta_bytes))
-            if len(pending) != 2:
-                continue
+        try:
+            pairs = iterate_tarfile_pairwise_metadata(tar)
+            for (left_meta, left_path), (right_meta, right_path) in pairs:
+                if _member_id(left_path) != _member_id(right_path):
+                    raise _StructuralReadError(
+                        f"tar pair stem mismatch in {path.name}: "
+                        f"{left_path} vs {right_path}"
+                    )
 
-            (left_path, left_meta), (right_path, right_meta) = pending
-            pending = []
-            if _member_id(left_path) != _member_id(right_path):
-                raise _StructuralReadError(
-                    f"tar pair stem mismatch in {path.name}: "
-                    f"{left_path} vs {right_path}"
-                )
+                if left_path.endswith(".nodata") and right_path.endswith(".nometa"):
+                    yield _member_id(left_path)
+                    continue
 
-            # Lhotse's SHAR layout is exactly one data member + exactly
-            # one metadata member per cut. Anything else (two metas, two
-            # datas) is a producer bug we want to surface, not silently
-            # pick a side.
-            left_is_meta = left_meta is not None
-            right_is_meta = right_meta is not None
-            if left_is_meta == right_is_meta:
-                raise _StructuralReadError(
-                    f"tar pair in {path.name} has both/neither metadata "
-                    f"members: {left_path} / {right_path}"
-                )
-            if left_is_meta or not right_is_meta:
-                raise _StructuralReadError(
-                    f"tar pair in {path.name} is not ordered as "
-                    f"data-then-metadata: {left_path} / {right_path}"
-                )
+                # Real pair: data first (None bytes — payload is not read),
+                # metadata second (JSON bytes). Anything else is a producer
+                # bug we want to surface, not silently pick a side.
+                left_is_meta = left_meta is not None
+                right_is_meta = right_meta is not None
+                if left_is_meta == right_is_meta:
+                    raise _StructuralReadError(
+                        f"tar pair in {path.name} has both/neither metadata "
+                        f"members: {left_path} / {right_path}"
+                    )
+                if left_is_meta or not right_is_meta:
+                    raise _StructuralReadError(
+                        f"tar pair in {path.name} is not ordered as "
+                        f"data-then-metadata: {left_path} / {right_path}"
+                    )
 
-            meta_blob = right_meta
-            meta_path = right_path
-            if meta_path.endswith(".nometa"):
-                yield _member_id(left_path)
-                continue
-            try:
-                manifest = deserialize_item(decode_json_line(meta_blob.decode("utf-8")))
-                # Reapply the same placeholder-fill invariant the real reader
-                # enforces, but without reading full payload bytes. The actual
-                # payload contents are out of scope here; we only need to prove
-                # that the manifest shape is compatible with SHAR placeholder
-                # filling (e.g. Recording has exactly one source, array suffix
-                # matches a supported storage backend, etc.).
-                placeholder_data = None if left_path.endswith(".nodata") else b""
-                fill_shar_placeholder(
-                    manifest=manifest,
-                    data=placeholder_data,
-                    tarpath=left_path,
-                )
-            except (
-                json.JSONDecodeError,
-                UnicodeDecodeError,
-                TypeError,
-                ValueError,
-                AssertionError,
+                meta_blob = right_meta
+                meta_path = right_path
+                try:
+                    manifest = deserialize_item(decode_json_line(meta_blob.decode("utf-8")))
+                    # Reapply the same placeholder-fill invariant the real
+                    # reader enforces, without reading full payload bytes —
+                    # we only need to prove the manifest shape is compatible
+                    # with SHAR placeholder filling (Recording has exactly one
+                    # source, array suffix matches a supported backend, etc.).
+                    placeholder_data = None if left_path.endswith(".nodata") else b""
+                    fill_shar_placeholder(
+                        manifest=manifest,
+                        data=placeholder_data,
+                        tarpath=left_path,
+                    )
+                except (
+                    json.JSONDecodeError,
+                    UnicodeDecodeError,
+                    TypeError,
+                    ValueError,
+                    AssertionError,
                 ) as e:
-                raise _StructuralReadError(
-                    f"tar metadata in {path.name} entry {meta_path} "
-                    f"failed to deserialize ({type(e).__name__}: {e})"
-                ) from e
-            except RuntimeError as e:
-                raise _StructuralReadError(
-                    f"tar metadata in {path.name} entry {meta_path} "
-                    f"failed SHAR placeholder validation "
-                    f"({type(e).__name__}: {e})"
-                ) from e
+                    raise _StructuralReadError(
+                        f"tar metadata in {path.name} entry {meta_path} "
+                        f"failed to deserialize ({type(e).__name__}: {e})"
+                    ) from e
+                except RuntimeError as e:
+                    raise _StructuralReadError(
+                        f"tar metadata in {path.name} entry {meta_path} "
+                        f"failed SHAR placeholder validation "
+                        f"({type(e).__name__}: {e})"
+                    ) from e
 
-            yield _member_id(left_path)
-
-        if pending:
+                yield _member_id(left_path)
+        except _StructuralReadError:
+            raise
+        except RuntimeError as exc:
+            # Upstream raises a plain RuntimeError("Uneven number of files
+            # in the tarfile...") when the archive has odd member counts.
+            # Wrap so _validate_structural_shard sees one canonical
+            # structural-error type instead of bypassing its except list.
             raise _StructuralReadError(
-                f"Uneven number of file members in {path.name}; "
-                f"expected data/meta pairs."
-            )
+                f"tar archive {path.name} has malformed structure "
+                f"(expected pairs of data + metadata members): {exc}"
+            ) from exc
 
 
 def _raise(
@@ -457,11 +439,70 @@ def _validate_structural_shard(
         ) from e
 
 
-def _validate_shard_worker(args: tuple[str, dict[str, list[str]]]) -> tuple[str, int]:
+def _worker_error_result(
+    *,
+    shard_name: str,
+    slice_fields: dict[str, list[str]],
+    error: BaseException,
+) -> dict[str, object]:
+    cuts_paths = slice_fields.get("cuts") or [""]
+    if isinstance(error, SharValidationError):
+        return {
+            "ok": False,
+            "shard_name": error.shard_name,
+            "cuts_path": str(error.cuts_path),
+            "last_good_cut_id": error.last_good_cut_id,
+            "cuts_consumed": error.cuts_consumed,
+            "error_type": type(error.original).__name__,
+            "message": str(error.original),
+        }
+    return {
+        "ok": False,
+        "shard_name": shard_name,
+        "cuts_path": str(cuts_paths[0]),
+        "last_good_cut_id": None,
+        "cuts_consumed": 0,
+        "error_type": type(error).__name__,
+        "message": f"{type(error).__name__}: {error}",
+    }
+
+
+def _validate_shard_worker(args: tuple[str, dict[str, list[str]]]) -> dict[str, object]:
     shard_name, slice_fields = args
-    return shard_name, _validate_structural_shard(
-        shard_name=shard_name, slice_fields=slice_fields,
-    )
+    try:
+        count = _validate_structural_shard(
+            shard_name=shard_name,
+            slice_fields=slice_fields,
+        )
+    except Exception as e:
+        return _worker_error_result(
+            shard_name=shard_name,
+            slice_fields=slice_fields,
+            error=e,
+        )
+    return {
+        "ok": True,
+        "shard_name": shard_name,
+        "count": count,
+    }
+
+
+def _raise_worker_validation_error(result: dict[str, object]) -> None:
+    # Lossy by design: the worker's real exception type and traceback don't
+    # survive the multiprocessing pickle boundary, so we reconstruct a
+    # RuntimeError carrying the rendered ``error_type: message`` string. The
+    # message + shard context is the operator-facing signal; the original
+    # traceback lives in the worker's stderr if deeper post-mortem is needed.
+    message = str(result.get("message") or "SHAR worker validation failed")
+    error_type = str(result.get("error_type") or "RuntimeError")
+    err = RuntimeError(f"{error_type}: {message}")
+    raise SharValidationError(
+        shard_name=str(result.get("shard_name") or "<unknown>"),
+        cuts_path=Path(str(result.get("cuts_path") or "")),
+        last_good_cut_id=result.get("last_good_cut_id") or None,
+        cuts_consumed=int(result.get("cuts_consumed") or 0),
+        original=err,
+    ) from err
 
 
 def validate_shar_directory(
@@ -500,8 +541,14 @@ def validate_shar_directory(
     if n_workers == 1:
         # Avoid pool overhead and keep tracebacks readable for single-shard
         # debugging.
-        for item in slices:
-            _record(*_validate_shard_worker(item))
+        for shard_name, slice_fields in slices:
+            _record(
+                shard_name,
+                _validate_structural_shard(
+                    shard_name=shard_name,
+                    slice_fields=slice_fields,
+                ),
+            )
     else:
         # Default context (fork on Linux) — cheaper than forkserver because
         # workers inherit the parent's lhotse imports via COW. Also works in
@@ -510,8 +557,10 @@ def validate_shar_directory(
         # imap_unordered streams results as workers finish so the verbose
         # log shows live progress instead of dumping at the end.
         with multiprocessing.Pool(processes=n_workers) as pool:
-            for shard_name, expected in pool.imap_unordered(_validate_shard_worker, slices):
-                _record(shard_name, expected)
+            for result in pool.imap_unordered(_validate_shard_worker, slices):
+                if result.get("ok") is not True:
+                    _raise_worker_validation_error(result)
+                _record(str(result["shard_name"]), int(result["count"]))
     return counts
 
 

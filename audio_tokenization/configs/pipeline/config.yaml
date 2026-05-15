@@ -7,6 +7,6 @@ defaults:
 # Root pipeline config is intentionally thin:
 # - `dataset` is required; choose one under dataset/{sft,cooldown,stage1,stage2,internal}
 # - `stage` is required for run/clean; plan/status inspect all when it is unset
-# - `runtime/*` carries operational knobs such as resume/debug
+# - `runtime/*` carries operational knobs such as overwrite/debug
 # - `dataset/*` is the canonical typed dataset spec
 stage: ???

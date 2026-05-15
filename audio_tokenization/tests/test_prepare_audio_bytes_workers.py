@@ -82,10 +82,26 @@ class _FakeParquetFile:
         assert use_threads is False
         rows = self._rows
         if columns is not None:
-            rows = [{k: row[k] for k in columns if k in row} for row in rows]
+            rows = [_project_fake_row(row, columns) for row in rows]
         batch_size = batch_size or len(rows)
         for start in range(0, len(rows), batch_size):
             yield _FakeArrowBatch(rows[start:start + batch_size])
+
+
+def _project_fake_row(row, columns):
+    out = {}
+    for column in columns:
+        if "." not in column:
+            if column in row:
+                out[column] = row[column]
+            continue
+
+        root, child = column.split(".", 1)
+        value = row.get(root)
+        if not isinstance(value, dict) or child not in value:
+            continue
+        out.setdefault(root, {})[child] = value[child]
+    return out
 
 
 class _FakeSupervisionSegment:
@@ -113,16 +129,22 @@ def _fake_fastcopy(cut, **overrides):
     return cut
 
 
-def _install_fake_lhotse(monkeypatch, written_cuts):
+def _install_fake_lhotse(monkeypatch, written_cuts, writer_kwargs=None):
     fake_lhotse = types.ModuleType("lhotse")
     fake_lhotse.SupervisionSegment = _FakeSupervisionSegment
     fake_lhotse.fastcopy = _fake_fastcopy
 
     fake_lhotse_shar = types.ModuleType("lhotse.shar")
-    fake_lhotse_shar.SharWriter = lambda **kwargs: _FakeSharWriter(
-        sink=written_cuts,
-        **kwargs,
-    )
+
+    def _writer(**kwargs):
+        if writer_kwargs is not None:
+            writer_kwargs.append(dict(kwargs))
+        return _FakeSharWriter(
+            sink=written_cuts,
+            **kwargs,
+        )
+
+    fake_lhotse_shar.SharWriter = _writer
 
     monkeypatch.setitem(sys.modules, "lhotse", fake_lhotse)
     monkeypatch.setitem(sys.modules, "lhotse.shar", fake_lhotse_shar)
@@ -142,7 +164,6 @@ def _install_fake_pyarrow(monkeypatch, table):
 def _install_common_worker_patches(monkeypatch, module, helper_calls):
     if hasattr(module, "_EXTERNAL_METADATA"):
         monkeypatch.setattr(module, "_EXTERNAL_METADATA", None)
-    monkeypatch.setattr(module, "check_worker_reuse", lambda *args, **kwargs: None)
     monkeypatch.setattr(module, "init_worker_process", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         module,
@@ -312,6 +333,71 @@ def test_prepare_hf_worker_uses_shared_audio_bytes_helper(monkeypatch, tmp_path)
     assert written_cuts[0].id == "clip-1"
     assert written_cuts[0].supervisions[0].id == "clip-1"
     assert written_cuts[0].supervisions[0].text == "hello from hf"
+
+
+def test_prepare_hf_worker_accepts_hf_audio_bytes_selector(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "audio": [{"bytes": b"arrow-bytes", "path": "clips/clip-1.wav"}],
+                "text": ["hello from nested hf"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_hf_to_shar, helper_calls)
+
+    result = prepare_hf_to_shar._convert_worker(
+        _hf_worker_args(
+            tmp_path,
+            audio_column="audio.bytes",
+            id_column="audio.path",
+        )
+    )
+
+    assert result["written"] == 1
+    assert result["errors"] == 0
+    assert helper_calls == [
+        {
+            "audio_bytes": b"arrow-bytes",
+            "recording_id": "clips/clip-1.wav",
+        }
+    ]
+    assert written_cuts[0].id == "clips/clip-1.wav"
+    assert written_cuts[0].supervisions[0].text == "hello from nested hf"
+
+
+def test_prepare_hf_worker_requests_atomic_shar_commit(monkeypatch, tmp_path):
+    written_cuts = []
+    writer_kwargs = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts, writer_kwargs)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "id": ["clip-1"],
+                "audio": [{"bytes": b"arrow-bytes"}],
+                "text": ["hello from hf"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_hf_to_shar, helper_calls)
+
+    result = prepare_hf_to_shar._convert_worker(_hf_worker_args(tmp_path))
+
+    assert result["written"] == 1
+    assert writer_kwargs == [
+        {
+            "output_dir": str(tmp_path / "shar" / "worker_00"),
+            "fields": {"recording": "flac"},
+            "shard_size": 100,
+            "commit": "atomic",
+        }
+    ]
 
 
 def test_prepare_hf_worker_parser_uses_row_ids_not_row_index_as_chunks(monkeypatch, tmp_path):
@@ -533,6 +619,45 @@ def test_prepare_parquet_worker_accepts_binary_audio_column(monkeypatch, tmp_pat
     assert written_cuts[0].supervisions[0].text == "hello from common voice"
     assert written_cuts[0].supervisions[0].language == "en"
     assert written_cuts[0].custom["split"] == "train"
+
+
+def test_prepare_parquet_worker_accepts_hf_audio_bytes_selector(monkeypatch, tmp_path):
+    written_cuts = []
+    helper_calls = []
+    _install_fake_lhotse(monkeypatch, written_cuts)
+    _install_fake_pyarrow(
+        monkeypatch,
+        _FakeArrowTable(
+            {
+                "audio": [{"bytes": b"hf-wav-bytes", "path": "speaker/clip_001.wav"}],
+                "transcription": ["hello from hf audio"],
+            }
+        ),
+    )
+    _install_common_worker_patches(monkeypatch, prepare_parquet_to_shar, helper_calls)
+
+    result = prepare_parquet_to_shar._convert_worker(
+        _parquet_worker_args(
+            tmp_path,
+            audio_column="audio.bytes",
+            id_column="audio.path",
+            text_column="transcription",
+            duration_column=None,
+            language="en",
+        )
+    )
+
+    assert result["written"] == 1
+    assert result["errors"] == 0
+    assert helper_calls == [
+        {
+            "audio_bytes": b"hf-wav-bytes",
+            "recording_id": "speaker/clip_001.wav",
+        }
+    ]
+    assert result["total_duration_sec"] == 1.5
+    assert written_cuts[0].id == "speaker/clip_001.wav"
+    assert written_cuts[0].supervisions[0].text == "hello from hf audio"
 
 
 def test_prepare_parquet_worker_external_metadata_overrides_text_and_custom(monkeypatch, tmp_path):
@@ -1128,7 +1253,11 @@ def test_prepare_parquet_preflight_checks_runtime_and_logs_missing_optional_colu
     )
 
     with caplog.at_level("INFO"):
-        prepare_parquet_to_shar._preflight_prepare(spec, ["dataset.parquet"])
+        prepare_parquet_to_shar.preflight(
+            spec,
+            runtime_validator=prepare_parquet_to_shar.validate_prepare_runtime,
+            resolved_inputs=["dataset.parquet"],
+        )
 
     assert calls == [
         {
@@ -1175,7 +1304,11 @@ def test_prepare_parquet_preflight_raises_for_missing_required_audio_column(monk
     )
 
     with pytest.raises(RuntimeError, match="required column roots are missing"):
-        prepare_parquet_to_shar._preflight_prepare(spec, ["dataset.parquet"])
+        prepare_parquet_to_shar.preflight(
+            spec,
+            runtime_validator=prepare_parquet_to_shar.validate_prepare_runtime,
+            resolved_inputs=["dataset.parquet"],
+        )
 
 
 def test_validate_prepare_runtime_requires_ffmpeg(monkeypatch):

@@ -4,27 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import json
+import inspect
 import logging
 import os
 import shutil
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence, get_args
+from typing import Any, Callable, Iterable, Sequence
 
-from audio_tokenization.config.schema import TokenizeMode
-from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
+from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME, SUCCESS_MARKER_FILE
 from audio_tokenization.prepare.constants import (
-    CURRENT_PREPARE_STATE_VERSION,
-    PREPARE_STATE_FILE,
     PREPARE_SUMMARY_FILE,
-    SUCCESS_MARKER_FILE,
-    WORKER_ASSIGNMENT_FILE,
     WORKER_STATS_FILE,
-    state_version_for_filename,
 )
-from audio_tokenization.utils.io import atomic_streaming_write, atomic_write_json
+from audio_tokenization.utils.io import atomic_write_json, write_success_marker
 from audio_tokenization.utils.stats import load_json_records, max_field, sum_counter_fields
 
 
@@ -32,15 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 _PREPARE_TOTAL_FIELDS = ("written", "skipped", "errors", "total_duration_sec")
-_TOKENIZE_MODES = frozenset(get_args(TokenizeMode))
-
-
-def _state_version_for_path(state_path: Path) -> int:
-    return state_version_for_filename(state_path.name)
-
-
-def _state_label_for_path(state_path: Path) -> str:
-    return "prepare state" if state_path.name == PREPARE_STATE_FILE else "stage state"
 
 
 def maybe_log_worker_progress(
@@ -86,6 +71,7 @@ def validate_prepare_runtime(
     """Fail fast on runtime prerequisites before worker startup."""
     from audio_tokenization.prepare.text_ops import load_text_tokenizer
 
+    require_lhotse_shar_features()
     init_worker_process(resampling_backend)
 
     if text_tokenizer_path is not None:
@@ -97,6 +83,59 @@ def validate_prepare_runtime(
             "Set PATH/LD_LIBRARY_PATH like the dataset SLURM script, or add a pinned ffmpeg "
             "runtime before starting prepare_parquet_to_shar."
         )
+
+
+def require_lhotse_shar_features() -> None:
+    """Fail early when the runtime is not the dev Lhotse required by prepare.
+
+    Convert now relies on two SHAR APIs that are intentionally owned by our
+    Lhotse fork: metadata-only tar iteration for validation, and atomic SHAR
+    commit for durable writes. Falling back to older packaged Lhotse would
+    silently weaken the stage contract, so make the dependency explicit.
+    """
+    missing: list[str] = []
+    try:
+        from lhotse import CutSet
+        import lhotse.shar as shar
+    except ImportError as exc:
+        raise RuntimeError(_dev_lhotse_error(["lhotse import"])) from exc
+
+    if not hasattr(shar, "iterate_tarfile_pairwise_metadata"):
+        missing.append("lhotse.shar.iterate_tarfile_pairwise_metadata")
+
+    shar_writer = getattr(shar, "SharWriter", None)
+    if shar_writer is None or not _accepts_keyword(shar_writer, "commit"):
+        missing.append("lhotse.shar.SharWriter(commit=...)")
+
+    to_shar = getattr(CutSet, "to_shar", None)
+    if to_shar is None or not _accepts_keyword(to_shar, "commit"):
+        missing.append("lhotse.CutSet.to_shar(commit=...)")
+
+    if missing:
+        raise RuntimeError(_dev_lhotse_error(missing))
+
+
+def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    if keyword in signature.parameters:
+        return True
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    )
+
+
+def _dev_lhotse_error(missing: Sequence[str]) -> str:
+    missing_msg = ", ".join(missing)
+    return (
+        "audio-tokenization prepare requires dev Lhotse with SHAR atomic commit "
+        f"support; missing: {missing_msg}. Source "
+        "`scripts/utils/source_lhotse_runtime.sh` before running convert, or set "
+        "`LHOTSE_DIR` to a checkout that provides these APIs."
+    )
 
 
 def get_prepare_runner(spec):
@@ -124,194 +163,47 @@ def preflight_prepare_spec(
     spec,
     *,
     runtime_validator: Callable[..., None] = validate_prepare_runtime,
+    resolved_inputs: list[str] | None = None,
 ) -> None:
     """Run generic prepare preflight through the family runner."""
     return get_prepare_runner(spec).preflight(
         spec,
         runtime_validator=runtime_validator,
+        resolved_inputs=resolved_inputs,
     )
 
 
 def setup_partition_dir(
     part_dir: Path,
     *,
-    success_marker_name: str = SUCCESS_MARKER_FILE,
-    reuse_log: str | None = None,
-    reset_log: str | None = None,
+    worker_id: int | None = None,
     logger=None,
-) -> bool:
-    """Prepare a partition directory for resume-safe writing."""
-    success_marker = part_dir / success_marker_name
-    if success_marker.is_file():
-        if logger and reuse_log:
-            logger.info(reuse_log)
-        return True
-
-    if part_dir.is_dir():
-        if logger and reset_log:
-            logger.warning(reset_log)
-        shutil.rmtree(part_dir)
-
-    part_dir.mkdir(parents=True, exist_ok=True)
-    return False
-
-
-def mark_partition_success(
-    part_dir: Path,
-    *,
-    success_marker_name: str = SUCCESS_MARKER_FILE,
 ) -> None:
-    """Atomically mark a partition as fully prepared."""
-    with atomic_streaming_write(part_dir / success_marker_name, mode="w") as f:
-        f.write("ok\n")
+    """Wipe and recreate a partition directory for fresh writing.
 
+    The stage adapter owns skip/overwrite semantics; partition writers are
+    invoked only when the stage has already decided to (re)build.
 
-def read_prepare_state(
-    state_path: Path,
-    *,
-    expected_version: int | None = None,
-    state_label: str | None = None,
-) -> dict:
-    """Read a current-version state file.
-
-    Raises:
-        FileNotFoundError: if ``state_path`` does not exist.
-        RuntimeError: if the file has no version, the wrong version, or a
-            payload that is not a dict.
+    Logs the wipe with worker_id context when both *worker_id* and *logger*
+    are provided. Callers that don't have a worker_id (or don't care about
+    the log) can omit either.
     """
-    if not state_path.is_file():
-        raise FileNotFoundError(state_path)
-    if expected_version is None:
-        expected_version = _state_version_for_path(state_path)
-    if state_label is None:
-        state_label = _state_label_for_path(state_path)
-
-    payload = json.loads(state_path.read_text())
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Invalid prepare state format: {state_path}")
-
-    if "version" not in payload:
-        raise RuntimeError(
-            f"{state_label} at {state_path} has no version. Delete the output "
-            "directory and rerun the stage."
-        )
-
-    version = payload["version"]
-    if not isinstance(version, int):
-        raise RuntimeError(
-            f"Invalid prepare state at {state_path}: 'version' must be an int, "
-            f"got {type(version).__name__}"
-        )
-
-    if version > expected_version:
-        raise RuntimeError(
-            f"{state_label} at {state_path} is version {version}, but this code "
-            f"only knows how to read up to version {expected_version}. "
-            "Upgrade audio_tokenization to a newer release, or delete the state "
-            "file to start a fresh run."
-        )
-
-    if version < expected_version:
-        raise RuntimeError(
-            f"{state_label} at {state_path} is stale version {version}; "
-            f"expected {expected_version}. Delete the output "
-            "directory and rerun the stage."
-        )
-
-    return payload
+    if part_dir.is_dir():
+        if logger is not None and worker_id is not None:
+            logger.warning(
+                "Worker %s: removing partial output in %s", worker_id, part_dir,
+            )
+        shutil.rmtree(part_dir)
+    part_dir.mkdir(parents=True, exist_ok=True)
 
 
-def diff_fingerprint(
-    expected: Mapping[str, object], on_disk: Mapping[str, object]
-) -> dict[str, tuple[object, object]]:
-    """{key: (expected, actual)} pairs that disagree.
+def mark_partition_success(part_dir: Path) -> None:
+    """Atomically mark a per-worker partition as complete.
 
-    Ignores keys in *on_disk* that aren't part of the expected fingerprint
-    (the ``version`` sentinel the state writer injects, plus any future
-    additive on-disk fields).
+    Distinct contract from stage-root ``run_stage`` completion: this signals
+    that *this worker's slice* is done, not that the whole stage is.
     """
-    expected_norm = _with_legacy_fingerprint_defaults(expected)
-    on_disk_norm = _with_legacy_fingerprint_defaults(on_disk)
-    drift: dict[str, tuple[object, object]] = {}
-    for k, v in expected_norm.items():
-        if k not in on_disk_norm:
-            drift[k] = (v, "<missing>")
-        elif on_disk_norm[k] != v:
-            drift[k] = (v, on_disk_norm[k])
-    return drift
-
-
-def _with_legacy_fingerprint_defaults(value):
-    """Return *value* with known legacy fingerprint omissions filled in.
-
-    Tokenize originally hard-coded the Lhotse resampling backend to soxr but
-    did not record it in ``tokenize_state.json``. Once the backend became an
-    explicit fingerprint key, old completed outputs would otherwise look dirty
-    even though their effective backend matches the current default.
-    """
-    if isinstance(value, Mapping):
-        out = {
-            key: _with_legacy_fingerprint_defaults(item)
-            for key, item in value.items()
-        }
-        if out.get("mode") in _TOKENIZE_MODES and "resampling_backend" not in out:
-            out["resampling_backend"] = "soxr"
-        return out
-    if isinstance(value, list):
-        return [_with_legacy_fingerprint_defaults(item) for item in value]
-    return value
-
-
-def validate_or_write_prepare_state(
-    state_path: Path,
-    *,
-    expected: Mapping[str, object],
-    invariant_keys: Sequence[str],
-    guidance: str,
-    state_version: int | None = None,
-    state_label: str | None = None,
-) -> bool:
-    """Persist first-run state or assert resume invariants on later runs."""
-    if state_version is None:
-        state_version = _state_version_for_path(state_path)
-    if state_label is None:
-        state_label = _state_label_for_path(state_path)
-    if state_path.is_file():
-        payload = read_prepare_state(
-            state_path,
-            expected_version=state_version,
-            state_label=state_label,
-        )
-        expected_norm = _with_legacy_fingerprint_defaults(expected)
-        payload_norm = _with_legacy_fingerprint_defaults(payload)
-
-        for key in invariant_keys:
-            if key not in payload_norm:
-                raise AssertionError(
-                    "Unsafe resume detected: persisted configuration is missing "
-                    "a required invariant.\n"
-                    f"State file: {state_path}\n"
-                    f"Key: {key}\n"
-                    f"Existing value: '<missing>'\n"
-                    f"Current value: {expected_norm.get(key)!r}\n"
-                    f"{guidance}"
-                )
-            prev = payload_norm[key]
-            cur = expected_norm.get(key)
-            if prev != cur:
-                raise AssertionError(
-                    "Unsafe resume detected: persisted configuration changed.\n"
-                    f"State file: {state_path}\n"
-                    f"Key: {key}\n"
-                    f"Existing value: {prev!r}\n"
-                    f"Current value: {cur!r}\n"
-                    f"{guidance}"
-                )
-        return False
-
-    versioned = {"version": state_version, **dict(expected)}
-    atomic_write_json(state_path, versioned)
-    return True
+    write_success_marker(part_dir)
 
 
 def resolve_num_workers(requested: int | None, *, num_inputs: int | None = None) -> int:
@@ -337,39 +229,11 @@ def resolve_num_workers(requested: int | None, *, num_inputs: int | None = None)
     return max(1, cap)
 
 
-def write_prepare_state_for_spec(spec) -> None:
-    """Persist (or assert) the canonical PREPARE_STATE for a typed PrepareSpec.
-
-    All five family runners share an identical state-file contract:
-    state file at ``<shar_dir>/PREPARE_STATE_FILE``, expected payload =
-    ``spec.fingerprint_payload()``, every key invariant. Hoisting here
-    keeps the contract single-sourced.
-    """
-    shar_dir = Path(spec.output.shar_dir)
-    state_path = shar_dir / PREPARE_STATE_FILE
-    expected = spec.fingerprint_payload()
-    wrote = validate_or_write_prepare_state(
-        state_path,
-        expected=expected,
-        invariant_keys=tuple(expected.keys()),
-        guidance=(
-            "The run's configuration has drifted from a previous run that "
-            f"wrote to {shar_dir}. Re-issue the original config to resume, "
-            f"or remove {shar_dir} and restart from scratch."
-        ),
-        state_version=CURRENT_PREPARE_STATE_VERSION,
-        state_label="prepare state",
-    )
-    if wrote:
-        logger.info(f"Wrote prepare state: {state_path}")
-
-
 def build_shar_index_from_parts(
     *,
     shar_root: Path,
     part_dirs: Iterable[Path],
     index_filename: str,
-    success_marker_name: str = SUCCESS_MARKER_FILE,
 ) -> tuple[Path, int]:
     """Build a merged ``shar_index.json`` from expected partition directories."""
     fields = defaultdict(list)
@@ -379,15 +243,15 @@ def build_shar_index_from_parts(
         if not part_dir.is_dir():
             raise FileNotFoundError(f"Missing partition directory: {part_dir}")
 
-        success_marker = part_dir / success_marker_name
+        success_marker = part_dir / SUCCESS_MARKER_FILE
         if not success_marker.is_file():
             raise RuntimeError(
                 f"Missing completion marker in {part_dir}. "
-                "Partial partition detected; resume is unsafe."
+                "Partial partition detected; rerun the stage with overwrite=True."
             )
 
         for p in sorted(part_dir.iterdir()):
-            if not p.is_file() or p.name == success_marker_name:
+            if not p.is_file() or p.name == SUCCESS_MARKER_FILE:
                 continue
             abs_p = p.resolve()
             try:
@@ -461,91 +325,8 @@ def build_shar_index_for_worker_dirs(
         shar_root=shar_root,
         part_dirs=worker_dirs,
         index_filename=index_filename,
-        success_marker_name=SUCCESS_MARKER_FILE,
     )
     logger.info(f"Wrote merged index: {index_path} ({cuts_count} cut shards)")
-
-
-def load_worker_assignment(
-    shar_dir: Path,
-    *,
-    items_key: str = "resolved_items",
-) -> dict | None:
-    """Load a persisted worker assignment from ``_worker_assignment.json``."""
-    path = shar_dir / WORKER_ASSIGNMENT_FILE
-    if not path.is_file():
-        return None
-
-    payload = json.loads(path.read_text())
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Invalid assignment file format: {path}")
-
-    try:
-        num_workers = int(payload["num_workers"])
-        resolved = payload[items_key]
-    except KeyError as e:
-        raise RuntimeError(
-            f"Invalid assignment file (missing key {e.args[0]}): {path}"
-        ) from e
-
-    if num_workers < 1:
-        raise RuntimeError(f"Invalid num_workers in assignment file: {path}")
-    if not isinstance(resolved, list):
-        raise RuntimeError(f"Invalid {items_key} in assignment file: {path}")
-
-    return {
-        "path": path,
-        "num_workers": num_workers,
-        items_key: [str(p) for p in resolved],
-    }
-
-
-def write_worker_assignment(
-    shar_dir: Path,
-    num_workers: int,
-    resolved_items: Sequence,
-    *,
-    items_key: str = "resolved_items",
-) -> Path:
-    """Persist worker assignment for resume safety."""
-    path = shar_dir / WORKER_ASSIGNMENT_FILE
-    payload = {
-        "version": 1,
-        "num_workers": int(num_workers),
-        items_key: list(resolved_items),
-    }
-    atomic_write_json(path, payload)
-    return path
-
-
-def check_worker_reuse(worker_id: int, shar_dir: str | Path) -> dict | None:
-    """Check if a worker partition is already complete; return reuse dict or None."""
-    worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
-    worker_stats_path = worker_dir / WORKER_STATS_FILE
-    if setup_partition_dir(
-        worker_dir,
-        success_marker_name=SUCCESS_MARKER_FILE,
-        reuse_log=f"Worker {worker_id}: reusing completed Shar in {worker_dir}",
-        reset_log=f"Worker {worker_id}: removing partial output in {worker_dir}",
-        logger=logger,
-    ):
-        reused_worker_stats: dict = {}
-        if worker_stats_path.is_file():
-            try:
-                reused_worker_stats = json.loads(worker_stats_path.read_text())
-            except Exception:
-                reused_worker_stats = {}
-        return {
-            "worker_id": worker_id,
-            "written": -1,
-            "skipped": 0,
-            "errors": 0,
-            "elapsed": 0,
-            "total_duration_sec": reused_worker_stats.get("total_duration_sec", 0.0),
-            "reused": True,
-            "worker_stats": reused_worker_stats,
-        }
-    return None
 
 
 def init_worker_process(resampling_backend: str | None = None) -> None:
@@ -596,7 +377,6 @@ def write_worker_result(
         "skipped": skipped,
         "errors": errors,
         "total_duration_sec": total_duration_sec,
-        "reused": False,
         "runtime_counts": dict(runtime_counts),
     }
     if extra_stats:
@@ -605,7 +385,7 @@ def write_worker_result(
     worker_stats_path = worker_dir / WORKER_STATS_FILE
     atomic_write_json(worker_stats_path, worker_stats, sort_keys=False)
 
-    mark_partition_success(worker_dir, success_marker_name=SUCCESS_MARKER_FILE)
+    mark_partition_success(worker_dir)
 
     result: dict = {
         "worker_id": worker_id,
@@ -614,23 +394,11 @@ def write_worker_result(
         "errors": errors,
         "elapsed": elapsed,
         "total_duration_sec": total_duration_sec,
-        "reused": False,
         "worker_stats": worker_stats,
     }
     if extra_stats:
         result.update(extra_stats)
     return result
-
-
-def _effective_worker_value(result: dict, key: str) -> int | float:
-    """Read a worker value, falling back to persisted stats for reused workers."""
-    worker_stats = result.get("worker_stats") or {}
-    if result.get("reused"):
-        return worker_stats.get(key, result.get(key, 0)) or 0
-    value = result.get(key)
-    if key == "written" and value == -1:
-        return worker_stats.get(key, 0) or 0
-    return value or 0
 
 
 def build_prepare_summary(
@@ -641,7 +409,7 @@ def build_prepare_summary(
 ) -> dict:
     """Aggregate prepare worker results into the durable summary schema."""
     totals = {
-        key: sum(_effective_worker_value(result, key) for result in results)
+        key: sum((result.get(key) or 0) for result in results)
         for key in _PREPARE_TOTAL_FIELDS
     }
     reason_counts = sum_counter_fields(
@@ -654,7 +422,6 @@ def build_prepare_summary(
     return {
         "version": 1,
         "num_workers": num_workers,
-        "workers_reused": sum(1 for r in results if r.get("reused")),
         "elapsed_sec": elapsed_sec,
         "total_written": int(totals["written"]),
         "total_skipped": int(totals["skipped"]),
@@ -678,38 +445,6 @@ def build_prepare_rollup(summaries: list[dict]) -> dict:
         "reason_counts": sum_counter_fields(summaries, "reason_counts"),
         "runtime_counts": sum_counter_fields(summaries, "runtime_counts"),
     }
-
-
-def ensure_worker_assignment(
-    shar_dir: Path,
-    resolved_items: Sequence,
-    num_workers: int | None,
-    items_key: str,
-    item_noun: str,
-) -> int:
-    """Load or create a worker assignment; return the final ``num_workers``."""
-    assignment = load_worker_assignment(shar_dir, items_key=items_key)
-    if assignment is not None:
-        if assignment[items_key] != list(resolved_items):
-            raise RuntimeError(
-                f"Existing worker assignment {item_noun} list does not match current resolved items. "
-                f"Delete {shar_dir / WORKER_ASSIGNMENT_FILE} and worker_* directories to start fresh."
-            )
-        if num_workers is not None and int(num_workers) != assignment["num_workers"]:
-            raise RuntimeError(
-                f"Existing worker assignment requires num_workers={assignment['num_workers']}, "
-                f"but got {num_workers}. Keep num_workers stable when resuming."
-            )
-        final = assignment["num_workers"]
-        logger.info(f"Reusing worker assignment from {assignment['path']} (num_workers={final})")
-        return final
-
-    final = resolve_num_workers(num_workers, num_inputs=len(resolved_items))
-    assignment_path = write_worker_assignment(
-        shar_dir, final, resolved_items, items_key=items_key,
-    )
-    logger.info(f"Wrote worker assignment to {assignment_path}")
-    return final
 
 
 def run_pool_and_finalize(
@@ -794,7 +529,8 @@ def run_pool_and_finalize(
     for shard_name, n in counts.items():
         logger.debug("  %s: %d cuts", shard_name, n)
 
-    mark_partition_success(Path(shar_dir), success_marker_name=SUCCESS_MARKER_FILE)
+    # Stage-root _SUCCESS is owned exclusively by run_stage(stage="convert").
+    # Prepare runners only mark per-worker partitions complete.
     logger.info("All done!")
     return results
 

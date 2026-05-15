@@ -53,13 +53,18 @@ def _write_tokenizer_mapping(path: Path, *, audio_start: int = 11, audio_end: in
     return path
 
 
-def _write_cache_manifest(cache_dir: Path, tokenizer_path: Path) -> None:
+def _write_cache_manifest(
+    cache_dir: Path,
+    tokenizer_path: Path,
+    *,
+    vocab_size: int | None = None,
+) -> None:
     from audio_tokenization.token_cache import write_audio_token_cache_manifest
 
     write_audio_token_cache_manifest(
         cache_dir,
         tokenizer_path=tokenizer_path,
-        vocab_size=len(_DummyTokenizer()),
+        vocab_size=len(_DummyTokenizer()) if vocab_size is None else vocab_size,
     )
 
 
@@ -861,6 +866,50 @@ def test_materialize_sft_accepts_json_messages_column(tmp_path, monkeypatch):
     assert result["samples_processed"] == 1
     tokens = list(collect_cutid_token_pairs(tmp_path / "out")["json-sample"])
     assert _find_subsequence(tokens, [101, 102]) > 0
+
+
+def test_materialize_sft_sizes_output_dtype_from_audio_cache_vocab(tmp_path, monkeypatch):
+    from audio_tokenization.token_cache import AudioTokenCacheWriter
+    from audio_tokenization.sft.materialize import SftMaterializeConfig, materialize_sft
+
+    audio_token_id = 131073
+    cache_dir = tmp_path / "audio_cache"
+    writer = AudioTokenCacheWriter(cache_dir, rank=0)
+    writer.add(audio_id="aud-a", tokens=[audio_token_id], duration_sec=1.25)
+    writer.finalize()
+    tokenizer_path = _write_tokenizer_mapping(tmp_path / "tokenizer")
+    _write_cache_manifest(cache_dir, tokenizer_path, vocab_size=266000)
+
+    conversations_dir = tmp_path / "conversations"
+    _write_conversations(
+        conversations_dir / "train.parquet",
+        [
+            {
+                "sample_id": "high-audio-token",
+                "messages": [
+                    {"role": "user", "content": "<audio>\nWhat is this?", "audio": []},
+                    {"role": "assistant", "content": "answer", "audio": []},
+                ],
+                "audio_ids": ["aud-a"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "audio_tokenization.sft.materialize.load_sft_chat_tokenizer",
+        lambda _path: _DummyTokenizer(),
+    )
+
+    materialize_sft(
+        SftMaterializeConfig(
+            conversations_dir=conversations_dir,
+            cache_dir=cache_dir,
+            output_dir=tmp_path / "out",
+            tokenizer_path=tokenizer_path,
+        )
+    )
+
+    tokens = list(collect_cutid_token_pairs(tmp_path / "out")["high-audio-token"])
+    assert audio_token_id in tokens
 
 
 def _find_subsequence(tokens: list[int], needle: list[int]) -> int:

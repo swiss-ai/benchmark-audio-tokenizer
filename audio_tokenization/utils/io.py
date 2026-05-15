@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 
+from audio_tokenization.contracts.artifacts import SUCCESS_MARKER_FILE
+
 
 def fsync_file(path: str | Path) -> None:
     """Flush an existing file path to stable storage."""
@@ -175,6 +177,16 @@ def atomic_streaming_write(
     chunk cleanup can sweep it with the same rank-local ``*.tmp`` pattern.
     """
     return AtomicStreamingWrite(path, mode=mode, compression=compression)
+
+
+def write_success_marker(directory: str | Path) -> None:
+    """Atomically write the canonical ``_SUCCESS`` marker into *directory*.
+
+    Single primitive shared by stage-level (``run_stage``) and partition-level
+    (per-worker, per-chunk, per-product cache) completion sites.
+    """
+    with atomic_streaming_write(Path(directory) / SUCCESS_MARKER_FILE, mode="w") as f:
+        f.write("ok\n")
 
 
 def _open_streaming_path(path: Path, *, mode: str, compression: str | None):

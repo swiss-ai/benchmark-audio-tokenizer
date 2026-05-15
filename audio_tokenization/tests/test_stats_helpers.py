@@ -1,12 +1,15 @@
 import json
 import multiprocessing as mp
 
-from audio_tokenization.prepare.constants import SUCCESS_MARKER_FILE
+from audio_tokenization.contracts.artifacts import SUCCESS_MARKER_FILE
 from audio_tokenization.prepare import runtime as prepare_runtime
+import pytest
+
 from audio_tokenization.pipelines.lhotse.stats_reducer import (
+    aggregate_rank_stats,
     build_aggregate,
     load_rank_stats,
-    maybe_publish_terminal_artifacts,
+    wait_for_rank_stats,
     write_rank_stats,
 )
 from audio_tokenization.prepare.runtime import build_prepare_rollup, build_prepare_summary
@@ -65,31 +68,70 @@ def test_tokenize_stats_reducer_uses_shared_json_loader(tmp_path):
     assert aggregate["max_elapsed_s"] == 4.0
 
 
-def test_terminal_artifacts_publish_success_only_after_all_ranks_success(tmp_path):
+def test_aggregate_rank_stats_writes_summary_when_all_ranks_succeed(tmp_path):
     write_rank_stats(tmp_path, _tokenize_rank_stats(0, success=True))
-    assert maybe_publish_terminal_artifacts(tmp_path, expected_ranks=2) is None
-    assert not (tmp_path / "_SUCCESS").exists()
-
     write_rank_stats(tmp_path, _tokenize_rank_stats(1, success=True))
-    summary = maybe_publish_terminal_artifacts(tmp_path, expected_ranks=2)
+
+    summary = aggregate_rank_stats(tmp_path)
 
     assert summary is not None
+    assert summary["num_ranks"] == 2
     assert (tmp_path / "stats_summary.json").is_file()
-    assert (tmp_path / "_SUCCESS").is_file()
+    # The stage SUCCESS marker is owned by run_stage, not stats_reducer:
+    assert not (tmp_path / "_SUCCESS").exists()
 
 
-def test_terminal_artifacts_do_not_publish_success_for_failed_rank(tmp_path):
+def test_aggregate_rank_stats_raises_for_failed_rank(tmp_path):
     write_rank_stats(tmp_path, _tokenize_rank_stats(0, success=True))
     write_rank_stats(tmp_path, _tokenize_rank_stats(1, success=False))
 
-    summary = maybe_publish_terminal_artifacts(tmp_path, expected_ranks=2)
+    with pytest.raises(RuntimeError, match="ranks reported failure"):
+        aggregate_rank_stats(tmp_path)
 
-    assert summary is not None
+    # Summary is still written so debug can read it.
     assert (tmp_path / "stats_summary.json").is_file()
     assert not (tmp_path / "_SUCCESS").exists()
 
 
-def test_prepare_summary_counts_reused_worker_from_persisted_stats():
+def test_wait_for_rank_stats_returns_when_all_present(tmp_path):
+    write_rank_stats(tmp_path, _tokenize_rank_stats(0, success=True))
+    write_rank_stats(tmp_path, _tokenize_rank_stats(1, success=True))
+
+    stats = wait_for_rank_stats(tmp_path, expected_ranks=2, poll_interval_sec=0.01)
+    assert len(stats) == 2
+    assert [s["rank"] for s in stats] == [0, 1]
+
+
+def test_wait_for_rank_stats_raises_on_timeout_with_missing_ranks(tmp_path):
+    # Only ranks 0 and 2 wrote stats; rank 1 "crashed" before writing.
+    write_rank_stats(tmp_path, _tokenize_rank_stats(0, success=True))
+    write_rank_stats(tmp_path, _tokenize_rank_stats(2, success=True))
+
+    with pytest.raises(RuntimeError, match=r"missing ranks: \[1\]"):
+        wait_for_rank_stats(
+            tmp_path,
+            expected_ranks=3,
+            timeout_sec=0.1,
+            poll_interval_sec=0.02,
+        )
+
+
+def test_wait_for_rank_stats_requires_exact_rank_ids(tmp_path):
+    # Count is not enough: rank 99 is not a substitute for missing rank 1.
+    write_rank_stats(tmp_path, _tokenize_rank_stats(0, success=True))
+    write_rank_stats(tmp_path, _tokenize_rank_stats(2, success=True))
+    write_rank_stats(tmp_path, _tokenize_rank_stats(99, success=True))
+
+    with pytest.raises(RuntimeError, match=r"missing ranks: \[1\]"):
+        wait_for_rank_stats(
+            tmp_path,
+            expected_ranks=3,
+            timeout_sec=0.1,
+            poll_interval_sec=0.02,
+        )
+
+
+def test_prepare_summary_counts_current_worker_results():
     results = [
         {
             "worker_id": 0,
@@ -97,22 +139,16 @@ def test_prepare_summary_counts_reused_worker_from_persisted_stats():
             "skipped": 1,
             "errors": 0,
             "total_duration_sec": 10.0,
-            "reused": False,
             "reason_counts": {"vad": 1},
             "worker_stats": {"runtime_counts": {"decoded": 5}},
         },
         {
             "worker_id": 1,
-            "written": -1,
-            "skipped": 0,
-            "errors": 0,
-            "total_duration_sec": 0.0,
-            "reused": True,
+            "written": 7,
+            "skipped": 2,
+            "errors": 1,
+            "total_duration_sec": 20.0,
             "worker_stats": {
-                "written": 7,
-                "skipped": 2,
-                "errors": 1,
-                "total_duration_sec": 20.0,
                 "runtime_counts": {"decoded": 7},
                 "reason_counts": {"quiet": 2},
             },
@@ -121,7 +157,6 @@ def test_prepare_summary_counts_reused_worker_from_persisted_stats():
 
     summary = build_prepare_summary(results, elapsed_sec=3.0, num_workers=2)
 
-    assert summary["workers_reused"] == 1
     assert summary["total_written"] == 12
     assert summary["total_skipped"] == 3
     assert summary["total_errors"] == 1
@@ -225,7 +260,6 @@ def test_prepare_pool_reports_workers_as_they_finish(monkeypatch, tmp_path):
             "errors": 0,
             "elapsed": 1.0,
             "total_duration_sec": 10.0,
-            "reused": False,
             "worker_stats": {"runtime_counts": {}},
         }
 
@@ -287,7 +321,6 @@ def test_prepare_pool_indexes_actual_worker_dirs_for_sparse_ids(monkeypatch, tmp
             "errors": 0,
             "elapsed": 1.0,
             "total_duration_sec": 10.0,
-            "reused": False,
             "worker_stats": {"runtime_counts": {}},
         }
 
