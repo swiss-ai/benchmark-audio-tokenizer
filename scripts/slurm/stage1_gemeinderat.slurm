@@ -13,7 +13,7 @@
 # inspect/validate the SHAR, then submit tokenize.
 #
 # Add normal Hydra overrides after the stage when needed, for example:
-#   scripts/slurm/stage1_gemeinderat.slurm tokenize runtime.resume=true
+#   scripts/slurm/stage1_gemeinderat.slurm tokenize runtime.overwrite=true
 
 #SBATCH --account=infra01
 #SBATCH --job-name=gm-stage1

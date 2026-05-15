@@ -5,9 +5,8 @@
 - CER for non-whitespace-segmented languages (cmn, yue, ko, th); WER otherwise.
 """
 from __future__ import annotations
+import argparse
 import json
-import os
-import sys
 from pathlib import Path
 
 import jiwer
@@ -19,6 +18,7 @@ from transformers.models.whisper.english_normalizer import (
 CER_LANGS = {"cmn_hans_cn", "yue_hant_hk", "ko_kr", "th_th"}
 EN_NORM = EnglishTextNormalizer({})
 BASIC_NORM = BasicTextNormalizer()
+DEFAULT_ROOT = Path("/capstor/scratch/cscs/xyixuan/recon_examples/it478000_transcribe")
 
 
 def lang_from_dataset_dir(name: str) -> str:
@@ -55,16 +55,41 @@ def compute(records: list[dict], lang: str) -> tuple[float, int, int]:
     return err, len(refs), skipped_empty
 
 
-def main() -> None:
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(
-        "/capstor/scratch/cscs/xyixuan/recon_examples/it478000_transcribe"
+def resolve_prediction_json(ds_dir: Path, pattern: str) -> Path | None:
+    matches = sorted(ds_dir.glob(pattern))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        joined = ", ".join(p.name for p in matches)
+        raise RuntimeError(
+            f"ambiguous prediction JSONs in {ds_dir}: {joined}; "
+            "pass a stricter --pattern"
+        )
+    return matches[0]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compute FLEURS WER/CER using Open ASR Leaderboard normalization."
     )
+    parser.add_argument("root", nargs="?", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--pattern",
+        default="*_transcribe.json",
+        help="Prediction JSON glob inside each fleurs_* directory.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    root = args.root
     rows = []
     for ds_dir in sorted(root.iterdir()):
         if not ds_dir.is_dir() or not ds_dir.name.startswith("fleurs_"):
             continue
-        json_path = ds_dir / "Apertus-1p5-8B-stage3-it478000_transcribe.json"
-        if not json_path.is_file():
+        json_path = resolve_prediction_json(ds_dir, args.pattern)
+        if json_path is None:
             continue
         with open(json_path) as f:
             records = json.load(f)["records"]

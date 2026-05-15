@@ -18,7 +18,7 @@
 # Tokenization consumes the parent root and expands node_* automatically.
 #
 # Add normal Hydra overrides after the stage when needed, for example:
-#   stage1_voxpopuli_vad.slurm tokenize runtime.resume=true
+#   stage1_voxpopuli_vad.slurm tokenize runtime.overwrite=true
 
 #SBATCH --account=infra01
 #SBATCH --job-name=vox-stage1

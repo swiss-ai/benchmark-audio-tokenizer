@@ -19,7 +19,7 @@
 # materialize is intentionally disabled in the dataset card.
 #
 # Add normal Hydra overrides after the stage when needed, for example:
-#   stage1_ups_vad.slurm tokenize runtime.resume=true
+#   stage1_ups_vad.slurm tokenize runtime.overwrite=true
 
 #SBATCH --account=infra01
 #SBATCH --job-name=ups-stage1

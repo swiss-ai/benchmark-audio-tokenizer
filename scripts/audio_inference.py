@@ -348,6 +348,12 @@ def main() -> None:
         "--backend", type=str, choices=["transformers", "vllm"], default="transformers",
         help="Inference backend to use.",
     )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=16384,
+        help="vLLM max_model_len.",
+    )
     parser.add_argument("--audio-column", type=str, default="audio",
                         help="Column name containing audio data.")
     parser.add_argument("--dataset-name", type=str, default=None,
@@ -400,7 +406,7 @@ def main() -> None:
             tokenizer=tokenizer_path,
             trust_remote_code=True,
             dtype="bfloat16",
-            max_model_len=16384,
+            max_model_len=args.max_model_len,
         )
 
     print(f"  Model loaded in {time.time() - t0:.1f}s")
@@ -587,16 +593,9 @@ def _run_dataset(
 
         duration_s = audio_tensor.shape[-1] / sr
 
+        audio_uri = ""
         if kind == "wav":
             audio_uri = sample.get("audio_path") or ""
-        else:
-            wav_name = f"sample_{i}.wav"
-            if isinstance(sample_id, str) and sample_id != str(i):
-                wav_name = f"{sample_id}.wav"
-            wav_path = os.path.join(output_dir, wav_name)
-            if not os.path.exists(wav_path):
-                sf.write(wav_path, audio_array, sr)
-            audio_uri = os.path.abspath(wav_path)
 
         if sr != 24000:
             if sr not in resamplers:

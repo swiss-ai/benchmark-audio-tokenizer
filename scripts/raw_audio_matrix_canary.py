@@ -138,7 +138,7 @@ def _cuda_preflight() -> None:
 
 def _base_runtime_overrides() -> list[str]:
     return [
-        "runtime.resume=false",
+        "runtime.overwrite=true",
         "dataset.tokenization.num_workers=8",
         "dataset.tokenization.prefetch_factor=4",
         "dataset.tokenization.checkpoint_interval_batches=2000",
@@ -412,7 +412,7 @@ def _run_tokenize_case(case: TokenizeCase) -> dict[str, Any]:
         materialize_args = [
             "run",
             "stage=materialize",
-            "runtime.resume=false",
+            "runtime.overwrite=true",
             *case.overrides,
             f"dataset.tokenization.input_shar_dir={case.shar_dir}",
             f"dataset.outputs.tokenized_dir={four_root}",

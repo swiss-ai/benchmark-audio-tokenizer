@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Compare fleurs WER/CER between it478000 and it430000 with Open ASR Leaderboard normalization.
+"""Compare FLEURS WER/CER between two prediction roots.
 
 For each fleurs language, computes WER (or CER for cmn/yue/ko/th) on the
 intersection of sample_ids between the two checkpoints' prediction JSONs.
 """
 from __future__ import annotations
+import argparse
 import json
 from pathlib import Path
 
@@ -19,10 +20,7 @@ EN_NORM = EnglishTextNormalizer({})
 BASIC_NORM = BasicTextNormalizer()
 
 NEW_ROOT = Path("/capstor/scratch/cscs/xyixuan/recon_examples/it478000_transcribe")
-NEW_FN = "Apertus-1p5-8B-stage3-it478000_transcribe.json"
-OLD_FN = "Apertus-1p5-8B-it430000_transcribe.json"
 OLD_FULL = Path("/capstor/scratch/cscs/xyixuan/recon_examples/it430000_transcribe_full")
-OLD_50 = Path("/capstor/scratch/cscs/xyixuan/recon_examples/it430000_transcribe")
 
 
 def normalize(text: str, lang: str) -> str:
@@ -41,6 +39,19 @@ def load_records(p: Path) -> dict[str, dict]:
     return out
 
 
+def resolve_prediction_json(ds_dir: Path, pattern: str) -> Path | None:
+    matches = sorted(ds_dir.glob(pattern))
+    if not matches:
+        return None
+    if len(matches) > 1:
+        joined = ", ".join(p.name for p in matches)
+        raise RuntimeError(
+            f"ambiguous prediction JSONs in {ds_dir}: {joined}; "
+            "pass a stricter pattern"
+        )
+    return matches[0]
+
+
 def compute_pair(refs: list[str], hyps: list[str], lang: str) -> float:
     if lang in CER_LANGS:
         refs = [" ".join(list(s)) for s in refs]
@@ -50,28 +61,62 @@ def compute_pair(refs: list[str], hyps: list[str], lang: str) -> float:
     return jiwer.wer(refs, hyps)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare FLEURS WER/CER between two prediction roots."
+    )
+    parser.add_argument("new_root", nargs="?", type=Path, default=NEW_ROOT)
+    parser.add_argument("old_root", nargs="?", type=Path, default=OLD_FULL)
+    parser.add_argument("--new-pattern", default="*_transcribe.json")
+    parser.add_argument("--old-pattern", default="*_transcribe.json")
+    parser.add_argument("--new-label", default=None)
+    parser.add_argument("--old-label", default=None)
+    parser.add_argument(
+        "--old-fallback-root",
+        type=Path,
+        default=None,
+        help="Optional fallback root used when old_root has no matching file/overlap.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    new_label = args.new_label or args.new_root.name
+    old_label = args.old_label or args.old_root.name
     rows = []
-    for ds_dir in sorted(NEW_ROOT.iterdir()):
+    for ds_dir in sorted(args.new_root.iterdir()):
         if not ds_dir.is_dir() or not ds_dir.name.startswith("fleurs_"):
             continue
         lang = ds_dir.name[len("fleurs_") :]
-        new_p = ds_dir / NEW_FN
-        if not new_p.is_file():
+        new_p = resolve_prediction_json(ds_dir, args.new_pattern)
+        if new_p is None:
             continue
         new_recs = load_records(new_p)
 
-        old_p = OLD_FULL / ds_dir.name / OLD_FN
-        ref_label = "full"
-        if not old_p.is_file():
-            old_p = OLD_50 / ds_dir.name / OLD_FN
-            ref_label = "50"
-        if not old_p.is_file():
-            rows.append((lang, "—", float("nan"), float("nan"), 0, "no it430000 ref"))
+        old_ds_dir = args.old_root / ds_dir.name
+        old_p = resolve_prediction_json(old_ds_dir, args.old_pattern) if old_ds_dir.is_dir() else None
+        fallback_ds_dir = args.old_fallback_root / ds_dir.name if args.old_fallback_root else None
+        fallback_p = (
+            resolve_prediction_json(fallback_ds_dir, args.old_pattern)
+            if fallback_ds_dir and fallback_ds_dir.is_dir()
+            else None
+        )
+        ref_label = args.old_root.name
+        if old_p is None and fallback_p is not None:
+            old_p = fallback_p
+            ref_label = args.old_fallback_root.name
+        if old_p is None:
+            rows.append((lang, "—", float("nan"), float("nan"), 0, f"no {old_label} ref"))
             continue
         old_recs = load_records(old_p)
 
         common = sorted(set(new_recs) & set(old_recs))
+        if not common and fallback_p is not None and old_p != fallback_p:
+            old_p = fallback_p
+            old_recs = load_records(old_p)
+            common = sorted(set(new_recs) & set(old_recs))
+            ref_label = args.old_fallback_root.name
         if not common:
             rows.append((lang, ref_label, float("nan"), float("nan"), 0, "no overlap"))
             continue
@@ -96,16 +141,15 @@ def main() -> None:
 
     metric_for = lambda l: "CER" if l in CER_LANGS else "WER"
     rows.sort(key=lambda r: (r[2] if r[2] == r[2] else 1.0))
-    print(f"{'language':<18} {'metric':<5} {'ref':<5} {'it478000':>10} {'it430000':>10} {'delta':>8} {'n':>6} note")
+    print(f"{'language':<18} {'metric':<5} {'ref':<24} {new_label:>14} {old_label:>14} {'delta':>8} {'n':>6} note")
     print("-" * 78)
     for lang, ref, new_err, old_err, n, note in rows:
         m = metric_for(lang)
         if new_err != new_err or old_err != old_err:  # NaN
-            print(f"{lang:<18} {m:<5} {ref:<5} {'—':>10} {'—':>10} {'—':>8} {n:>6} {note}")
+            print(f"{lang:<18} {m:<5} {ref:<24} {'—':>14} {'—':>14} {'—':>8} {n:>6} {note}")
             continue
         delta = (new_err - old_err) * 100
-        sign = "+" if delta >= 0 else ""
-        print(f"{lang:<18} {m:<5} {ref:<5} {new_err*100:>9.2f}% {old_err*100:>9.2f}% {sign}{delta:>6.2f}pp {n:>6} {note}")
+        print(f"{lang:<18} {m:<5} {ref:<24} {new_err*100:>13.2f}% {old_err*100:>13.2f}% {delta:+7.2f}pp {n:>6} {note}")
     print("-" * 78)
     valid = [(r[2], r[3]) for r in rows if r[2] == r[2] and r[3] == r[3] and metric_for(r[0]) == "WER"]
     if valid:

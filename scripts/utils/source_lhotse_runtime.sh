@@ -9,12 +9,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 : "${REPO_DIR:=${DEFAULT_REPO_DIR}}"
 : "${LHOTSE_DIR:=/iopsstor/scratch/cscs/xyixuan/dev/lhotse}"
-: "${FFMPEG_ROOT:=/capstor/store/cscs/swissai/infra01/MLLM/wheelhouse/aarch64/ffmpeg-7.1.1-full-aarch64}"
-: "${TORCHCODEC_WHL:=/capstor/store/cscs/swissai/infra01/MLLM/wheelhouse/aarch64/torchcodec-0.9.0-cp312-cp312-linux_aarch64.whl}"
+: "${WHEELHOUSE_AARCH64:=/capstor/store/cscs/swissai/infra01/MLLM/wheelhouse/aarch64}"
+: "${FFMPEG_ROOT:=${WHEELHOUSE_AARCH64}/ffmpeg-7.1.1-full-aarch64}"
+: "${TORCHCODEC_WHEELSET:=nemo_25_11}"
+: "${TORCHCODEC_WHL:=${WHEELHOUSE_AARCH64}/${TORCHCODEC_WHEELSET}/torchcodec-0.9.0-cp312-cp312-linux_aarch64.whl}"
 : "${TORCHAUDIO_SPEC:=git+https://github.com/pytorch/audio.git@release/2.9}"
 : "${INSTALL_TORCHCODEC:=1}"
 : "${INSTALL_TORCHAUDIO:=0}"
@@ -22,7 +24,7 @@ DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${PRINT_LHOTSE_RUNTIME:=1}"
 
 export PYTHONPATH="${LHOTSE_DIR}:${REPO_DIR}:${PYTHONPATH:-}"
-export PATH="${FFMPEG_ROOT}/bin:${PATH}"
+export PATH="/opt/venv/bin:${FFMPEG_ROOT}/bin:${PATH}"
 export LD_LIBRARY_PATH="${FFMPEG_ROOT}/lib:${LD_LIBRARY_PATH:-}"
 
 # Pin BLAS/OpenMP to single-threaded for the convert stage. The prepare

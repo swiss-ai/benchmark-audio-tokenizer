@@ -75,6 +75,9 @@ export INSTALL_TORCHAUDIO=${INSTALL_TORCHAUDIO:-1}
 export INSTALL_ONCE_PER_NODE=${INSTALL_ONCE_PER_NODE:-1}
 export PRINT_LHOTSE_RUNTIME=${PRINT_LHOTSE_RUNTIME:-0}
 export RUNTIME_READY_FILE=${RUNTIME_READY_FILE:-/tmp/.lhotse_runtime_ready_${SLURM_JOB_ID:-manual}}
+if [ "${STAGE}" = "tokenize" ]; then
+    export INSTALL_TORCHAUDIO=1
+fi
 if [ "${STAGE}" = "convert" ]; then
     export LHOTSE_AUDIO_BACKEND=${LHOTSE_AUDIO_BACKEND:-LibsndfileBackend}
 fi
@@ -97,6 +100,11 @@ fi
 
 source "${RUNTIME_ENV_SH}"
 cd "${REPO_DIR}"
+
+if [ "${STAGE}" = "tokenize" ]; then
+    echo "Runtime dependency check: INSTALL_TORCHAUDIO=${INSTALL_TORCHAUDIO}"
+    python -c "import torchaudio; print(torchaudio.__version__)"
+fi
 
 python -m audio_tokenization run \
     dataset="${DATASET}" \
