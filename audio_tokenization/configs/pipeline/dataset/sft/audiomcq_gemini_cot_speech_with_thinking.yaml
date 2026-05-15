@@ -1,0 +1,86 @@
+defaults:
+  - /recipe/parquet_sft_audio@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# CoT-with-thinking variant of audiomcq_gemini_cot_speech.
+#
+# Same speech-partition audio cache as the answer-only config (convert + tokenize
+# can be skipped — _SUCCESS already present). Only materialize.sft re-runs against
+# a new conversations parquet whose assistant turns are:
+#
+#     <think>
+#     {gemini_cot}
+#     </think>
+#
+#     {sft_target}
+#
+# The new conversations parquet was built at
+# /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/
+#   hf___Harland___AudioMCQ-StrongAC-GeminiCoT/examples/speech_with_cot/
+# from the raw data parquets (which carry the gemini_cot field stripped by the
+# answer-only variant). 10,505 samples, identical sample_id set as the answer-only
+# variant.
+
+name: sft_audiomcq_gemini_cot_speech_with_thinking
+language: en
+
+# Source is the same raw data dir; convert/tokenize will skip via _SUCCESS on
+# the shared SHAR + audio_cache paths below.
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/hf___Harland___AudioMCQ-StrongAC-GeminiCoT/data
+  files: "speech-train-*.parquet"
+
+columns:
+  audio: audio_bytes
+  duration: duration_sec
+  id: clip_id
+  keep:
+    - source_dataset
+    - source_id
+    - question_type
+    - audio_path
+    - audio_format
+    - sampling_rate
+    - num_frames
+    - question
+    - answer
+    - answer_index
+    - answer_label
+  constant:
+    dataset: audiomcq_gemini_cot_speech_sft
+
+outputs:
+  # SHAR + audio_cache are intentionally SHARED with the answer-only config.
+  # The convert + tokenize stages will skip via existing _SUCCESS markers.
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/sft/audiomcq_gemini_cot_speech_audio
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft
+  # Distinct sft_dir so the CoT-with-thinking output doesn't overwrite the
+  # answer-only one — both materialize products live side-by-side.
+  sft_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft/audiomcq_gemini_cot_speech_with_thinking
+  name: audiomcq_gemini_cot_speech_audio
+
+tokenizer:
+  path: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok_instruct
+
+conversion:
+  num_workers: 64
+  shard_size: 5000
+  shar_format: flac
+
+tokenization:
+  min_duration: 1.0
+  max_duration: 60.0
+  num_workers: 32
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 1000
+
+materialization:
+  sft:
+    # The only difference from the answer-only config: point at the
+    # CoT-wrapped conversations parquet.
+    conversations_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/hf___Harland___AudioMCQ-StrongAC-GeminiCoT/examples/speech_with_cot
+    max_seq_len: 262144
+    seq_threshold: 8192
+    messages_column: messages_json
+    num_workers: 64

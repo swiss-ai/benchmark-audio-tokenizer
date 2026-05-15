@@ -38,7 +38,13 @@ conversion:
 tokenization:
   min_duration: 1.0
   max_duration: 1300.0
-  num_workers: 32
+  num_workers: 16
+  # Marco's duration distribution is essentially uniform at ~10 min/cut
+  # (p01=517s, p99=752s, 97.5% in [600s, 1200s)). The default 20000-cut
+  # buffer × ~6 MB/cut at load time exceeds the per-task cgroup ceiling.
+  # Bucketing is also a no-op here (zero duration variance to balance
+  # against), so a small buffer for shuffle look-ahead is all we need.
+  bucket_buffer_size: 2000
   max_batch_duration: 2000.0
   checkpoint_interval_batches: 1000
 
