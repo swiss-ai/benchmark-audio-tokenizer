@@ -376,7 +376,7 @@ def test_materialize_sft_rejects_cache_tokenizer_mismatch(tmp_path, monkeypatch)
         )
 
 
-def test_materialize_sft_rejects_conversations_missing_cached_audio(tmp_path):
+def test_materialize_sft_skips_rows_with_missing_audio_and_records_stats(tmp_path, monkeypatch):
     from audio_tokenization.token_cache import AudioTokenCacheWriter
     from audio_tokenization.sft.materialize import SftMaterializeConfig, materialize_sft
 
@@ -394,19 +394,79 @@ def test_materialize_sft_rejects_conversations_missing_cached_audio(tmp_path):
             {
                 "sample_id": "sample-1",
                 "messages": [
-                    {
-                        "role": "user",
-                        "content": "<audio>\nCompare with <audio>.",
-                        "audio": [],
-                    },
+                    {"role": "user", "content": "<audio>\nWhat is this?", "audio": []},
+                    {"role": "assistant", "content": "answer", "audio": []},
+                ],
+                "audio_ids": ["aud-a"],
+            },
+            {
+                "sample_id": "sample-2",
+                "messages": [
+                    {"role": "user", "content": "<audio>\nCompare with <audio>.", "audio": []},
                     {"role": "assistant", "content": "answer", "audio": []},
                 ],
                 "audio_ids": ["aud-a", "aud-missing"],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        "audio_tokenization.sft.materialize.load_sft_chat_tokenizer",
+        lambda _path: _DummyTokenizer(),
+    )
+
+    output_dir = tmp_path / "out"
+    result = materialize_sft(
+        SftMaterializeConfig(
+            conversations_dir=conversations_dir,
+            cache_dir=cache_dir,
+            output_dir=output_dir,
+            tokenizer_path=tokenizer_path,
+        )
+    )
+
+    assert result["samples_seen"] == 2
+    assert result["samples_processed"] == 1
+    assert result["missing_audio_skipped"] == 1
+    assert result["first_missing_audio_ids"] == ["aud-missing"]
+    assert result["first_missing_sample_ids"] == ["sample-2"]
+
+    summary = json.loads((output_dir / "sft_materialize_summary.json").read_text())
+    assert summary["samples_processed"] == 1
+    assert summary["missing_audio_skipped"] == 1
+    assert summary["first_missing_audio_ids"] == ["aud-missing"]
+
+
+def test_materialize_sft_fails_when_every_row_missing_audio(tmp_path, monkeypatch):
+    from audio_tokenization.token_cache import AudioTokenCacheWriter
+    from audio_tokenization.sft.materialize import SftMaterializeConfig, materialize_sft
+
+    tokenizer_path = _write_tokenizer_mapping(tmp_path / "tokenizer")
+    cache_dir = tmp_path / "audio_cache"
+    writer = AudioTokenCacheWriter(cache_dir, rank=0)
+    writer.add(audio_id="aud-a", tokens=[101, 102], duration_sec=1.25)
+    writer.finalize()
+    _write_cache_manifest(cache_dir, tokenizer_path)
+
+    conversations_dir = tmp_path / "conversations"
+    _write_conversations(
+        conversations_dir / "train.parquet",
+        [
+            {
+                "sample_id": "sample-1",
+                "messages": [
+                    {"role": "user", "content": "<audio>\nFoo?", "audio": []},
+                    {"role": "assistant", "content": "answer", "audio": []},
+                ],
+                "audio_ids": ["aud-missing"],
             }
         ],
     )
+    monkeypatch.setattr(
+        "audio_tokenization.sft.materialize.load_sft_chat_tokenizer",
+        lambda _path: _DummyTokenizer(),
+    )
 
-    with pytest.raises(ValueError, match="missing from audio token cache"):
+    with pytest.raises(ValueError, match="0/1 samples processed"):
         materialize_sft(
             SftMaterializeConfig(
                 conversations_dir=conversations_dir,
@@ -414,60 +474,6 @@ def test_materialize_sft_rejects_conversations_missing_cached_audio(tmp_path):
                 output_dir=tmp_path / "out",
                 tokenizer_path=tokenizer_path,
             )
-        )
-
-
-def test_sft_cache_reference_validation_uses_audio_ids_column_fast_path(tmp_path, monkeypatch):
-    from audio_tokenization.token_cache import AudioTokenCacheWriter, load_audio_token_cache
-    import audio_tokenization.sft.materialize as sft_materialize
-
-    cache_dir = tmp_path / "audio_cache"
-    writer = AudioTokenCacheWriter(cache_dir, rank=0)
-    writer.add(audio_id="aud-a", tokens=[101, 102], duration_sec=1.25)
-    writer.finalize()
-    cache = load_audio_token_cache(cache_dir)
-
-    conversations_dir = tmp_path / "conversations"
-    conversations_dir.mkdir()
-    pq.write_table(
-        pa.table({
-            "sample_id": ["sample-1"],
-            "messages": ["this column should not be selected by cache-reference validation"],
-            "audio_ids": pa.array([["aud-a", "aud-missing"]], type=pa.list_(pa.string())),
-        }),
-        conversations_dir / "train.parquet",
-    )
-    row_groups = [
-        sft_materialize._SftRowGroup(
-            path=conversations_dir / "train.parquet",
-            row_group=0,
-            num_rows=1,
-        )
-    ]
-    config = sft_materialize.SftMaterializeConfig(
-        conversations_dir=conversations_dir,
-        cache_dir=cache_dir,
-        output_dir=tmp_path / "out",
-        tokenizer_path=tmp_path / "tokenizer",
-    )
-
-    original = sft_materialize.select_conversation_columns
-
-    def _record_selected_columns(pf, *, path, columns, required=("sample_id",)):
-        assert config.messages_column not in columns
-        return original(pf, path=path, columns=columns, required=required)
-
-    monkeypatch.setattr(
-        sft_materialize,
-        "select_conversation_columns",
-        _record_selected_columns,
-    )
-
-    with pytest.raises(ValueError, match="missing from audio token cache"):
-        sft_materialize._validate_conversation_audio_ids_in_cache(
-            row_groups,
-            config=config,
-            cache=cache,
         )
 
 
@@ -680,6 +686,72 @@ def test_materialize_sft_parallelizes_by_sft_row_group(tmp_path, monkeypatch):
     assert set(pairs) == {f"sample-{idx}" for idx in range(4)}
     for idx in range(4):
         assert 100 + idx in pairs[f"sample-{idx}"]
+
+
+def test_materialize_sft_precomputes_cache_audio_ids_before_worker_dispatch(tmp_path, monkeypatch):
+    from audio_tokenization.token_cache import AudioTokenCacheWriter
+    from audio_tokenization.sft import materialize as sft_materialize
+    from audio_tokenization.sft.materialize import SftMaterializeConfig, materialize_sft
+
+    cache_dir = tmp_path / "audio_cache"
+    writer = AudioTokenCacheWriter(cache_dir, rank=0)
+    writer.add(audio_id="aud-a", tokens=[101], duration_sec=1.0)
+    writer.finalize()
+    tokenizer_path = _write_tokenizer_mapping(tmp_path / "tokenizer")
+    _write_cache_manifest(cache_dir, tokenizer_path)
+
+    conversations_dir = tmp_path / "conversations"
+    _write_conversations(
+        conversations_dir / "train.parquet",
+        [
+            {
+                "sample_id": "sample-1",
+                "messages": [
+                    {"role": "user", "content": "<audio>\nWhat is this?", "audio": []},
+                    {"role": "assistant", "content": "answer", "audio": []},
+                ],
+                "audio_ids": ["aud-a"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "audio_tokenization.sft.materialize.load_sft_chat_tokenizer",
+        lambda _path: _DummyTokenizer(),
+    )
+
+    def _assert_cache_warmed(_args):
+        cache = sft_materialize._require_shared_audio_cache()
+        assert "audio_ids" in cache.__dict__
+        return {
+            "samples_seen": 1,
+            "samples_processed": 1,
+            "missing_audio_skipped": 0,
+            "first_missing_audio_ids": [],
+            "first_missing_sample_ids": [],
+            "tokens_generated": 1,
+            "chunks_written": 1,
+            "stage2_samples": 1,
+            "lct_samples": 0,
+            "stage2_tokens": 1,
+            "lct_tokens": 0,
+        }
+
+    monkeypatch.setattr(
+        "audio_tokenization.sft.materialize._materialize_sft_worker",
+        _assert_cache_warmed,
+    )
+
+    result = materialize_sft(
+        SftMaterializeConfig(
+            conversations_dir=conversations_dir,
+            cache_dir=cache_dir,
+            output_dir=tmp_path / "out",
+            tokenizer_path=tokenizer_path,
+            max_seq_len=4096,
+        )
+    )
+
+    assert result["samples_processed"] == 1
 
 
 def test_materialize_sft_routes_by_seq_threshold(tmp_path, monkeypatch):

@@ -21,10 +21,36 @@ from audio_tokenization.token_cache import (
     load_audio_token_cache,
     validate_audio_token_cache_manifest,
 )
+from audio_tokenization.utils.io import atomic_write_json
 
 
 _SHARED_AUDIO_CACHE: AudioTokenCache | None = None
 _SHARED_CHAT_TOKENIZER: Any = None
+
+_MAX_MISSING_PREVIEW = 10
+
+_SFT_SUM_FIELDS = (
+    "samples_seen",
+    "samples_processed",
+    "missing_audio_skipped",
+    "tokens_generated",
+    "chunks_written",
+    "stage2_samples",
+    "lct_samples",
+    "stage2_tokens",
+    "lct_tokens",
+)
+
+
+def _extend_capped(
+    dst: list[str], src: Iterable[str], cap: int, *, dedup: bool
+) -> None:
+    for item in src:
+        if len(dst) >= cap:
+            return
+        if dedup and item in dst:
+            continue
+        dst.append(item)
 
 
 @dataclass(frozen=True)
@@ -151,7 +177,6 @@ def materialize_sft(config: SftMaterializeConfig) -> dict[str, Any]:
     # materialization must not guess whether cached audio IDs use this tokenizer.
     cache_manifest = validate_audio_token_cache_manifest(config.cache_dir, tokenizer_path=config.tokenizer_path)
     cache = load_audio_token_cache(config.cache_dir)
-    _validate_conversation_audio_ids_in_cache(row_groups, config=config, cache=cache)
     tokenizer = load_sft_chat_tokenizer(config.tokenizer_path)
     vocab_size = _sft_output_vocab_size(tokenizer, cache_manifest)
     worker_args = [
@@ -165,46 +190,89 @@ def materialize_sft(config: SftMaterializeConfig) -> dict[str, Any]:
         if items
     ]
 
-    if not worker_args:
-        return {
-            "samples_processed": 0,
-            "tokens_generated": 0,
-            "chunks_written": 0,
-            "stage2_samples": 0,
-            "lct_samples": 0,
-            "stage2_tokens": 0,
-            "lct_tokens": 0,
-            "num_workers": 0,
-            "output_dir": str(output_dir),
-            "success": True,
-        }
+    if worker_args:
+        # Build the membership set once in the parent so forked workers share it
+        # through copy-on-write instead of rebuilding it per process.
+        _ = cache.audio_ids
+        _set_shared_audio_cache(cache)
+        _set_shared_chat_tokenizer(tokenizer)
+        try:
+            if len(worker_args) == 1:
+                worker_results = [_materialize_sft_worker(worker_args[0])]
+            else:
+                ctx = mp.get_context("fork")
+                with ctx.Pool(processes=len(worker_args)) as pool:
+                    worker_results = pool.map(_materialize_sft_worker, worker_args)
+        finally:
+            _set_shared_audio_cache(None)
+            _set_shared_chat_tokenizer(None)
+    else:
+        worker_results = []
 
-    _set_shared_audio_cache(cache)
-    _set_shared_chat_tokenizer(tokenizer)
-    try:
-        if len(worker_args) == 1:
-            worker_results = [_materialize_sft_worker(worker_args[0])]
-        else:
-            ctx = mp.get_context("fork")
-            with ctx.Pool(processes=len(worker_args)) as pool:
-                worker_results = pool.map(_materialize_sft_worker, worker_args)
-    finally:
-        _set_shared_audio_cache(None)
-        _set_shared_chat_tokenizer(None)
+    merged = _merge_sft_worker_results(worker_results)
+    if merged["samples_seen"] > 0 and merged["samples_processed"] == 0:
+        raise ValueError(
+            f"materialize: 0/{merged['samples_seen']} samples processed; "
+            f"every conversation referenced audio missing from the cache. "
+            f"first missing audio_ids: {merged['first_missing_audio_ids']}; "
+            f"first affected sample_ids: {merged['first_missing_sample_ids']}. "
+            "Likely wrong cache or wrong dataset config."
+        )
 
+    summary = {**merged, "num_workers": len(worker_args)}
+    _write_sft_materialize_summary(output_dir, summary)
     return {
-        "samples_processed": sum(int(r["samples_processed"]) for r in worker_results),
-        "tokens_generated": sum(int(r["tokens_generated"]) for r in worker_results),
-        "chunks_written": sum(int(r["chunks_written"]) for r in worker_results),
-        "stage2_samples": sum(int(r.get("stage2_samples", 0)) for r in worker_results),
-        "lct_samples": sum(int(r.get("lct_samples", 0)) for r in worker_results),
-        "stage2_tokens": sum(int(r.get("stage2_tokens", 0)) for r in worker_results),
-        "lct_tokens": sum(int(r.get("lct_tokens", 0)) for r in worker_results),
-        "num_workers": len(worker_args),
+        **summary,
         "worker_results": worker_results,
         "output_dir": str(output_dir),
         "success": True,
     }
+
+
+def _merge_sft_worker_results(worker_results: list[dict[str, Any]]) -> dict[str, Any]:
+    totals = {k: sum(int(r.get(k, 0)) for r in worker_results) for k in _SFT_SUM_FIELDS}
+    first_missing_audio_ids: list[str] = []
+    first_missing_sample_ids: list[str] = []
+    for r in worker_results:
+        _extend_capped(
+            first_missing_audio_ids,
+            r.get("first_missing_audio_ids", []),
+            _MAX_MISSING_PREVIEW,
+            dedup=True,
+        )
+        _extend_capped(
+            first_missing_sample_ids,
+            r.get("first_missing_sample_ids", []),
+            _MAX_MISSING_PREVIEW,
+            dedup=False,
+        )
+    return {
+        **totals,
+        "first_missing_audio_ids": first_missing_audio_ids,
+        "first_missing_sample_ids": first_missing_sample_ids,
+    }
+
+
+def _write_sft_materialize_summary(output_dir: Path, summary: dict[str, Any]) -> None:
+    """Persist run-level audit fields next to the materialized outputs.
+
+    Separate from _STAGE_MANIFEST.json so the generic stage runner stays
+    agnostic of stage-specific business data (skip counts, previews).
+    """
+    atomic_write_json(output_dir / "sft_materialize_summary.json", summary)
+
+
+def _record_missing(
+    *,
+    missing: list[str],
+    sample_id: str,
+    first_missing_audio_ids: list[str],
+    first_missing_sample_ids: list[str],
+) -> None:
+    _extend_capped(first_missing_audio_ids, missing, _MAX_MISSING_PREVIEW, dedup=True)
+    _extend_capped(
+        first_missing_sample_ids, [sample_id], _MAX_MISSING_PREVIEW, dedup=False
+    )
 
 
 def _materialize_sft_worker(args: _SftWorkerArgs) -> dict[str, Any]:
@@ -213,8 +281,13 @@ def _materialize_sft_worker(args: _SftWorkerArgs) -> dict[str, Any]:
     cache = _require_shared_audio_cache()
     tokenizer = _require_shared_chat_tokenizer()
     vocab_size = args.vocab_size
+    cache_audio_ids = cache.audio_ids
 
-    samples = 0
+    samples_seen = 0
+    samples_processed = 0
+    missing_audio_skipped = 0
+    first_missing_audio_ids: list[str] = []
+    first_missing_sample_ids: list[str] = []
     tokens_written = 0
     bucket_samples = {"stage2": 0, "lct": 0}
     bucket_tokens = {"stage2": 0, "lct": 0}
@@ -224,11 +297,36 @@ def _materialize_sft_worker(args: _SftWorkerArgs) -> dict[str, Any]:
             args.row_groups,
             columns=["sample_id", config.messages_column, config.audio_ids_column],
         ):
-            sample_id, seq = _assemble_sft_row(
-                row,
-                config=config,
+            samples_seen += 1
+            sample_id = str(row["sample_id"])
+            messages = coerce_messages(
+                row[config.messages_column],
+                sample_id=sample_id,
+                column=config.messages_column,
+            )
+            audio_ids = ordered_audio_ids(
+                row.get(config.audio_ids_column),
+                messages=messages,
+                sample_id=sample_id,
+            )
+            missing = [a for a in audio_ids if a not in cache_audio_ids]
+            if missing:
+                missing_audio_skipped += 1
+                _record_missing(
+                    missing=missing,
+                    sample_id=sample_id,
+                    first_missing_audio_ids=first_missing_audio_ids,
+                    first_missing_sample_ids=first_missing_sample_ids,
+                )
+                continue
+
+            seq = assemble_sft_conversation(
+                sample_id=sample_id,
+                messages=messages,
+                audio_ids=audio_ids,
                 cache=cache,
                 tokenizer=tokenizer,
+                audio_placeholder=config.audio_placeholder,
             )
             seq_len = int(seq.size)
             if seq_len > int(config.max_seq_len):
@@ -242,7 +340,7 @@ def _materialize_sft_worker(args: _SftWorkerArgs) -> dict[str, Any]:
                 writer = _SftShardWriter(bucket_dir, worker_id=args.worker_id, vocab_size=vocab_size)
                 writers[bucket_name] = writer
             writer.add(sample_id, seq)
-            samples += 1
+            samples_processed += 1
             tokens_written += seq_len
             if bucket_name in bucket_samples:
                 bucket_samples[bucket_name] += 1
@@ -256,7 +354,11 @@ def _materialize_sft_worker(args: _SftWorkerArgs) -> dict[str, Any]:
     return {
         "worker_id": args.worker_id,
         "row_groups": len(args.row_groups),
-        "samples_processed": samples,
+        "samples_seen": samples_seen,
+        "samples_processed": samples_processed,
+        "missing_audio_skipped": missing_audio_skipped,
+        "first_missing_audio_ids": first_missing_audio_ids,
+        "first_missing_sample_ids": first_missing_sample_ids,
         "tokens_generated": tokens_written,
         "chunks_written": chunks_written,
         "stage2_samples": bucket_samples["stage2"],
@@ -305,34 +407,6 @@ def _require_shared_chat_tokenizer() -> Any:
     if _SHARED_CHAT_TOKENIZER is None:
         raise RuntimeError("SFT chat tokenizer was not initialised before worker start")
     return _SHARED_CHAT_TOKENIZER
-
-
-def _assemble_sft_row(
-    row: dict[str, Any],
-    *,
-    config: SftMaterializeConfig,
-    cache: AudioTokenCache,
-    tokenizer: Any,
-) -> tuple[str, np.ndarray]:
-    sample_id = str(row["sample_id"])
-    messages = coerce_messages(
-        row[config.messages_column],
-        sample_id=sample_id,
-        column=config.messages_column,
-    )
-    audio_ids = ordered_audio_ids(
-        row.get(config.audio_ids_column),
-        messages=messages,
-        sample_id=sample_id,
-    )
-    return sample_id, assemble_sft_conversation(
-        sample_id=sample_id,
-        messages=messages,
-        audio_ids=audio_ids,
-        cache=cache,
-        tokenizer=tokenizer,
-        audio_placeholder=config.audio_placeholder,
-    )
 
 
 def assemble_sft_conversation(
@@ -433,58 +507,6 @@ def _iter_sft_rows(
         for batch in pf.iter_batches(columns=selected, row_groups=group_ids):
             for row in batch.to_pylist():
                 yield row
-
-
-def _validate_conversation_audio_ids_in_cache(
-    row_groups: list[_SftRowGroup],
-    *,
-    config: SftMaterializeConfig,
-    cache: AudioTokenCache,
-) -> None:
-    """Fail before writing if any SFT conversation references uncached audio."""
-    available = cache.audio_ids
-    missing_audio_ids: set[str] = set()
-    affected_samples: list[str] = []
-    affected_rows = 0
-    columns = ["sample_id", config.audio_ids_column]
-    if any(
-        config.audio_ids_column not in pq.ParquetFile(path).schema_arrow.names
-        for path in {row_group.path for row_group in row_groups}
-    ):
-        columns = ["sample_id", config.messages_column, config.audio_ids_column]
-    for row in _iter_sft_rows(row_groups, columns=columns):
-        sample_id = str(row["sample_id"])
-        value = row.get(config.audio_ids_column)
-        if value is not None:
-            audio_ids = [str(audio_id) for audio_id in value]
-        elif config.messages_column in row:
-            messages = coerce_messages(
-                row[config.messages_column],
-                sample_id=sample_id,
-                column=config.messages_column,
-            )
-            audio_ids = _message_audio_ids(messages)
-        else:
-            raise ValueError(
-                f"SFT sample {sample_id!r} has null {config.audio_ids_column!r}; "
-                "use an empty list for text-only rows"
-            )
-        missing = [audio_id for audio_id in audio_ids if audio_id not in available]
-        if not missing:
-            continue
-        affected_rows += 1
-        missing_audio_ids.update(missing)
-        if len(affected_samples) < 10:
-            affected_samples.append(sample_id)
-
-    if missing_audio_ids:
-        first_ids = sorted(missing_audio_ids)[:10]
-        raise ValueError(
-            "SFT conversations reference audio IDs missing from audio token cache: "
-            f"{len(missing_audio_ids)} missing audio ids across {affected_rows} rows. "
-            f"First missing audio_ids: {first_ids}; "
-            f"first affected sample_ids: {affected_samples}"
-        )
 
 
 def select_conversation_columns(
