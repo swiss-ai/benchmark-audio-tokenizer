@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib
 import inspect
 import logging
@@ -277,14 +276,6 @@ def build_shar_index_from_parts(
     index_path = shar_root / index_filename
     atomic_write_json(index_path, payload)
     return index_path, len(fields["cuts"])
-
-
-def audio_md5(path: str) -> str:
-    """MD5 of decoded audio waveform (float32 PCM, not raw file bytes)."""
-    import soundfile as sf
-
-    data, _ = sf.read(path, dtype="float32")
-    return hashlib.md5(data.tobytes()).hexdigest()
 
 
 def build_audio_index(audio_root: Path, pattern: str = "**/*.ogg") -> dict[str, str]:

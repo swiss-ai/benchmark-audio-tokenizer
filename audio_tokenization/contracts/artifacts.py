@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
 
 
 SHAR_INDEX_FILENAME = "shar_index.json"
@@ -49,25 +48,6 @@ def _sibling_bins(rank_dir: Path, stem: str) -> tuple[Path, Path]:
         rank_dir / f"audio_tokens.{stem}.bin",
         rank_dir / f"text_tokens.{stem}.bin",
     )
-
-
-def iter_v2_chunks(rank_dir: Path) -> Iterator[V2CacheChunk]:
-    """Yield only complete chunks (all three sibling files present), sorted by stem.
-
-    Skips partials silently — readers that need to fail loud on incomplete
-    chunks should call :func:`validate_v2_chunks_complete` instead.
-    """
-    for clips_path in sorted(rank_dir.glob("clips.*.parquet")):
-        stem = _stem_for(clips_path)
-        audio_path, text_path = _sibling_bins(rank_dir, stem)
-        if audio_path.exists() and text_path.exists():
-            yield V2CacheChunk(
-                stem=stem,
-                rank_dir=rank_dir,
-                clips_path=clips_path,
-                audio_path=audio_path,
-                text_path=text_path,
-            )
 
 
 def validate_v2_chunks_complete(rank_dir: Path, *, error_label: str = "v2 structured cache") -> list[V2CacheChunk]:
