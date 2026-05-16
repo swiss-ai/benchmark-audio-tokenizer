@@ -3,17 +3,19 @@ defaults:
   - /tokenizer/apertus_wavtok@_here_
   - _self_
 
-# HeySQuAD human: 76,148 spoken questions over SQuAD passages.
-# 12 native English speakers (5F/7M), no accents, real recordings.
-# License: CC-BY-4.0 (commercial OK).
+# HeySQuAD human (accepted slice): 49,850 answerable spoken questions over
+# SQuAD passages. 12 native English speakers (5F/7M), real recordings.
+# License: CC-BY-4.0.
 #
-# The raw HuggingFace parquets store audio as Struct{bytes, path}; convert reads
-# `audio.bytes` directly and decodes duration/sample-rate metadata from bytes.
-# Conversations parquet at /processed/sft/.../examples/qa/ has `messages_json`
-# with user=<audio>+context, assistant=answer (or a canonical refusal phrase
-# for SQuAD-2.0 impossible rows; see the prep script).
+# Companion configs share the same SHAR + audio cache:
+#   - heysquad_human_refusal_canonical   (26,298 unanswerable rows, baseline)
+#   - heysquad_human_refusal_reasoned    (26,298, LLM-enriched, deferred)
+#
+# The raw HF parquets store audio as Struct{bytes, path}; convert reads
+# `audio.bytes` directly. The conversations parquet under accepted/ has
+# extractive answers; refusal rows live in sibling directories.
 
-name: sft_heysquad_human
+name: sft_heysquad_human_accepted
 language: en
 
 source:
@@ -38,7 +40,7 @@ columns:
 outputs:
   shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/sft/heysquad_human_audio
   tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft
-  sft_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft/heysquad_human
+  sft_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft/heysquad_human_accepted
   name: heysquad_human_audio
 
 tokenizer:
@@ -59,7 +61,7 @@ tokenization:
 
 materialization:
   sft:
-    conversations_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/hf___yijingwu___HeySQuAD_human/examples/qa
+    conversations_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/hf___yijingwu___HeySQuAD_human/accepted
     max_seq_len: 262144
     seq_threshold: 8192
     messages_column: messages_json
