@@ -1,10 +1,5 @@
 # Reality-gap Polish ASR configs
 
-Synthetic Polish speech from VoxCPM-2 (speaker 1636), tokenized for the Apertus
-audio LLM. Five source corpora, all parquet input + WavTokenizer-40 + Apertus
-omni-tokenizer. All outputs are isolated under `audio-datasets/reality_gap/` so
-nothing here mixes with the production SHAR/tokenized trees.
-
 | config                       |    utts |  hours | parquets | size  |
 |------------------------------|--------:|-------:|---------:|------:|
 | `pl_cv_spk1636`              |  23,510 |   32.8 |       24 |  5.6G |
@@ -13,73 +8,59 @@ nothing here mixes with the production SHAR/tokenized trees.
 | `pl_granary_ytc_spk1636`     |   2,647 |    8.9 |        4 |  1.5G |
 | `pl_granary_1kh_spk1636`     | 164,573 |  850.3 |      189 | 146.5G |
 
-`pl_granary_yodas_spk1636` is the smallest — use it first for plumbing checks.
+## Patched Lhotse
 
-## Output layout
+Pipeline needs the patched fork (atomic SHAR + fixed sampler). Upstream Lhotse
+silently corrupts SHAR.
 
+```bash
+git clone -b fix/duration-batcher-and-shar-reader \
+  https://github.com/Alvorecer721/lhotse.git /capstor/scratch/cscs/mkwapniewska/dev/lhotse
+export LHOTSE_DIR=/capstor/scratch/cscs/mkwapniewska/dev/lhotse
 ```
-/capstor/store/cscs/swissai/infra01/audio-datasets/reality_gap/
-├── SHAR/voxcpm2/<subset>/        # written by `convert`
-└── tokenized/voxcpm2/<subset>/   # written by `tokenize`
+
+> ⚠️ `scripts/utils/source_lhotse_runtime.sh` line 15 hardcodes the default
+> `LHOTSE_DIR` to **Yixuan's scratch** (`/iopsstor/scratch/cscs/xyixuan/dev/lhotse`).
+> That path can vanish at any time. **Always `export LHOTSE_DIR=...` to your own
+> checkout** before submitting — sbatch will propagate the env into the job.
+
+The slurm launchers source that script for you; it honours `LHOTSE_DIR`,
+installs torchaudio/torchcodec into `/opt/venv`, and sets `OMP_NUM_THREADS=1`
+for `convert`. For interactive Python:
+
+```bash
+INSTALL_TORCHAUDIO=1 INSTALL_TORCHCODEC=1 \
+  source scripts/utils/source_lhotse_runtime.sh
 ```
 
-Both paths are hard-coded in each config's `outputs` block — no override needed.
-
-## How to run
-
-### Easiest: chained submission (convert then tokenize)
+## Run
 
 ```bash
 scripts/slurm/mkwapniewska_pl_chain.sh pl_granary_yodas_spk1636
 ```
 
-That submits `convert` (CPU) and queues `tokenize` (GPU) with
-`--dependency=afterok` so tokenize only runs if convert succeeds.
-
-For the big `pl_granary_1kh_spk1636` (850 h) raise the walltimes:
+That submits `convert` (`--ntasks=1 --cpus-per-task=288`, all 288 CPUs on one
+task) and chains `tokenize` (`--ntasks-per-node=4 --gpus-per-node=4
+--cpus-per-task=72`, one task per GPU) with `afterok`.
+For the big one:
 
 ```bash
 CONVERT_TIME=04:00:00 TOKENIZE_TIME=08:00:00 \
   scripts/slurm/mkwapniewska_pl_chain.sh pl_granary_1kh_spk1636
 ```
 
-### Manual: one stage at a time
-
-```bash
-unset SLURM_SPANK__SLURM_SPANK_OPTION_pyxis_environment  # if inside an interactive container
-
-# convert (CPU)
-sbatch --reservation=SD-69241-apertus-1-5-0 --time=02:00:00 \
-       --nodes=1 --ntasks=1 --cpus-per-task=288 \
-       scripts/slurm/mkwapniewska_pl.slurm pl_granary_yodas_spk1636 convert
-
-# tokenize (GPU) — only after convert succeeds
-sbatch --reservation=SD-69241-apertus-1-5-0 --time=04:00:00 \
-       --nodes=1 --ntasks-per-node=4 --gpus-per-node=4 --cpus-per-task=72 \
-       scripts/slurm/mkwapniewska_pl.slurm pl_granary_yodas_spk1636 tokenize
+Outputs land in:
 ```
-
-## Logs & success markers
-
-Both stages stream to `logs/mk_pl_<JOBID>.{out,err}`. Stage success is signalled
-by a `_SUCCESS` file in the corresponding output directory:
-
+reality_gap/SHAR/voxcpm2/<subset>/                                     # convert
+reality_gap/tokenized/voxcpm2/<subset>/transcribe/voxcpm2_<subset>/    # tokenize
 ```
-reality_gap/SHAR/voxcpm2/<subset>/_SUCCESS         # convert OK
-reality_gap/tokenized/voxcpm2/<subset>/transcribe/voxcpm2_<subset>/_SUCCESS  # tokenize OK
-```
+Success = `_SUCCESS` file in each. Throughput on GH200 is ~10–20K audio
+tokens/s/GPU; `stats_summary.json` in the tokenize dir has per-rank numbers.
+Logs: `logs/mk_pl_<JOBID>.{out,err}`.
 
-`stats_summary.json` in the tokenize output gives per-rank sample counts and
-throughput.
+## Validated reference (2026-05-18, `pl_granary_yodas_spk1636`)
 
-## Validation reference
-
-`pl_granary_yodas_spk1636` validated end-to-end on 2026-05-18:
-* convert: 45 s, 3,239 cuts written, 0 errors.
-* tokenize: 4 ranks × 24 s, 941 K audio + 111 K text tokens, 0 errors.
-* Whisper-large-v3 PL WER on original synth audio: **6.78 %**.
-* WER after WavTokenizer-40 encode + decode: **28.08 %** (+21.30 abs pts).
-
-The 21-pt codec gap is the round-trip degradation from the 40-tok/s audio
-codec on Polish. It is the starting baseline for the real-vs-synth ablation
-on this branch — nothing in these configs introduces it.
+* convert 45 s, tokenize 4×24 s, 941 K audio + 111 K text tokens, 0 errors.
+* Whisper-large-v3 PL WER on original synth: **6.78 %**.
+* WER after WavTokenizer round-trip: **28.08 %** (+21.30 pts codec gap —
+  baseline degradation, not introduced by these configs).
