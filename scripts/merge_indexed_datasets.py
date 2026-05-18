@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import logging
 
-from audio_tokenization.utils.indexed_dataset import merge_indexed_dataset
+from audio_tokenization.utils.indexed_dataset.merge_indexed_dataset import (
+    merge_indexed_dataset,
+)
 
 
 def parse_args() -> argparse.Namespace:
