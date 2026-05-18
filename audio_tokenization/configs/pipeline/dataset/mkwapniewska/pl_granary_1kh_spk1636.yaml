@@ -1,0 +1,36 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# Synthetic Polish ASR (VoxCPM2, speaker 1636) — Granary 1k-hour Polish slice.
+# 164,573 utterances, 850.3 h. Largest of the five spk1636 configs.
+# HF-style parquet with `audio`/`text`/`duration`. 189 shards (~146 GB).
+
+name: mkwapniewska_pl_granary_1kh_spk1636
+language: pl
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/synthesized/voxcpm2/pl_granary_1kh_spk1636/data
+  files: "train-*.parquet"
+
+columns:
+  audio: audio
+  text: text
+  duration: duration
+  id: id
+  language_column: language
+  constant:
+    dataset: voxcpm2_pl_granary_1kh_spk1636
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/reality_gap/SHAR/voxcpm2/pl_granary_1kh_spk1636
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/reality_gap/tokenized/voxcpm2/pl_granary_1kh_spk1636
+  name: voxcpm2_pl_granary_1kh_spk1636
+
+tokenization:
+  min_duration: 1.0
+  max_duration: 60.0
+
+conversion:
+  num_workers: 189

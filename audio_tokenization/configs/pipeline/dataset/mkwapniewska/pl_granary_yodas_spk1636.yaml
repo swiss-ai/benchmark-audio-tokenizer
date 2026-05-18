@@ -1,0 +1,41 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# Synthetic Polish ASR (VoxCPM2, speaker 1636) — Granary YODAS subset.
+# 3,239 utterances, 6.6 h. Source: HF-style parquet shards with an
+# `audio` struct ({bytes, sampling_rate}) and a `text` field. The
+# upstream text is the Polish ASR transcript used to drive VoxCPM2.
+#
+# Owner-namespaced under dataset/mkwapniewska/ alongside the existing
+# pl_voxpopuli / pl_commonvoice / pl_fleurs ablation configs. Unlike
+# those, this set is parquet-input (no pre-built SHAR) so convert runs.
+#
+# Override `outputs.tokenized_dir` at invocation, e.g.:
+#   stage=tokenize outputs.tokenized_dir=/capstor/scratch/cscs/<USER>/tokenized
+
+name: mkwapniewska_pl_granary_yodas_spk1636
+language: pl
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/synthesized/voxcpm2/pl_granary_yodas_spk1636/data
+  files: "train-*.parquet"
+
+columns:
+  audio: audio
+  text: text
+  duration: duration
+  id: id
+  language_column: language
+  constant:
+    dataset: voxcpm2_pl_granary_yodas_spk1636
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/reality_gap/SHAR/voxcpm2/pl_granary_yodas_spk1636
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/reality_gap/tokenized/voxcpm2/pl_granary_yodas_spk1636
+  name: voxcpm2_pl_granary_yodas_spk1636
+
+tokenization:
+  min_duration: 1.0
+  max_duration: 60.0
