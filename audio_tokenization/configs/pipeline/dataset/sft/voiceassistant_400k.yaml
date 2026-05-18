@@ -1,0 +1,72 @@
+defaults:
+  - /recipe/parquet_sft_audio@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# gpt-omni/VoiceAssistant-400K, voice-in/text-out SFT.
+# 465,748 user-turn audios across 246,913 conversations (4,306 `identity`
+# rows excluded at prep time — they would poison Apertus self-identity).
+# Six surviving splits: rlhf (multi-turn, mean 2.36 / max 33 turns),
+# alpaca_gpt4_en_55k, qa_assistant_v1_7k, qa_assistant_v2_20k,
+# trivia_single_choice_20k, trivia_multi_choice_17k (all single-turn).
+# English only, all TTS (multi-voice; see prep audit notes). License: Apache-2.0.
+#
+# Pre-flattened by the sibling-repo prep script:
+#   multimodal-data/01-dataset-download/audio/voiceassistant-400k/convert_to_parquet.py
+# The flat shards under `data/` carry unique `audio_id` keys; `index` is NOT
+# unique across splits (trivia/qa/alpaca all restart at 000000000), so the
+# audio_id and conversation sample_id are namespaced by split_name.
+
+name: sft_voiceassistant_400k
+language: en
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/VoiceAssistant-400K/data
+  files: "train-*.parquet"
+
+columns:
+  audio: audio_bytes
+  duration: duration_sec
+  id: audio_id
+  keep:
+    - audio_path
+    - audio_format
+    - sampling_rate
+    - num_frames
+    - split_name
+    - index
+    - round
+    - question_text
+    - answer_text
+  constant:
+    dataset: voiceassistant_400k_sft
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/sft/voiceassistant_400k_audio
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft
+  sft_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft/voiceassistant_400k
+  name: voiceassistant_400k_audio
+
+tokenizer:
+  path: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok_instruct
+
+conversion:
+  num_workers: 64
+  shard_size: 5000
+  shar_format: flac
+
+tokenization:
+  min_duration: 1.0
+  # User turns are short queries — sampled rlhf max was 17.9s; 60s is generous.
+  max_duration: 60.0
+  num_workers: 32
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 1000
+
+materialization:
+  sft:
+    conversations_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/VoiceAssistant-400K/conversations
+    max_seq_len: 262144
+    seq_threshold: 8192
+    messages_column: messages_json
+    num_workers: 64
