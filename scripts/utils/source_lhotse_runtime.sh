@@ -12,6 +12,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 : "${REPO_DIR:=${DEFAULT_REPO_DIR}}"
+
+: "${LHOTSE_RUNTIME_MODE:=legacy}"
+case "${LHOTSE_RUNTIME_MODE}" in
+  baked)
+    if [ "${STAGE:-}" != "tokenize" ]; then
+      echo "ERROR: baked Lhotse runtime is only validated for tokenize" >&2
+      return 2
+    fi
+    export INSTALL_TORCHCODEC=0 INSTALL_TORCHAUDIO=0 INSTALL_ONCE_PER_NODE=0
+    export PYTHONNOUSERSITE=1
+    export PYTHONPATH="${REPO_DIR}"
+    export PATH="/opt/venv/bin:${PATH}"
+    if [ "${PRINT_LHOTSE_RUNTIME:-1}" = "1" ]; then
+      python -c 'import lhotse, torchaudio; print(f"lhotse={lhotse.__file__}"); print(f"torchaudio={torchaudio.__version__} {torchaudio.__file__}")'
+      command -v ffmpeg
+    fi
+    return 0
+    ;;
+  legacy) ;;
+  *)
+    echo "ERROR: unsupported LHOTSE_RUNTIME_MODE=${LHOTSE_RUNTIME_MODE}" >&2
+    return 2
+    ;;
+esac
 : "${LHOTSE_DIR:=/iopsstor/scratch/cscs/xyixuan/dev/lhotse}"
 : "${WHEELHOUSE_AARCH64:=/capstor/store/cscs/swissai/infra01/MLLM/wheelhouse/aarch64}"
 : "${FFMPEG_ROOT:=${WHEELHOUSE_AARCH64}/ffmpeg-7.1.1-full-aarch64}"

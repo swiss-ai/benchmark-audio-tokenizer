@@ -1,0 +1,19 @@
+# Tokenization only: Lhotse, TorchAudio, and FFmpeg are baked into this image.
+# Image SHA256: 142c2baf8855318d9f5a23f1b7a7aba13d6c0fe19758b65b61ace8a2e804dd0d
+image = "/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/outputs/nemo-audio-image-20260913/revision-2/nemo-audio-tokenization-26.08.aarch64.sqsh"
+mounts = ["/capstor", "/iopsstor", "/users"]
+writable = true
+workdir = "/workspace"
+
+[env]
+PATH = "/opt/audio-runtime/ffmpeg/bin:/opt/venv/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin"
+PYTHONNOUSERSITE = "1"
+CUDA_CACHE_DISABLE = "1"
+PMIX_MCA_psec = "native"
+FI_MR_CACHE_MAX_SIZE = "-1"
+FI_MR_CACHE_MAX_COUNT = "524288"
+FI_CXI_SAFE_DEVMEM_COPY_THRESHOLD = "16777216"
+FI_MR_CACHE_MONITOR = "userfaultfd"
+
+[annotations]
+com.hooks.cxi.enabled = "false"

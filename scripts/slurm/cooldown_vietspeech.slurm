@@ -16,7 +16,6 @@
 #SBATCH --account=infra01
 #SBATCH --job-name=vs-cooldown
 #SBATCH --reservation=SD-69241-apertus-1-5
-#SBATCH --environment=nemo_25_11
 #SBATCH --output=/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/logs/cooldown_vietspeech_%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/logs/cooldown_vietspeech_%j.err
 #SBATCH --partition=normal
@@ -33,7 +32,19 @@ fi
 shift
 HYDRA_OVERRIDES=("$@")
 
-REPO_DIR=/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer
+# sbatch spools this file, so BASH_SOURCE cannot identify the checkout there.
+# Submit from the checkout, or export REPO_DIR explicitly before sbatch.
+REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-}}"
+if [ -z "${REPO_DIR}" ]; then
+    REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
+if [ ! -f "${REPO_DIR}/audio_tokenization/__main__.py" ] || \
+   [ ! -f "${REPO_DIR}/scripts/utils/source_lhotse_runtime.sh" ]; then
+    echo "ERROR: REPO_DIR must name the pipeline checkout; got ${REPO_DIR}" >&2
+    exit 2
+fi
+REPO_DIR="$(cd "${REPO_DIR}" && pwd)"
+source "${REPO_DIR}/scripts/utils/source_lhotse_stage_environment.sh"
 RUNTIME_ENV_SH="${REPO_DIR}/scripts/utils/source_lhotse_runtime.sh"
 LOG_DIR="${REPO_DIR}/logs"
 mkdir -p "${LOG_DIR}"
@@ -78,11 +89,11 @@ run_stage() {
     echo "Running stage=${pipeline_stage} with srun --ntasks=${ntasks} $*"
     echo "=========================================="
 
-    STAGE="${pipeline_stage}" srun --kill-on-bad-exit=0 -u --ntasks="${ntasks}" "$@" bash -c '
+    STAGE="${pipeline_stage}" lhotse_srun "${pipeline_stage}" --kill-on-bad-exit=0 -u --ntasks="${ntasks}" "$@" bash -c '
 set -euo pipefail
 
 jemalloc=/opt/venv/lib/python3.12/site-packages/ray/core/libjemalloc.so
-if [ -f "${jemalloc}" ]; then
+if [ "${LHOTSE_RUNTIME_MODE:-legacy}" = "legacy" ] && [ -f "${jemalloc}" ]; then
     export LD_PRELOAD="${jemalloc}${LD_PRELOAD:+:${LD_PRELOAD}}"
 fi
 

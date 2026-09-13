@@ -1,0 +1,68 @@
+{
+  "base_image": "/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-image-tokenzier/outputs/nemo-pipeline-image-20260913/nemo-tokenization-cudnn9241-faiss1131.aarch64.sqsh",
+  "base_sha256": "b25155f97b6341fa221abbf9548313592b54726eb4b8050e32e988fe985288cc",
+  "source_revisions": {
+    "lhotse": "89ed3be63756b0f1d87c5cfd0af1e9639527f557",
+    "torchaudio": "34c52a67e8941bbd8e6adaca0eb0b9eabec11d78",
+    "pipeline": "fe8650e7d999b257dae1673df2e509d516be8d7e",
+    "wavtokenizer": "5cf440d91ac420ca338f117b7003a77450d64730"
+  },
+  "scope": "WavTokenizer inference on existing SHAR; missing custom atomic preparation APIs are not included",
+  "ffmpeg_source": "/capstor/store/cscs/swissai/infra01/MLLM/wheelhouse/aarch64/ffmpeg-7.1.1-full-aarch64",
+  "packages": [
+    {
+      "file": "cytoolz-1.1.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+      "bytes": 2824951,
+      "sha256": "82779049f352fb3ab5e8c993ab45edbb6e02efb1f17f0b50f4972c706cc51d76",
+      "name": "cytoolz",
+      "version": "1.1.0"
+    },
+    {
+      "file": "ffmpeg-7.1.1-aarch64.tar",
+      "bytes": 23736320,
+      "sha256": "36b8014827c6cdecd59d7a28c6dc8066a749c5e4e3b2451e5e2fe9c171b2defd"
+    },
+    {
+      "file": "intervaltree-3.2.1-py2.py3-none-any.whl",
+      "bytes": 25929,
+      "sha256": "a8a8381bbd35d48ceebee932c77ffc988492d22fb1d27d0ba1d74a7694eb8f0b",
+      "name": "intervaltree",
+      "version": "3.2.1"
+    },
+    {
+      "file": "lhotse-2.0.0a6.dev0+git.89ed3be6.clean-py3-none-any.whl",
+      "bytes": 993030,
+      "sha256": "32725c42d1bbb40dea32c58607a94e95ab4c5df11f5e186460f0e42a083a9a3b",
+      "name": "lhotse",
+      "version": "2.0.0a6.dev0+git.89ed3be6.clean"
+    },
+    {
+      "file": "lilcom-1.8.2-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+      "bytes": 86841,
+      "sha256": "f28a68165b7dbf55613fbe463f2e322165de4f54a8744ef653f5b112eca4ca24",
+      "name": "lilcom",
+      "version": "1.8.2"
+    },
+    {
+      "file": "sortedcontainers-2.4.0-py2.py3-none-any.whl",
+      "bytes": 29575,
+      "sha256": "a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0",
+      "name": "sortedcontainers",
+      "version": "2.4.0"
+    },
+    {
+      "file": "toolz-1.1.0-py3-none-any.whl",
+      "bytes": 58093,
+      "sha256": "15ccc861ac51c53696de0a5d6d4607f99c210739caf987b5d2054f3efed429d8",
+      "name": "toolz",
+      "version": "1.1.0"
+    },
+    {
+      "file": "torchaudio-2.11.0+nv26.8.cuda13.3-cp312-cp312-linux_aarch64.whl",
+      "bytes": 1884100,
+      "sha256": "8bb15ca56353148ddcc4b995d50870541ab5a3ed5daff10cc357973620f19032",
+      "name": "torchaudio",
+      "version": "2.11.0+nv26.8.cuda13.3"
+    }
+  ]
+}
