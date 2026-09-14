@@ -332,7 +332,8 @@ def sample_interleave_cache(
             str(row_data.get("text") or decoded_texts[idx])
             for idx, row_data in enumerate(rows)
         ]
-        audio_tokens = cache.audio.get(center)
+        # Samples outlive this reader window; do not retain its mapped files.
+        audio_tokens = cache.audio.get(center).tolist()
         expected_text = str(row.get("text") or decoded_texts[center])
 
         samples.append(

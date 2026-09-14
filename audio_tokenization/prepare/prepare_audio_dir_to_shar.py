@@ -16,9 +16,10 @@ import logging
 import time
 from pathlib import Path
 
+from audio_tokenization.contracts.errors import OutputWriteError
+from audio_tokenization.prepare.atomic_shar import atomic_shar_partition
 from audio_tokenization.prepare.audio_ops import apply_audio_pipeline, write_cut_to_shar
 from audio_tokenization.prepare.cli import expand_path_patterns
-from audio_tokenization.prepare.constants import PREPARE_SHAR_COMMIT_MODE
 from audio_tokenization.prepare.identity import set_interleave_metadata
 from audio_tokenization.prepare.runtime import (
     build_audio_index,
@@ -132,11 +133,10 @@ def _convert_worker(args: AudioDirWorkerArgs):
         ),
     )
 
-    with SharWriter(
-        output_dir=str(worker_dir),
+    with atomic_shar_partition(worker_dir, fields=("recording",)) as staged_dir, SharWriter(
+        output_dir=str(staged_dir),
         fields={"recording": shar_format},
         shard_size=shard_size,
-        commit=PREPARE_SHAR_COMMIT_MODE,
     ) as writer:
         for jsonl_path in jsonl_paths:
             with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -245,6 +245,8 @@ def _convert_worker(args: AudioDirWorkerArgs):
                                 t0=t0,
                                 next_log_at=next_log_at,
                             )
+                        except OutputWriteError:
+                            raise
                         except Exception as e:
                             errors += 1
                             runtime_counts["processing_errors"] += 1

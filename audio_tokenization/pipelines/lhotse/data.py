@@ -11,7 +11,7 @@ import glob
 import json
 import logging
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from audio_tokenization.config.schema import TokenizeSpec
 from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
@@ -53,7 +53,7 @@ def resolve_shar_dirs(shar_dir, *, index_name: str = SHAR_INDEX_FILENAME) -> lis
 
         resolved.extend(_expand_partitioned_root(Path(item_str), index_name=index_name))
 
-    return sorted(dict.fromkeys(resolved))
+    return sorted({str(Path(path).resolve()) for path in resolved})
 
 
 def _expand_partitioned_root(shar_path: Path, *, index_name: str) -> list[str]:
@@ -90,10 +90,33 @@ def _resolve_index_paths(shar_root: Path, fields: dict[str, list]) -> dict[str, 
                     f"Absolute path in shar index is not allowed: {pp}. "
                     f"Rebuild {shar_root / SHAR_INDEX_FILENAME} with relative paths."
                 )
-            pp = shar_root / pp
+            pp = (shar_root / pp).resolve()
             out.append(str(pp))
         resolved[field] = out
     return resolved
+
+
+def _read_shar_index_fields(index_path: Path) -> dict[str, list[str]]:
+    """Resolve and validate the paired fields shared by planning and loading."""
+    with index_path.open() as stream:
+        fields = json.load(stream).get("fields", {})
+    if "cuts" not in fields:
+        raise ValueError(f"Shar index missing required 'cuts' field: {index_path}")
+    fields = _resolve_index_paths(index_path.parent, fields)
+    _validate_parallel_fields(index_path, fields)
+    return fields
+
+
+def _validate_parallel_fields(index_path: Path, fields: Mapping[str, list[str]]) -> None:
+    if "cuts" not in fields:
+        raise ValueError(f"Shar index missing required 'cuts' field: {index_path}")
+    expected = len(fields["cuts"])
+    for field, paths in fields.items():
+        if len(paths) != expected:
+            raise ValueError(
+                f"SHAR index field {field!r} in {index_path} has {len(paths)} "
+                f"shards, expected {expected} to match 'cuts'."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -208,20 +231,14 @@ def _load_shar_cutset(
     ``stages/tokenize.py``. That plan assigns whole SHAR work units by
     estimated duration before this loader is called.
     """
-    from lhotse import CutSet
-
     if planned_shar_fields is not None:
-        planned_fields = {k: sorted(v) for k, v in planned_shar_fields.items()}
+        planned_fields = {k: list(v) for k, v in planned_shar_fields.items()}
         logger.info(
             "[rank %s] Loading planned SHAR assignment: %s cut shard(s)",
             rank,
             len(planned_fields.get("cuts", [])),
         )
-        return CutSet.from_shar(
-            fields=planned_fields,
-            split_for_dataloading=False,
-            shuffle_shards=True,
-        )
+        return _cutset_from_paired_fields(planned_fields, rank=rank)
 
     shar_dirs = resolve_shar_dirs(input_shar_dirs, index_name=index_name)
     merged_fields: dict[str, list[str]] = {}
@@ -233,11 +250,7 @@ def _load_shar_cutset(
 
         index_path = shar_path / index_name
         if index_path.is_file():
-            with open(index_path) as f:
-                fields = json.load(f).get("fields", {})
-            if "cuts" not in fields:
-                raise ValueError(f"Shar index missing required 'cuts' field: {index_path}")
-            fields = _resolve_index_paths(shar_path, fields)
+            fields = _read_shar_index_fields(index_path)
             logger.info(f"[rank {rank}] Loading Shar index from {index_path}")
         elif _shar_exists(sd):
             raise FileNotFoundError(
@@ -253,8 +266,10 @@ def _load_shar_cutset(
         for field, paths in fields.items():
             merged_fields.setdefault(field, []).extend(paths)
 
-    # Sort for determinism.
-    merged_fields = {k: sorted(v) for k, v in merged_fields.items()}
+    _validate_parallel_fields(Path("merged SHAR inputs"), merged_fields)
+    # Match the planned path's lexical cuts order by permuting whole units.
+    order = sorted(range(len(merged_fields["cuts"])), key=lambda i: merged_fields["cuts"][i])
+    merged_fields = {field: [paths[i] for i in order] for field, paths in merged_fields.items()}
     total_shards = len(merged_fields.get("cuts", []))
     logger.info(
         f"[rank {rank}] Merged {len(shar_dirs)} shar dir(s): "
@@ -267,12 +282,24 @@ def _load_shar_cutset(
             "tokenize stage; refusing to load the full SHAR on every rank."
         )
 
+    return _cutset_from_paired_fields(merged_fields, rank=rank)
+
+
+def _cutset_from_paired_fields(fields: dict[str, list[str]], *, rank: int):
+    from lhotse import CutSet
+
+    _validate_parallel_fields(Path("SHAR reader fields"), fields)
     # Intentionally keep split_for_dataloading disabled here.
     # This pipeline assigns whole SHAR shards to ranks via planned fields so
     # checkpoint ownership and output ownership are both rank-local. Switching
     # to Lhotse's worker/node striding would blur that ownership boundary and
     # make recovery/output layout harder to reason about.
-    return CutSet.from_shar(fields=merged_fields, split_for_dataloading=False, shuffle_shards=True)
+    cuts = CutSet.from_shar(fields=fields, split_for_dataloading=False, shuffle_shards=True)
+    logger.info(
+        "[rank %s] SHAR reader_mode=%s split_for_dataloading=False shuffle_shards=True",
+        rank, "indexed" if cuts.is_indexed else "streaming",
+    )
+    return cuts
 
 
 def _shar_exists(shar_dir: str) -> bool:

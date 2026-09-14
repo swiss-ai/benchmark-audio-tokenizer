@@ -5,19 +5,39 @@ Supports two output formats:
 - ``direct``: Megatron indexed dataset (bin/idx) with full training sequences.
 """
 
-import os
-
+import numpy as np
 import torch
 
 from audio_tokenization.config.schema import TokenizeSpec
 
-from .checkpoint import finalize_shard_writer, open_chunk_writer
+from .checkpoint import MegatronWriterMixin
 
 TASK_TOKEN_MAP = {
     "transcribe": "speech_transcribe_id",
     "translate": "stt_translate_id",
     "annotate": "audio_annotate_id",
 }
+
+
+def _tokenize_batch(batch, tokenizer, *, target_sr, device):
+    """Return CPU tokens and cuts, releasing any device copy owned by this call.
+
+    Pre-normalized GPU input remains owned by the caller's batch.
+    """
+    audios = batch["inputs"]
+    cuts = batch["supervisions"]["cut"]
+    audio_lens = [cut.num_samples for cut in cuts]
+    audios_gpu = audios.to(device, non_blocking=True)
+    with torch.inference_mode():
+        tokens = tokenizer.tokenize_batch_raw(
+            audios_gpu,
+            target_sr,
+            orig_audio_samples=audio_lens,
+            pad_audio_samples=audios.shape[1],
+        )
+    if len(tokens) != len(cuts) or any(item is None or len(item) == 0 for item in tokens):
+        raise ValueError("Tokenizer must return one valid token sequence per cut")
+    return cuts, tokens, sum(audio_lens) / target_sr
 
 
 def resolve_interleaving_metadata(cut):
@@ -54,7 +74,7 @@ def resolve_interleaving_metadata(cut):
     )
 
 
-class AudioTextHandler:
+class AudioTextHandler(MegatronWriterMixin):
     """Handler for audio-text tokenization mode.
 
     Uses WavTokenizer to encode audio into token sequences, pairs them
@@ -99,27 +119,10 @@ class AudioTextHandler:
 
     def setup_writer(self, output_dir, rank, writer_state, tokenizer):
         if self.audio_text_format == "direct":
-            self._setup_writer_direct(output_dir, rank, writer_state, tokenizer)
+            self._setup_megatron_writer(output_dir, rank, writer_state, tokenizer)
         else:
             self._setup_writer_interleaved(output_dir, rank, writer_state)
         self.chunk_samples = 0
-
-    def _setup_writer_direct(self, output_dir, rank, writer_state, tokenizer):
-        self._output_dir = output_dir
-        self._rank = rank
-        self._chunk_id = int(writer_state)
-        self._vocab_size = len(tokenizer.omni_tokenizer)
-        (
-            self._builder,
-            self._cut_ids,
-            self._tmp_bin,
-            self._tmp_idx,
-            self._tmp_cut_ids,
-            self._bin,
-            self._idx,
-            self._cut_ids_path,
-        ) = \
-            open_chunk_writer(output_dir, rank, self._chunk_id, self._vocab_size)
 
     def _setup_writer_interleaved(self, output_dir, rank, writer_state):
         from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
@@ -142,23 +145,9 @@ class AudioTextHandler:
             return self._process_batch_interleaved(batch, tokenizer, stats, target_sr, device)
 
     def _process_batch_direct(self, batch, tokenizer, stats, target_sr, device):
-        audios = batch["inputs"]
-        cuts = batch["supervisions"]["cut"]
-
-        audio_lens = torch.tensor(
-            [c.num_samples for c in cuts], dtype=torch.int64,
+        cuts, raw_tokens, batch_audio_secs = _tokenize_batch(
+            batch, tokenizer, target_sr=target_sr, device=device,
         )
-
-        batch_audio_secs = audio_lens.sum().item() / target_sr
-        audios_gpu = audios.to(device, non_blocking=True)
-
-        with torch.inference_mode():
-            raw_tokens = tokenizer.tokenize_batch_raw(
-                audios_gpu,
-                target_sr,
-                orig_audio_samples=audio_lens.tolist(),
-                pad_audio_samples=audios.shape[1],
-            )
 
         task_token_id = getattr(tokenizer, TASK_TOKEN_MAP[self.audio_text_task])
         bos_id = tokenizer.bos_id
@@ -166,13 +155,15 @@ class AudioTextHandler:
 
         batch_audio_tok = 0
         batch_text_tok = 0
-        for audio_tok, cut in zip(raw_tokens, cuts):
+        for audio_tok, cut in zip(raw_tokens, cuts, strict=True):
             text_tokens = cut.custom.get("text_tokens", []) if cut.custom else []
             # audio_tok = [audio_start, offset_audio..., audio_end]
             # Full: [BOS] + audio_tok + [task_token] + text_tokens + [EOS]
-            seq = [bos_id] + audio_tok + [task_token_id] + text_tokens + [eos_id]
-            t = torch.tensor(seq, dtype=torch.int64)
-            self._builder.add_item(t)
+            seq = np.concatenate(
+                ([bos_id], audio_tok, [task_token_id, *text_tokens, eos_id]),
+                dtype=np.int64,
+            )
+            self._builder.add_item(seq)
             self._builder.end_document()
             self._cut_ids.write(cut.id)
 
@@ -187,28 +178,14 @@ class AudioTextHandler:
         return batch_audio_secs
 
     def _process_batch_interleaved(self, batch, tokenizer, stats, target_sr, device):
-        audios = batch["inputs"]
-        cuts = batch["supervisions"]["cut"]
-
-        audio_lens = torch.tensor(
-            [c.num_samples for c in cuts], dtype=torch.int64,
+        cuts, raw_tokens, batch_audio_secs = _tokenize_batch(
+            batch, tokenizer, target_sr=target_sr, device=device,
         )
-
-        batch_audio_secs = audio_lens.sum().item() / target_sr
-        audios_gpu = audios.to(device, non_blocking=True)
-
-        with torch.inference_mode():
-            raw_tokens = tokenizer.tokenize_batch_raw(
-                audios_gpu,
-                target_sr,
-                orig_audio_samples=audio_lens.tolist(),
-                pad_audio_samples=audios.shape[1],
-            )
 
         rows = []
         batch_audio_tok = 0
         batch_text_tok = 0
-        for tokens, cut in zip(raw_tokens, cuts):
+        for tokens, cut in zip(raw_tokens, cuts, strict=True):
             source_id, clip_num, clip_start, clip_duration = resolve_interleaving_metadata(cut)
             text = cut.supervisions[0].text if cut.supervisions else ""
             speaker = cut.supervisions[0].speaker if cut.supervisions else ""
@@ -253,34 +230,9 @@ class AudioTextHandler:
 
     def checkpoint_writer(self):
         if self.audio_text_format == "direct":
-            return self._checkpoint_writer_direct()
+            return self._rotate_megatron_writer()
         else:
             return self._checkpoint_writer_interleaved()
-
-    def _checkpoint_writer_direct(self) -> int:
-        finalize_shard_writer(
-            self._builder,
-            self._tmp_bin,
-            self._tmp_idx,
-            self._bin,
-            self._idx,
-            self._cut_ids,
-        )
-        self._chunk_id += 1
-        self.chunk_samples = 0
-        self.chunks_written += 1
-        (
-            self._builder,
-            self._cut_ids,
-            self._tmp_bin,
-            self._tmp_idx,
-            self._tmp_cut_ids,
-            self._bin,
-            self._idx,
-            self._cut_ids_path,
-        ) = \
-            open_chunk_writer(self._output_dir, self._rank, self._chunk_id, self._vocab_size)
-        return self._chunk_id
 
     def _checkpoint_writer_interleaved(self):
         done_id = self._writer.finalize()
@@ -288,39 +240,19 @@ class AudioTextHandler:
         self.chunks_written += len(done_id)
         return self._writer.get_state()
 
-    def get_writer_state(self):
-        if self.audio_text_format == "direct":
-            return self._chunk_id
-        return self._writer.get_state()
-
     def finalize_writer(self):
         if self.audio_text_format == "direct":
-            self._finalize_writer_direct()
+            self._finalize_megatron_writer()
         else:
             self._finalize_writer_interleaved()
-
-    def _finalize_writer_direct(self):
-        if self.chunk_samples > 0:
-            finalize_shard_writer(
-                self._builder,
-                self._tmp_bin,
-                self._tmp_idx,
-                self._bin,
-                self._idx,
-                self._cut_ids,
-            )
-            self.chunks_written += 1
-            self._chunk_id += 1
-        else:
-            self._cut_ids.abort()
-            for p in (self._tmp_bin, self._tmp_idx):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
 
     def _finalize_writer_interleaved(self):
         if self.chunk_samples > 0:
             done = self._writer.finalize()
             self.chunks_written += len(done)
+
+    def abort_writer(self):
+        if self.audio_text_format == "direct":
+            self._abort_megatron_writer()
+        elif getattr(self, "_writer", None) is not None:
+            self._writer.abort()

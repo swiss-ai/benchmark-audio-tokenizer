@@ -13,7 +13,6 @@ class TokenizedUnsupervisedBatch:
     """CPU token tensors matched to the original unsupervised Lhotse cuts."""
 
     audio_seconds: float
-    errors: int
     tokens_and_cuts: list[tuple[torch.Tensor, Any]]
 
 
@@ -46,12 +45,11 @@ def tokenize_unsupervised_batch(
             pad_audio_samples=audios.shape[1],
         )
 
-    valid: list[tuple[torch.Tensor, Any]] = [
-        (tokens, cut) for tokens, cut in zip(token_list, cuts) if tokens is not None
-    ]
-    errors = len(token_list) - len(valid)
+    if len(token_list) != len(cuts) or any(tokens is None or len(tokens) == 0 for tokens in token_list):
+        raise ValueError("Tokenizer must return one nonempty token sequence per cut")
+    valid = list(zip(token_list, cuts, strict=True))
     if not valid:
-        return TokenizedUnsupervisedBatch(audio_seconds, errors, [])
+        return TokenizedUnsupervisedBatch(audio_seconds, [])
 
     trimmed = [
         _slice_tokens(
@@ -62,13 +60,14 @@ def tokenize_unsupervised_batch(
         for tokens, _cut in valid
     ]
     lengths = [int(tokens.shape[0]) for tokens in trimmed]
+    if any(length == 0 for length in lengths):
+        raise ValueError("Trimming removed every token for a cut")
 
     # One concatenated GPU-to-CPU copy avoids synchronizing per sample.
     all_cpu = torch.cat(trimmed).to(dtype=dtype).cpu()
     cpu_tokens = all_cpu.split(lengths)
     return TokenizedUnsupervisedBatch(
         audio_seconds,
-        errors,
         [(tokens, cut) for tokens, (_raw_tokens, cut) in zip(cpu_tokens, valid)],
     )
 

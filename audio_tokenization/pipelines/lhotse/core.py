@@ -68,6 +68,9 @@ def _build_sampler_kwargs(spec: TokenizeSpec) -> dict[str, Any]:
     if dataloader.quadratic_duration is not None:
         sampler_kwargs["quadratic_duration"] = dataloader.quadratic_duration
 
+    if dataloader.num_buckets == 1:
+        sampler_kwargs["duration_bins"] = []
+
     return sampler_kwargs
 
 
@@ -119,7 +122,6 @@ def _is_bucket_count_assertion(exc: AssertionError) -> bool:
     return (
         "The number of buckets" in message
         or "num_buckets > 1" in message
-        or message == ""
     )
 
 
@@ -437,9 +439,9 @@ def tokenize_loop(
         f"(writer_state={_format_writer_state(writer_state)}, checkpoint_interval={checkpoint_interval})"
     )
 
-    consecutive_errors = 0
-    max_consecutive_errors = 50
     _loop_error = None
+    current_cut_ids = []
+    pending_cut_ids = []
 
     normalize_peak_db = spec.filter.normalize_peak_db
     if normalize_peak_db is not None:
@@ -461,6 +463,9 @@ def tokenize_loop(
 
     try:
         for batch in dataloader:
+            cuts = batch.get("cuts", batch.get("supervisions", {}).get("cut", []))
+            current_cut_ids = [cut.id for cut in cuts]
+            pending_cut_ids.extend(current_cut_ids)
             _dataloader_wait_ms = (time.monotonic() - _batch_ready_time) * 1000
 
             # Decide whether to capture per-batch timing (only when W&B will flush).
@@ -470,48 +475,22 @@ def tokenize_loop(
             if _time_this:
                 _t_start.record()
 
-            try:
-                _host_process_start = time.monotonic()
-                # Normalize audio volume before tokenization (all modes).
-                if normalize_peak_db is not None:
-                    batch = _normalize_batch(batch, normalize_peak_db, device)
+            _host_process_start = time.monotonic()
+            if normalize_peak_db is not None:
+                batch = _normalize_batch(batch, normalize_peak_db, device)
 
-                if _time_this:
-                    _t_encode_start.record()
+            if _time_this:
+                _t_encode_start.record()
 
-                batch_audio_secs = handler.process_batch(
-                    batch, tokenizer, stats, target_sr, device,
-                )
+            batch_audio_secs = handler.process_batch(
+                batch, tokenizer, stats, target_sr, device,
+            )
 
-                if _time_this:
-                    _t_encode_end.record()
+            if _time_this:
+                _t_encode_end.record()
 
-                total_audio_seconds += batch_audio_secs
-                _process_batch_wall_ms = (time.monotonic() - _host_process_start) * 1000
-                consecutive_errors = 0  # reset on batch success
-
-            except Exception as batch_err:
-                stats.errors += 1
-                consecutive_errors += 1
-
-                # CUDA OOM: free the failed allocation so the next batch can succeed.
-                if is_cuda_oom(batch_err):
-                    torch.cuda.empty_cache()
-                    logger.warning(
-                        f"[rank {rank}] CUDA OOM on batch {batch_count}, freed cache "
-                        f"({consecutive_errors}/{max_consecutive_errors})"
-                    )
-                else:
-                    logger.warning(
-                        f"[rank {rank}] Batch error ({consecutive_errors}/{max_consecutive_errors}): "
-                        f"{batch_err}"
-                    )
-
-                if consecutive_errors >= max_consecutive_errors:
-                    raise RuntimeError(
-                        f"[rank {rank}] {max_consecutive_errors} consecutive batch errors, aborting"
-                    ) from batch_err
-                continue
+            total_audio_seconds += batch_audio_secs
+            _process_batch_wall_ms = (time.monotonic() - _host_process_start) * 1000
 
             batch_count += 1
 
@@ -552,32 +531,45 @@ def tokenize_loop(
             # Periodic chunk rotation: finalize current chunk and open next.
             if batch_count % checkpoint_interval == 0 and handler.chunk_samples > 0:
                 writer_state = handler.checkpoint_writer()
+                pending_cut_ids = []
                 logger.info(
                     f"[rank {rank}] Rotated writer state {_format_writer_state(writer_state)} "
                     f"({stats.tokens_generated} total tokens)"
                 )
 
             _batch_ready_time = time.monotonic()
+            current_cut_ids = []
+
+        handler.finalize_writer()
+        pending_cut_ids = []
 
     except Exception as e:
         logger.error(f"[rank {rank}] Fatal error in tokenization loop: {e}", exc_info=True)
         stats.errors += 1
         _loop_error = e
+        if is_cuda_oom(e):
+            logger.error("[rank %s] CUDA OOM: reduce max_batch_duration; failed cuts: %s",
+                         rank, current_cut_ids[:10])
+        try:
+            handler.abort_writer()
+        except Exception:
+            logger.exception("[rank %s] Failed to clean up uncommitted writer", rank)
 
     if _pbar is not None:
         _pbar.close()
-
-    # ------------------------------------------------------------------
-    # 7. Finalize last chunk.
-    # ------------------------------------------------------------------
-    handler.finalize_writer()
 
     result = stats.finalize()
     result["rank"] = rank
     result["chunks_written"] = handler.chunks_written
 
     if wandb_logger is not None:
-        wandb_logger.finish()
+        try:
+            wandb_logger.finish()
+        except Exception as e:
+            logger.exception("[rank %s] Failed to finish W&B logging", rank)
+            if _loop_error is None:
+                _loop_error = e
+                result["errors"] += 1
 
     text_tok_msg = ""
     if result.get("text_tokens_generated", 0) > 0:
@@ -593,6 +585,13 @@ def tokenize_loop(
 
     result["output_dir"] = output_dir
     result["success"] = _loop_error is None
+    if _loop_error is not None:
+        result["error"] = f"{type(_loop_error).__name__}: {_loop_error}"
+        result["failed_cut_ids"] = current_cut_ids or pending_cut_ids
+        # Includes cuts since the last completed rotation. A failed multi-file
+        # publication can leave some of these committed; inspect artifacts
+        # before attempting manual recovery. This is not sampler resume state.
+        result["affected_cut_ids"] = pending_cut_ids
 
     from .stats_reducer import write_rank_stats
 
@@ -664,15 +663,22 @@ def run_lhotse_pipeline(
     else:
         assert_never(spec.mode)
 
-    return tokenize_loop(
-        spec,
-        dataset_name=dataset_name,
-        input_shar_dirs=input_shar_dirs,
-        planned_shar_fields=planned_shar_fields,
-        rank=rank,
-        world_size=world_size,
-        local_rank=local_rank,
-        final_output_dir=final_output_dir,
-        assigned_cut_count=assigned_cut_count,
-        handler=handler,
-    )
+    try:
+        return tokenize_loop(
+            spec,
+            dataset_name=dataset_name,
+            input_shar_dirs=input_shar_dirs,
+            planned_shar_fields=planned_shar_fields,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+            final_output_dir=final_output_dir,
+            assigned_cut_count=assigned_cut_count,
+            handler=handler,
+        )
+    except BaseException:
+        try:
+            handler.abort_writer()
+        except Exception:
+            logger.exception("[rank %s] Failed to clean up unfinished writer", rank)
+        raise

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -21,7 +22,7 @@ class _FakeBuilder:
         self.documents = 0
 
     def add_item(self, tensor):
-        self.items.append(tensor.clone())
+        self.items.append(np.asarray(tensor).copy())
 
     def end_document(self):
         self.documents += 1
@@ -146,7 +147,13 @@ def test_audio_text_handler_selects_v2_writer(monkeypatch, tmp_path):
     )
 
 
-def test_audio_text_direct_writes_cut_ids_in_document_order():
+@pytest.mark.parametrize("as_arrays", [False, True])
+@pytest.mark.parametrize(("text_custom", "want_second", "text_count"), [
+    ({"text_tokens": [201, 202]}, [1, 20, 21, 22, 3, 201, 202, 2], 3),
+    ({"text_tokens": []}, [1, 20, 21, 22, 3, 2], 1),
+    (None, [1, 20, 21, 22, 3, 2], 1),
+])
+def test_audio_text_direct_writes_cut_ids_in_document_order(as_arrays, text_custom, want_second, text_count):
     handler = AudioTextHandler(
         _tokenize_spec(audio_text_format="direct"),
         dataset_name="test_dataset",
@@ -157,28 +164,33 @@ def test_audio_text_direct_writes_cut_ids_in_document_order():
 
     cuts = [
         SimpleNamespace(id="cut-a", num_samples=12, custom={"text_tokens": [101]}),
-        SimpleNamespace(id="cut-b", num_samples=16, custom={"text_tokens": [201, 202]}),
+        SimpleNamespace(id="cut-b", num_samples=16, custom=text_custom),
     ]
-    handler._process_batch_direct(
+    tokenizer = _FakeDirectTokenizer()
+    if as_arrays:
+        original = tokenizer.tokenize_batch_raw
+        tokenizer.tokenize_batch_raw = lambda *a, **kw: [np.asarray(t) for t in original(*a, **kw)]
+    audio_seconds = handler.process_batch(
         {
             "inputs": torch.zeros(2, 16),
             "supervisions": {"cut": cuts},
         },
-        _FakeDirectTokenizer(),
+        tokenizer,
         stats,
         target_sr=24_000,
         device="cpu",
     )
 
+    assert audio_seconds == pytest.approx(28 / 24_000)
     assert handler._cut_ids.ids == ["cut-a", "cut-b"]
     assert handler._builder.documents == 2
     assert [item.tolist() for item in handler._builder.items] == [
         [1, 10, 11, 3, 101, 2],
-        [1, 20, 21, 22, 3, 201, 202, 2],
+        want_second,
     ]
     assert stats.samples_processed == 2
     assert stats.tokens_generated == 5
-    assert stats.text_tokens_generated == 3
+    assert stats.text_tokens_generated == text_count
 
 
 def test_audio_text_interleaved_field_partitioning_reads_generated_row_fields():

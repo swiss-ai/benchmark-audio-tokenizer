@@ -28,6 +28,7 @@ from audio_tokenization.contracts.artifacts import (
     INTERLEAVE_CACHE_SCHEMA_VERSION,
     validate_v2_chunks_complete,
 )
+from audio_tokenization.contracts.token_spans import validate_int32_token_spans
 from audio_tokenization.utils.indexed_dataset.constants import MEGATRON_INDEX_HEADER
 from audio_tokenization.utils.indexed_dataset.indexed_dataset_megatron import (
     DType,
@@ -82,8 +83,13 @@ class _TokenRunView:
     def __len__(self):
         return self._length
 
+    @property
+    def lengths(self) -> np.ndarray:
+        """Token counts for this view without accessing payload pages."""
+        return self._accessor.lengths[self._start:self._start + self._length]
+
     def to_pylist(self) -> list[list[int]]:
-        return [self._accessor.get(self._start + i) for i in range(self._length)]
+        return [self._accessor.get(self._start + i).tolist() for i in range(self._length)]
 
 
 class _MemmapTokenAccessor:
@@ -91,7 +97,7 @@ class _MemmapTokenAccessor:
 
     def __init__(
         self,
-        mmaps: list[np.memmap],
+        mmaps: list[np.ndarray],
         chunk_indices: np.ndarray,
         starts: np.ndarray,
         lengths: np.ndarray,
@@ -101,11 +107,11 @@ class _MemmapTokenAccessor:
         self._starts = starts
         self._lengths = lengths
 
-    def get(self, idx: int) -> list[int]:
+    def get(self, idx: int) -> np.ndarray:
         chunk_idx = int(self._chunk_indices[idx])
         start = int(self._starts[idx])
         length = int(self._lengths[idx])
-        return self._mmaps[chunk_idx][start:start + length].tolist()
+        return self._mmaps[chunk_idx][start:start + length]
 
     def slice(self, start: int, length: int) -> _TokenRunView:
         return _TokenRunView(self, start, length)
@@ -172,7 +178,7 @@ class _V2InterleaveCacheReader:
 
     def load_metadata(self, *, include_text: bool = False) -> pl.DataFrame:
         parts: list[pl.DataFrame] = []
-        for chunk_idx, (clips_path, _audio_path, _text_path) in enumerate(self.chunks):
+        for chunk_idx, (clips_path, audio_path, text_path) in enumerate(self.chunks):
             part = _read_parquet_metadata(
                 clips_path,
                 required_columns=[
@@ -187,7 +193,16 @@ class _V2InterleaveCacheReader:
                     ["clip_id", "text", "speaker", "duration", "dataset"]
                     if include_text else None
                 ),
-            ).with_columns(
+            )
+            for kind, payload_path in (("audio", audio_path), ("text", text_path)):
+                validate_int32_token_spans(
+                    part[f"{kind}_token_offset"].to_numpy(),
+                    part[f"{kind}_token_length"].to_numpy(),
+                    payload_path.stat().st_size,
+                    allow_empty=True,
+                    context=f"Interleave {kind} tokens in {clips_path} ({payload_path})",
+                )
+            part = part.with_columns(
                 pl.lit(chunk_idx).alias("_chunk_idx"),
                 (pl.col("audio_token_offset") // np.dtype(np.int32).itemsize).cast(pl.Int64).alias("_audio_token_start"),
                 (pl.col("text_token_offset") // np.dtype(np.int32).itemsize).cast(pl.Int64).alias("_text_token_start"),
@@ -235,8 +250,15 @@ class _V2InterleaveCacheReader:
 
     def prepare(self, sorted_df: pl.DataFrame) -> PreparedInterleaveCache:
         self._ensure_fd_budget()
-        audio_mmaps = [np.memmap(audio_path, dtype=np.int32, mode="r") for _clips_path, audio_path, _text_path in self.chunks]
-        text_mmaps = [np.memmap(text_path, dtype=np.int32, mode="r") for _clips_path, _audio_path, text_path in self.chunks]
+        # NumPy cannot mmap an empty file; zero-length spans still form valid
+        # cache rows (in particular, a chunk can have no text tokens at all).
+        def open_payload(path: Path) -> np.ndarray:
+            if path.stat().st_size == 0:
+                return np.empty(0, dtype=np.int32)
+            return np.memmap(path, dtype=np.int32, mode="r")
+
+        audio_mmaps = [open_payload(audio_path) for _clips_path, audio_path, _text_path in self.chunks]
+        text_mmaps = [open_payload(text_path) for _clips_path, _audio_path, text_path in self.chunks]
 
         chunk_indices = sorted_df["_chunk_idx"].to_numpy()
         audio_starts = sorted_df["_audio_token_start"].to_numpy()

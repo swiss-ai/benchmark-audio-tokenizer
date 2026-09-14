@@ -456,3 +456,53 @@ def test_structured_cache_chunk_writer_resumes_per_partition_chunk_ids(tmp_path)
 
     assert done == {"language=de": 0, "language=fr": 3}
     assert writer.get_state() == {"language=de": 1, "language=fr": 4}
+
+
+@pytest.mark.parametrize("phase", ["add_rows", "finalize"])
+def test_structured_cache_cleanup_preserves_primary_failure(monkeypatch, tmp_path, caplog, phase):
+    """An unlink failure must not hide a write error or strand other partitions."""
+    writer = StructuredCacheChunkWriter(
+        str(tmp_path), rank=0, partitioning={"type": "field", "field": "source_id"},
+    )
+    rows = [{"clip_id": name, "source_id": name, "clip_num": 0, "clip_start": None,
+             "speaker": "", "duration": 1.0, "text": "", "dataset": "ds",
+             "audio_tokens": [1, 2], "text_tokens": [3]} for name in ["a", "b"]]
+    writer.add_rows(rows)
+    blocked = tmp_path / "source_id=a/rank_0000/audio_tokens.000000.bin.tmp"
+    unlink = Path.unlink
+
+    def fail_one_unlink(path, *args, **kwargs):
+        if path == blocked:
+            raise PermissionError("injected unlink failure")
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_one_unlink)
+    original_error = OSError("injected primary output failure")
+    partition = writer._partition_writers["source_id=a"]
+    if phase == "add_rows":
+        class BrokenFile:
+            def write(self, data):
+                raise original_error
+
+            def close(self):
+                pass
+
+        partition._audio_fh.close()
+        partition._audio_fh = BrokenFile()
+        operation = lambda: writer.add_rows(rows[:1])
+    else:
+        def fail_parquet(*args, **kwargs):
+            raise original_error
+
+        monkeypatch.setattr(pq, "write_table", fail_parquet)
+        operation = writer.finalize
+    with pytest.raises(OSError) as caught:
+        operation()
+    assert caught.value is original_error
+    assert "injected unlink failure" in caplog.text
+    # Continue cleaning every other temporary path, including the second partition.
+    assert set(tmp_path.rglob("*.tmp")) == {blocked}
+    assert not list(tmp_path.rglob("clips.*.parquet"))
+    assert all(not p._opened for p in writer._partition_writers.values())
+    with pytest.raises(RuntimeError, match="aborted"):
+        writer.add_rows(rows)

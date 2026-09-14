@@ -16,9 +16,9 @@ import json
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +26,13 @@ from audio_tokenization.config.schema import TokenizeSpec
 from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.utils.io import atomic_write_json, open_compressed
 
-from .data import _resolve_index_paths, resolve_shar_dirs
+from .data import _read_shar_index_fields, _validate_parallel_fields, resolve_shar_dirs
 
 
 SHAR_WORK_MANIFEST_FILE = "_shar_work_manifest.json"
 TOKENIZE_ASSIGNMENT_FILE = "_tokenize_assignment.json"
 PLANNING_SCHEMA_VERSION = 2
+SHAR_WORK_MANIFEST_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -294,10 +295,9 @@ class TokenizeAssignment:
 @dataclass
 class _Bin:
     rank: int
-    work_units: list[str]
+    work_units: list[SharWorkUnit]
     duration: float
     cut_count: int
-    fields: dict[str, list[str]]
 
 
 def build_shar_work_manifest(
@@ -329,21 +329,17 @@ def _build_shar_work_manifest_unfiltered(
     shar_dir: str | list[str],
     *,
     index_name: str,
+    resolved_dirs: list[str] | None = None,
+    validated_stats: Mapping[str, dict[str, Any]] | None = None,
 ) -> SharWorkManifest:
-    resolved_dirs = resolve_shar_dirs(shar_dir, index_name=index_name)
+    if resolved_dirs is None:
+        resolved_dirs = resolve_shar_dirs(shar_dir, index_name=index_name)
     planned_units: list[tuple[Path, int, dict[str, list[str]], Path]] = []
 
     for sd in resolved_dirs:
         shar_path = Path(sd)
         index_path = shar_path / index_name
-        if not index_path.is_file():
-            raise FileNotFoundError(f"SHAR index not found: {index_path}")
-        with open(index_path) as f:
-            fields = json.load(f).get("fields", {})
-        if "cuts" not in fields:
-            raise ValueError(f"Shar index missing required 'cuts' field: {index_path}")
-        resolved_fields = _resolve_index_paths(shar_path, fields)
-        _validate_parallel_fields(index_path, resolved_fields)
+        resolved_fields = _read_shar_index_fields(index_path)
 
         cut_paths = resolved_fields["cuts"]
         for shard_index, cut_path in enumerate(cut_paths):
@@ -353,9 +349,13 @@ def _build_shar_work_manifest_unfiltered(
             }
             planned_units.append((shar_path, shard_index, unit_fields, Path(cut_path)))
 
-    stats_by_unit = _scan_cut_manifests(
-        [cut_path for _shar_path, _shard_index, _unit_fields, cut_path in planned_units],
-    )
+    cut_paths = [cut_path for _root, _index, _fields, cut_path in planned_units]
+    if validated_stats is None:
+        stats_by_unit = _scan_cut_manifests(cut_paths)
+    else:
+        if len(validated_stats) != len(cut_paths) or set(validated_stats) != {str(path) for path in cut_paths}:
+            raise ValueError("Validated SHAR metadata does not cover every indexed cut shard")
+        stats_by_unit = [validated_stats[str(path)] for path in cut_paths]
     work_units = [
         SharWorkUnit(
             work_unit_id=_work_unit_id(shar_path, cut_path, shard_index),
@@ -379,24 +379,145 @@ def write_shar_work_manifest(
     shar_dir: str | list[str] | None = None,
     *,
     index_name: str = SHAR_INDEX_FILENAME,
+    validated_stats: Mapping[str, dict[str, Any]] | None = None,
+    manifest_filename: str = SHAR_WORK_MANIFEST_FILE,
 ) -> SharWorkManifest:
-    """Build and write the durable, filter-independent SHAR work manifest."""
+    """Build and write the durable, filter-independent SHAR work manifest.
+
+    Prepare may supply metadata from its structural pass in ``validated_stats``.
+    Exact indexed coverage is required, and file identities bind that evidence
+    for subsequent prepare completion checks without reading payloads again.
+    """
     output_dir = Path(output_dir)
-    manifest = build_shar_work_manifest(
+    manifest = _build_shar_work_manifest_unfiltered(
         str(output_dir) if shar_dir is None else shar_dir,
         index_name=index_name,
-        tokenize_filter=None,
+        validated_stats=validated_stats,
     )
-    atomic_write_json(output_dir / SHAR_WORK_MANIFEST_FILE, manifest.to_json())
+    payload = _durable_manifest_payload(manifest, output_dir)
+    if validated_stats is not None:
+        payload["validated_files"] = _shar_file_identities(manifest, output_dir)
+    atomic_write_json(output_dir / manifest_filename, payload)
     return manifest
 
 
-def read_shar_work_manifest(path: str | Path) -> SharWorkManifest:
-    """Read a durable SHAR work manifest from a file path or SHAR directory."""
+def read_shar_work_manifest(
+    path: str | Path, *, require_validation: bool = False,
+) -> SharWorkManifest:
+    """Read a relocatable durable manifest and validate its current indexes.
+
+    Schema 2 stored absolute paths and is intentionally not reused. The
+    automatic planner falls back to a metadata scan for that legacy format.
+    ``require_validation`` additionally checks prepare's file identities; copies
+    can reuse planning metadata, but require a fresh structural completion check.
+    """
     path = Path(path)
     manifest_path = path / SHAR_WORK_MANIFEST_FILE if path.is_dir() else path
     payload = json.loads(manifest_path.read_text())
-    return SharWorkManifest.from_json(payload)
+    if payload.get("schema_version") != SHAR_WORK_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported durable SHAR work manifest schema: {payload.get('schema_version')!r}. "
+            "Rebuild the manifest from the requested SHAR roots."
+        )
+    if payload.get("path_base") != "manifest":
+        raise ValueError("Durable SHAR manifest must use paths relative to its location")
+    base = manifest_path.parent.resolve()
+    roots = {
+        root: str(_relative_manifest_path(base, root))
+        for root in payload["input_shar_dirs"]
+    }
+    index_name = str(payload["shar_index_filename"])
+    for relative_root, root in roots.items():
+        digest = hashlib.sha256((Path(root) / index_name).read_bytes()).hexdigest()
+        if digest != payload["shar_index_sha256"].get(relative_root):
+            raise ValueError(f"SHAR index changed since work manifest was written: {root}")
+    units = []
+    for item in payload["work_units"]:
+        root = Path(roots[item["shar_dir"]])
+        fields = {
+            field: [str(_relative_manifest_path(root, path)) for path in paths]
+            for field, paths in item["fields"].items()
+        }
+        unit = SharWorkUnit.from_json({**item, "shar_dir": str(root), "fields": fields})
+        units.append(replace(
+            unit,
+            work_unit_id=_work_unit_id(root, Path(fields["cuts"][0]), unit.shard_index),
+        ))
+    manifest = SharWorkManifest(
+        input_shar_dirs=sorted(roots.values()),
+        shar_index_filename=index_name,
+        work_units=sorted(units, key=lambda unit: unit.work_unit_id),
+    )
+    _validate_manifest_indexes(manifest)
+    if require_validation and payload.get("validated_files") != _shar_file_identities(manifest, base):
+        raise ValueError("SHAR structural validation is missing or its files have changed")
+    return manifest
+
+
+def _shar_file_identities(manifest: SharWorkManifest, base: Path) -> dict[str, list[int]]:
+    """Bind structural evidence to local files; copies need fresh validation."""
+    identities = {}
+    for unit in manifest.work_units:
+        for paths in unit.fields.values():
+            for value in paths:
+                path = Path(value)
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError(f"SHAR validation requires a regular file: {path}")
+                st = path.stat()
+                identities[os.path.relpath(path, base.resolve())] = [
+                    st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                ]
+    return identities
+
+
+def _relative_manifest_path(base: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        raise ValueError(f"Absolute path in durable SHAR manifest: {value}")
+    return (base / path).resolve()
+
+
+def _durable_manifest_payload(manifest: SharWorkManifest, base: Path) -> dict[str, Any]:
+    """Keep launch snapshots absolute; make only durable dataset paths relative."""
+    roots = {root: os.path.relpath(root, base.resolve()) for root in manifest.input_shar_dirs}
+    payload = manifest.to_json()
+    payload.update(
+        schema_version=SHAR_WORK_MANIFEST_SCHEMA_VERSION,
+        path_base="manifest",
+        input_shar_dirs=[roots[root] for root in manifest.input_shar_dirs],
+        shar_index_sha256={
+            roots[root]: hashlib.sha256((Path(root) / manifest.shar_index_filename).read_bytes()).hexdigest()
+            for root in manifest.input_shar_dirs
+        },
+        work_units=[{
+            **unit.to_json(),
+            "shar_dir": roots[unit.shar_dir],
+            "fields": {
+                field: [os.path.relpath(path, unit.shar_dir) for path in paths]
+                for field, paths in unit.fields.items()
+            },
+        } for unit in manifest.work_units],
+    )
+    # Runtime fingerprints describe resolved launch inputs and change on
+    # relocation; they are recomputed on read, never trusted from disk.
+    payload.pop("fingerprint")
+    return payload
+
+
+def _validate_manifest_indexes(manifest: SharWorkManifest) -> None:
+    by_root: dict[str, dict[int, SharWorkUnit]] = {root: {} for root in manifest.input_shar_dirs}
+    for unit in manifest.work_units:
+        if unit.shar_dir not in by_root or unit.shard_index in by_root[unit.shar_dir]:
+            raise ValueError("Duplicate or undeclared SHAR work unit root/index")
+        by_root[unit.shar_dir][unit.shard_index] = unit
+    for root, units in by_root.items():
+        fields = _read_shar_index_fields(Path(root) / manifest.shar_index_filename)
+        if set(units) != set(range(len(fields["cuts"]))):
+            raise ValueError(f"SHAR manifest does not cover every indexed work unit in {root}")
+        for shard_index, unit in units.items():
+            expected = {field: [paths[shard_index]] for field, paths in fields.items()}
+            if unit.fields != expected:
+                raise ValueError(f"SHAR manifest field pairing differs from index in {root}")
 
 
 def load_or_build_shar_work_manifest(
@@ -413,18 +534,16 @@ def load_or_build_shar_work_manifest(
     rank assignment by default; assignment uses the durable unfiltered manifest
     durations, while filters still trigger fail-fast metadata coverage checks.
     """
-    raw_manifest = _load_existing_manifest(shar_dir, index_name=index_name)
+    resolved_dirs = resolve_shar_dirs(shar_dir, index_name=index_name)
+    raw_manifest = _load_existing_manifest(
+        shar_dir, index_name=index_name, resolved_dirs=resolved_dirs,
+    )
     source = "manifest"
     if raw_manifest is None:
-        return (
-            build_shar_work_manifest(
-                shar_dir,
-                index_name=index_name,
-                tokenize_filter=tokenize_filter,
-                require_interleave_ids=require_interleave_ids,
-            ),
-            "scan",
+        raw_manifest = _build_shar_work_manifest_unfiltered(
+            shar_dir, index_name=index_name, resolved_dirs=resolved_dirs,
         )
+        source = "scan"
 
     _assert_manifest_coverage(
         raw_manifest,
@@ -451,7 +570,7 @@ def build_tokenize_assignment(
 
     active_ranks = min(world_size, len(manifest.work_units))
     bins = [
-        _Bin(rank=rank, work_units=[], duration=0.0, cut_count=0, fields={})
+        _Bin(rank=rank, work_units=[], duration=0.0, cut_count=0)
         for rank in range(active_ranks)
     ]
 
@@ -463,22 +582,27 @@ def build_tokenize_assignment(
         if not bins:
             break
         target = min(bins, key=lambda b: (b.duration, b.cut_count, b.rank))
-        target.work_units.append(unit.work_unit_id)
+        target.work_units.append(unit)
         target.duration += unit.duration_sec
         target.cut_count += unit.cut_count
-        for field, paths in unit.fields.items():
-            target.fields.setdefault(field, []).extend(paths)
 
     assignments: list[RankAssignment] = []
     for rank in range(world_size):
         if rank < active_ranks:
             b = bins[rank]
-            fields = {field: sorted(paths) for field, paths in b.fields.items()}
+            # Preserve the prior lexical cuts order while sorting each whole
+            # unit exactly once; companion names need not sort the same way.
+            units = sorted(b.work_units, key=lambda unit: unit.fields["cuts"])
+            fields: dict[str, list[str]] = {}
+            for unit in units:
+                for field, paths in unit.fields.items():
+                    fields.setdefault(field, []).extend(paths)
+            _validate_parallel_fields(Path("tokenize assignment"), fields)
             assignments.append(
                 RankAssignment(
                     rank=rank,
                     active=bool(b.work_units),
-                    work_unit_ids=list(b.work_units),
+                    work_unit_ids=[unit.work_unit_id for unit in units],
                     fields=fields,
                     cut_count=int(b.cut_count),
                     duration_sec=float(b.duration),
@@ -527,67 +651,52 @@ def _load_existing_manifest(
     shar_dir: str | list[str],
     *,
     index_name: str,
+    resolved_dirs: list[str],
 ) -> SharWorkManifest | None:
-    """Best-effort durable manifest discovery.
+    """Reuse durable manifests only when their union covers every requested leaf.
 
-    Globs are intentionally not interpreted here because a glob can expand to
-    mixed old/new SHAR roots. The caller falls back to an explicit scan in that
-    case, which is safer than silently trusting a partial manifest set.
+    A parent-root artifact may describe several partitions. A missing, legacy,
+    stale, or partial artifact is only a lost optimization: the caller scans
+    all requested roots with the same already-resolved ownership boundary.
     """
-
-    raw_dirs = shar_dir if isinstance(shar_dir, list) else [shar_dir]
-    candidates: list[Path] = []
-    for item in raw_dirs:
-        item_str = str(item)
-        if any(ch in item_str for ch in "*?["):
-            logger.debug("Skipping durable manifest discovery: glob char in %r", item_str)
-            return None
-        candidate = Path(item_str) / SHAR_WORK_MANIFEST_FILE
-        if candidate.is_file():
-            candidates.append(candidate)
-
-    if not candidates:
-        logger.debug("No durable manifest found under %s; falling back to scan", raw_dirs)
-        return None
-
-    manifests = [read_shar_work_manifest(path) for path in candidates]
-    if len(manifests) == 1:
-        manifest = manifests[0]
-        if manifest.shar_index_filename != index_name:
-            logger.debug(
-                "Rejecting manifest %s: shar_index_filename=%r != requested %r",
-                candidates[0], manifest.shar_index_filename, index_name,
-            )
-            return None
-        return manifest
-
-    work_units: list[SharWorkUnit] = []
-    input_dirs: list[str] = []
-    for manifest, path in zip(manifests, candidates):
-        if manifest.shar_index_filename != index_name:
-            logger.debug(
-                "Rejecting partitioned manifest %s: shar_index_filename=%r != requested %r",
-                path, manifest.shar_index_filename, index_name,
-            )
-            return None
-        work_units.extend(manifest.work_units)
-        input_dirs.extend(manifest.input_shar_dirs)
-
-    return SharWorkManifest(
-        input_shar_dirs=sorted(dict.fromkeys(input_dirs)),
-        shar_index_filename=index_name,
-        work_units=sorted(work_units, key=lambda u: u.work_unit_id),
+    raw_dirs = shar_dir if isinstance(shar_dir, (list, tuple)) else [shar_dir]
+    candidate_roots = {Path(root) for root in resolved_dirs}
+    candidate_roots.update(
+        Path(item).resolve() for item in raw_dirs
+        if not any(ch in str(item) for ch in "*?[")
     )
+    requested = set(resolved_dirs)
+    covered: set[str] = set()
+    units: list[SharWorkUnit] = []
+    for root in sorted(candidate_roots):
+        path = root / SHAR_WORK_MANIFEST_FILE
+        if not path.is_file():
+            continue
+        try:
+            manifest = read_shar_work_manifest(path)
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+            logger.info("Ignoring unusable SHAR work manifest %s: %s", path, exc)
+            continue
+        roots = set(manifest.input_shar_dirs)
+        if manifest.shar_index_filename != index_name or not roots.issubset(requested):
+            logger.info("Ignoring SHAR work manifest outside requested roots/index: %s", path)
+            continue
+        if covered.intersection(roots):
+            continue
+        covered.update(roots)
+        units.extend(manifest.work_units)
 
-
-def _validate_parallel_fields(index_path: Path, fields: Mapping[str, list[str]]) -> None:
-    expected = len(fields["cuts"])
-    for field, paths in fields.items():
-        if len(paths) != expected:
-            raise ValueError(
-                f"SHAR index field {field!r} in {index_path} has {len(paths)} "
-                f"shards, expected {expected} to match 'cuts'."
-            )
+    if covered != requested:
+        logger.info(
+            "Durable SHAR manifests cover %s/%s requested roots; scanning all requested inputs",
+            len(covered), len(requested),
+        )
+        return None
+    return SharWorkManifest(
+        input_shar_dirs=resolved_dirs,
+        shar_index_filename=index_name,
+        work_units=sorted(units, key=lambda unit: unit.work_unit_id),
+    )
 
 
 def _assert_manifest_coverage(
@@ -650,6 +759,12 @@ def _scan_cut_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"Cut manifest shard not found: {path}")
 
+    with open_compressed(path, "rt") as source:
+        return _scan_cut_metadata(json.loads(line) for line in source if line.strip())
+
+
+def _scan_cut_metadata(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Collect planning statistics from rows already read by a caller."""
     cut_count = 0
     duration_sec = 0.0
     min_duration_sec: float | None = None
@@ -665,39 +780,35 @@ def _scan_cut_manifest(path: Path) -> dict[str, Any]:
     min_sample_rate: int | None = None
     max_sample_rate: int | None = None
 
-    with open_compressed(path, "rt") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            cut = json.loads(line)
-            cut_count += 1
-            duration = _optional_float(cut.get("duration")) or 0.0
-            duration_sec += duration
-            min_duration_sec = duration if min_duration_sec is None else min(min_duration_sec, duration)
-            max_duration_sec = duration if max_duration_sec is None else max(max_duration_sec, duration)
+    for cut in rows:
+        cut_count += 1
+        duration = _optional_float(cut.get("duration")) or 0.0
+        duration_sec += duration
+        min_duration_sec = duration if min_duration_sec is None else min(min_duration_sec, duration)
+        max_duration_sec = duration if max_duration_sec is None else max(max_duration_sec, duration)
 
-            sample_rate = _cut_sample_rate(cut)
-            if sample_rate is not None:
-                sample_rate_count += 1
-                min_sample_rate = sample_rate if min_sample_rate is None else min(min_sample_rate, sample_rate)
-                max_sample_rate = sample_rate if max_sample_rate is None else max(max_sample_rate, sample_rate)
+        sample_rate = _cut_sample_rate(cut)
+        if sample_rate is not None:
+            sample_rate_count += 1
+            min_sample_rate = sample_rate if min_sample_rate is None else min(min_sample_rate, sample_rate)
+            max_sample_rate = sample_rate if max_sample_rate is None else max(max_sample_rate, sample_rate)
 
-            rms_db = _cut_rms_db(cut)
-            if rms_db is not None:
-                rms_db_count += 1
-                min_rms_db = rms_db if min_rms_db is None else min(min_rms_db, rms_db)
-                max_rms_db = rms_db if max_rms_db is None else max(max_rms_db, rms_db)
+        rms_db = _cut_rms_db(cut)
+        if rms_db is not None:
+            rms_db_count += 1
+            min_rms_db = rms_db if min_rms_db is None else min(min_rms_db, rms_db)
+            max_rms_db = rms_db if max_rms_db is None else max(max_rms_db, rms_db)
 
-            interleave = _cut_interleave_metadata(cut)
-            if interleave is not None:
-                if interleave.get("source_id") is not None:
-                    source_id_count += 1
-                if interleave.get("clip_num") is not None:
-                    clip_num_count += 1
-                if interleave.get("clip_start") is not None:
-                    clip_start_count += 1
-                if interleave.get("clip_duration") is not None:
-                    clip_duration_count += 1
+        interleave = _cut_interleave_metadata(cut)
+        if interleave is not None:
+            if interleave.get("source_id") is not None:
+                source_id_count += 1
+            if interleave.get("clip_num") is not None:
+                clip_num_count += 1
+            if interleave.get("clip_start") is not None:
+                clip_start_count += 1
+            if interleave.get("clip_duration") is not None:
+                clip_duration_count += 1
 
     return {
         "cut_count": cut_count,

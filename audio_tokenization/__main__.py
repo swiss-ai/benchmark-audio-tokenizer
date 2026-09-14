@@ -25,7 +25,6 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from audio_tokenization.config import load_dataset_spec
-from audio_tokenization.stages import clean_stages, plan_stages, run_stages, status_stages
 
 
 logger = logging.getLogger(__name__)
@@ -47,11 +46,19 @@ def _compose_pipeline_cfg(overrides: list[str]):
 
 
 def _execute_command(command: Command, cfg) -> dict[str, Any]:
+    stage = None if OmegaConf.is_missing(cfg, "stage") else cfg.get("stage")
+    if command == "run" and stage == "convert":
+        from audio_tokenization.prepare.memory import disable_transparent_huge_pages
+
+        disable_transparent_huge_pages()
+
+    # Stage imports pull in Torch/NumPy; establish the conversion policy first.
+    from audio_tokenization.stages import clean_stages, plan_stages, run_stages, status_stages
+
     if int(os.environ.get("RANK", 0)) == 0:
         logger.info("Pipeline config:\n%s", OmegaConf.to_yaml(cfg))
 
     spec = load_dataset_spec(cfg.dataset)
-    stage = None if OmegaConf.is_missing(cfg, "stage") else cfg.get("stage")
     runtime = cfg.get("runtime") or {}
     overwrite = bool(runtime.get("overwrite", False))
 

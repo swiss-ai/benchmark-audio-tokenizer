@@ -1,0 +1,448 @@
+{
+  "source": "Frozen before tree, pipeline-simplification-implementation-20260914",
+  "source_sha256": {
+    "interleave/common.py": "68403d0b750101735d6c4ef7f293b166b028f38b743c418b6655b9bcc4643a50",
+    "interleave/shift_by_one.py": "f1f9ef6f901b54a499665185380f8ef314f2128a1b43b1d86063790d13f7d996",
+    "utils/indexed_dataset/indexed_dataset_megatron.py": "c29395cd26159c7ed9d1fd19605619d8c24bda91660d85554c269974b5ec4d82"
+  },
+  "cases": {
+    "int32:None:None": {
+      "run_lengths": [
+        4,
+        2,
+        1,
+        5,
+        1
+      ],
+      "converted": [],
+      "counters": {
+        "offset_0": {
+          "seqs": 4,
+          "tokens": 38
+        },
+        "offset_1": {
+          "seqs": 2,
+          "tokens": 15
+        },
+        "transcribe": {
+          "seqs": 5,
+          "tokens": 25
+        }
+      },
+      "dry_run_stats": "shift-by-one dry run\ntotal_seqs=11\ntotal_tokens=78\n",
+      "files": {
+        "shards/offset_0_shard0000.bin": "d77d84631d0321d53abd203ec5a96c3cbd972cf39cf8f902949e6e10b79ab6a4",
+        "shards/offset_0_shard0000_docidx.npy": "eed7c944a674e7e9a3f4baf8393c37b9f169123e13a884a08b151a39da2adef5",
+        "shards/offset_0_shard0000_seqlens.npy": "b7e59c27d79d27c34c0584924637ace15475cda9db3d29a8a7ea76ae4a2e873a",
+        "shards/offset_0_shard0001.bin": "24d9c726dea60d79f8918b92f749105a79b07d321abdcb6ba841bf23aa23a9e6",
+        "shards/offset_0_shard0001_docidx.npy": "eed7c944a674e7e9a3f4baf8393c37b9f169123e13a884a08b151a39da2adef5",
+        "shards/offset_0_shard0001_seqlens.npy": "efd7dcf8d561d8b8635469450c8199a302eeb1e3cdeabe2edf7709ee745cb30d",
+        "shards/offset_1_shard0000.bin": "5d98b5fedda655b898870a4026f0dc29d11dc3580bd8375229e82a5b61345711",
+        "shards/offset_1_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/offset_1_shard0000_seqlens.npy": "f997bd9efd93713d25a947fcf137dd85e3c80a4f11ccff2cbc630c92ad81e56f",
+        "shards/offset_1_shard0001.bin": "a0264d7852b8c02988e6b5e1af88afc227c2ed81b54e60bf0274b5c0e19b79d1",
+        "shards/offset_1_shard0001_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/offset_1_shard0001_seqlens.npy": "159cfc9b54c7a79fa0cc3f801eb27933f3d277af68a3e7f673bb16a699b4dced",
+        "shards/transcribe_shard0000.bin": "569e6dfcb7213f3deaf643bca65a44aa325fec1ce869d917fe504d1e9204d75c",
+        "shards/transcribe_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/transcribe_shard0000_seqlens.npy": "f997bd9efd93713d25a947fcf137dd85e3c80a4f11ccff2cbc630c92ad81e56f",
+        "shards/transcribe_shard0001.bin": "65c9ae23d4f2c959d0ba2e0889daa064d29f1704d2bea81e3487f678fc33fec6",
+        "shards/transcribe_shard0001_docidx.npy": "e24087dfc0efa40c8b280f8839dbdac487c5be2456ee63b23a284df057d01a6e",
+        "shards/transcribe_shard0001_seqlens.npy": "976f91eda5e6654192a9b17fb4ce945fcacd0f5c4b00fc71d81fea5ad5cad6ad",
+        "output/offset_0.bin": "00f03ffc8603a1478d1c52bb215a82620c5b9a2c63bed6306dff74b04165c96f",
+        "output/offset_0.idx": "878da58b555c402c6acbe1583ebe5a55c175cedbf629b7639347434ac340c90e",
+        "output/offset_1.bin": "f36de430af0bf5480b46be5ee77413ad3eb4ebe2acd2f584a769a4f39c45be72",
+        "output/offset_1.idx": "4e2978d118e513f92ffa4097cdf4562421e3dc5f6a5fb00bcd15fa56ad0f3c47",
+        "output/transcribe.bin": "8c2a2e558768e1a05f830f410a1c00228a8c438cff6cdff554e77fc378a20284",
+        "output/transcribe.idx": "e8cb43bbd5d4cd1d6b0ac3cd119dc77f5baeceac025a00686274d103fcbda157"
+      }
+    },
+    "int32:9:None": {
+      "run_lengths": [
+        4,
+        2,
+        1,
+        5,
+        1
+      ],
+      "converted": [],
+      "counters": {
+        "stage2/offset_0": {
+          "seqs": 3,
+          "tokens": 18
+        },
+        "stage2/offset_1": {
+          "seqs": 1,
+          "tokens": 5
+        },
+        "stage2/transcribe": {
+          "seqs": 5,
+          "tokens": 25
+        },
+        "lct/offset_0": {
+          "seqs": 1,
+          "tokens": 20
+        },
+        "lct/offset_1": {
+          "seqs": 1,
+          "tokens": 10
+        },
+        "lct/transcribe": {
+          "seqs": 0,
+          "tokens": 0
+        }
+      },
+      "dry_run_stats": "shift-by-one dry run\ntotal_seqs=11\ntotal_tokens=78\n",
+      "files": {
+        "shards/lct_offset_0_shard0000.bin": "bfc3a5dbf0f46e6aa4aa74d30f3f610dd39e319933cb6409b495c7b2a82cc802",
+        "shards/lct_offset_0_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/lct_offset_0_shard0000_seqlens.npy": "ff7da8184e56451b4c7f2289dae8cae6c0e5f8518af1b4b05ae2d0cef949d628",
+        "shards/lct_offset_0_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_0_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_0_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_1_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_1_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_1_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_1_shard0001.bin": "a0264d7852b8c02988e6b5e1af88afc227c2ed81b54e60bf0274b5c0e19b79d1",
+        "shards/lct_offset_1_shard0001_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/lct_offset_1_shard0001_seqlens.npy": "159cfc9b54c7a79fa0cc3f801eb27933f3d277af68a3e7f673bb16a699b4dced",
+        "shards/lct_transcribe_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_transcribe_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_transcribe_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_transcribe_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_transcribe_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_transcribe_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_0_shard0000.bin": "3a167dd4096c856efc117168514a730e53d8da699f827e1e05f46e9aef7fd040",
+        "shards/stage2_offset_0_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/stage2_offset_0_shard0000_seqlens.npy": "a13ce523b4b3f6820d0774c508f6eb167d7e6017b46730ef0a122c746b55db2e",
+        "shards/stage2_offset_0_shard0001.bin": "24d9c726dea60d79f8918b92f749105a79b07d321abdcb6ba841bf23aa23a9e6",
+        "shards/stage2_offset_0_shard0001_docidx.npy": "eed7c944a674e7e9a3f4baf8393c37b9f169123e13a884a08b151a39da2adef5",
+        "shards/stage2_offset_0_shard0001_seqlens.npy": "efd7dcf8d561d8b8635469450c8199a302eeb1e3cdeabe2edf7709ee745cb30d",
+        "shards/stage2_offset_1_shard0000.bin": "5d98b5fedda655b898870a4026f0dc29d11dc3580bd8375229e82a5b61345711",
+        "shards/stage2_offset_1_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/stage2_offset_1_shard0000_seqlens.npy": "f997bd9efd93713d25a947fcf137dd85e3c80a4f11ccff2cbc630c92ad81e56f",
+        "shards/stage2_offset_1_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_1_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_1_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_transcribe_shard0000.bin": "569e6dfcb7213f3deaf643bca65a44aa325fec1ce869d917fe504d1e9204d75c",
+        "shards/stage2_transcribe_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/stage2_transcribe_shard0000_seqlens.npy": "f997bd9efd93713d25a947fcf137dd85e3c80a4f11ccff2cbc630c92ad81e56f",
+        "shards/stage2_transcribe_shard0001.bin": "65c9ae23d4f2c959d0ba2e0889daa064d29f1704d2bea81e3487f678fc33fec6",
+        "shards/stage2_transcribe_shard0001_docidx.npy": "e24087dfc0efa40c8b280f8839dbdac487c5be2456ee63b23a284df057d01a6e",
+        "shards/stage2_transcribe_shard0001_seqlens.npy": "976f91eda5e6654192a9b17fb4ce945fcacd0f5c4b00fc71d81fea5ad5cad6ad",
+        "output/lct/offset_0.bin": "bfc3a5dbf0f46e6aa4aa74d30f3f610dd39e319933cb6409b495c7b2a82cc802",
+        "output/lct/offset_0.idx": "b1539d66f849b6617d533957857a631d3c3fb50c6729139438ef62b49b0fbffd",
+        "output/lct/offset_1.bin": "a0264d7852b8c02988e6b5e1af88afc227c2ed81b54e60bf0274b5c0e19b79d1",
+        "output/lct/offset_1.idx": "a191618d15ccf1a1a3c3daada797e0f9c2ca8996541b4d76fb880b9aa5b7eaad",
+        "output/stage2/offset_0.bin": "3d36ce54c87309697d8704a5fbaf3786c27083af88047208a93b053f4306d90a",
+        "output/stage2/offset_0.idx": "4ed7166d2cd0525e37f3b688fdfd1b7ece101edf68d7168ffee7866204362603",
+        "output/stage2/offset_1.bin": "5d98b5fedda655b898870a4026f0dc29d11dc3580bd8375229e82a5b61345711",
+        "output/stage2/offset_1.idx": "82598d4568e9de7159ea160f88424046a209dd891e5d5dbb5b5903ddfb5f9e12",
+        "output/stage2/transcribe.bin": "8c2a2e558768e1a05f830f410a1c00228a8c438cff6cdff554e77fc378a20284",
+        "output/stage2/transcribe.idx": "e8cb43bbd5d4cd1d6b0ac3cd119dc77f5baeceac025a00686274d103fcbda157"
+      }
+    },
+    "int32:9:0.8": {
+      "run_lengths": [
+        4,
+        2,
+        1,
+        5,
+        1
+      ],
+      "converted": [
+        0,
+        1,
+        3
+      ],
+      "counters": {
+        "stage2/offset_0": {
+          "seqs": 0,
+          "tokens": 0
+        },
+        "stage2/offset_1": {
+          "seqs": 0,
+          "tokens": 0
+        },
+        "stage2/transcribe": {
+          "seqs": 12,
+          "tokens": 59
+        },
+        "lct/offset_0": {
+          "seqs": 0,
+          "tokens": 0
+        },
+        "lct/offset_1": {
+          "seqs": 0,
+          "tokens": 0
+        },
+        "lct/transcribe": {
+          "seqs": 1,
+          "tokens": 19
+        }
+      },
+      "dry_run_stats": "shift-by-one dry run\ntotal_seqs=13\ntotal_tokens=78\n",
+      "files": {
+        "shards/lct_offset_0_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_0_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_0_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_0_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_0_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_0_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_1_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_1_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_1_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_1_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_1_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_1_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_transcribe_shard0000.bin": "9ea6d9829bb4897c1b6f58a7c648d6bf4fb649ca7468308677fca6f46246dbbf",
+        "shards/lct_transcribe_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/lct_transcribe_shard0000_seqlens.npy": "14c5e7ad6270a93d81737891c1de9097a74833561019d1582715bb439864e12a",
+        "shards/lct_transcribe_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_transcribe_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_transcribe_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_0_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_0_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_0_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_0_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_0_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_0_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_1_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_1_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_1_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_1_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_1_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_1_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_transcribe_shard0000.bin": "8031aad5bd72b9af4a7f48f197f0c522c3a65afcfd8d5d168ee24eb0cdc56017",
+        "shards/stage2_transcribe_shard0000_docidx.npy": "dc5de563b86c3210ee39b3adc9c39934ef72b87a5c20f475ccc78e336ea75a7e",
+        "shards/stage2_transcribe_shard0000_seqlens.npy": "2703c829af717f4eb5a8781c67fc4a9d154df8dc599fb0144ec88417f7c5b904",
+        "shards/stage2_transcribe_shard0001.bin": "ba2af125cb283ab68985d29ee8ae167e39c3c9255128329577f6b2448d27c92d",
+        "shards/stage2_transcribe_shard0001_docidx.npy": "f314ddddf18999d4890f4fec8bb6539fc62b6f41861fa85e1c04c98a03097dda",
+        "shards/stage2_transcribe_shard0001_seqlens.npy": "743ee50b8810c6053651b30f51799bd6548513d376c5f6f6f76dfc492870c344",
+        "output/lct/transcribe.bin": "9ea6d9829bb4897c1b6f58a7c648d6bf4fb649ca7468308677fca6f46246dbbf",
+        "output/lct/transcribe.idx": "db2c83540bd10e3edf93aed6f2d26e91e9a7ad0f9430f0a0ac252a3b612a1984",
+        "output/stage2/transcribe.bin": "0bb53d58bc1b2387d2fee10adcc24d95670c98dfb80961dc1ed64903612ddb73",
+        "output/stage2/transcribe.idx": "511b8e39ae7b2a36806983fef6c4b317316415649a258548d0ac6dda1e35efcf"
+      }
+    },
+    "uint16:None:None": {
+      "run_lengths": [
+        4,
+        2,
+        1,
+        5,
+        1
+      ],
+      "converted": [],
+      "counters": {
+        "offset_0": {
+          "seqs": 4,
+          "tokens": 38
+        },
+        "offset_1": {
+          "seqs": 2,
+          "tokens": 15
+        },
+        "transcribe": {
+          "seqs": 5,
+          "tokens": 25
+        }
+      },
+      "dry_run_stats": "shift-by-one dry run\ntotal_seqs=11\ntotal_tokens=78\n",
+      "files": {
+        "shards/offset_0_shard0000.bin": "3f241286bd794181b3e88cc2391f6a18ccef80281a7ae58429cb4bf0677f05b9",
+        "shards/offset_0_shard0000_docidx.npy": "eed7c944a674e7e9a3f4baf8393c37b9f169123e13a884a08b151a39da2adef5",
+        "shards/offset_0_shard0000_seqlens.npy": "b7e59c27d79d27c34c0584924637ace15475cda9db3d29a8a7ea76ae4a2e873a",
+        "shards/offset_0_shard0001.bin": "38bb1a6b993e84591304518b544f20528772a543dd0f408725cfb683fcf0d55f",
+        "shards/offset_0_shard0001_docidx.npy": "eed7c944a674e7e9a3f4baf8393c37b9f169123e13a884a08b151a39da2adef5",
+        "shards/offset_0_shard0001_seqlens.npy": "efd7dcf8d561d8b8635469450c8199a302eeb1e3cdeabe2edf7709ee745cb30d",
+        "shards/offset_1_shard0000.bin": "78ac2838ef64e7dc2eaba201a2e1e1f9a92a1fd4242a03b271138545602e23c6",
+        "shards/offset_1_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/offset_1_shard0000_seqlens.npy": "f997bd9efd93713d25a947fcf137dd85e3c80a4f11ccff2cbc630c92ad81e56f",
+        "shards/offset_1_shard0001.bin": "7eab2e7127f5946df7fc4fb0861f8f1916dd175d9918643dc424676a92132f12",
+        "shards/offset_1_shard0001_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/offset_1_shard0001_seqlens.npy": "159cfc9b54c7a79fa0cc3f801eb27933f3d277af68a3e7f673bb16a699b4dced",
+        "shards/transcribe_shard0000.bin": "96cf2a92263dbfe111d465b75ae7d2045edf69d60da82d8918058a02b35d6032",
+        "shards/transcribe_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/transcribe_shard0000_seqlens.npy": "f997bd9efd93713d25a947fcf137dd85e3c80a4f11ccff2cbc630c92ad81e56f",
+        "shards/transcribe_shard0001.bin": "8cec8aaba544df26065f1fea666b0a0113dadcf7d2ff23063daaabedf2253d5e",
+        "shards/transcribe_shard0001_docidx.npy": "e24087dfc0efa40c8b280f8839dbdac487c5be2456ee63b23a284df057d01a6e",
+        "shards/transcribe_shard0001_seqlens.npy": "976f91eda5e6654192a9b17fb4ce945fcacd0f5c4b00fc71d81fea5ad5cad6ad",
+        "output/offset_0.bin": "a2ee01100e735055b15e6a11b346261c36ec791c5f196a74e1bbf5bd4a523404",
+        "output/offset_0.idx": "5619a22b899e568c99e5e103be32aaa22db1189123f1c8b3062a77809b1c369e",
+        "output/offset_1.bin": "a7ff5b68a68bf2f376c9595f668e74b16cc9192c5a6558ef7f73237eae693ff7",
+        "output/offset_1.idx": "48a507ac24c57cfd21577c913ca1658d8dfb197694682994b7bf84550a9ba3bc",
+        "output/transcribe.bin": "672d262be22b55da50e3e9fef8ad7f72e5d0389a1cde7849167269496e1fba50",
+        "output/transcribe.idx": "804ef2a22dda37a7ca880dcb133367d9c25b1f1248503ce0101b9d65122588a9"
+      }
+    },
+    "uint16:9:None": {
+      "run_lengths": [
+        4,
+        2,
+        1,
+        5,
+        1
+      ],
+      "converted": [],
+      "counters": {
+        "stage2/offset_0": {
+          "seqs": 3,
+          "tokens": 18
+        },
+        "stage2/offset_1": {
+          "seqs": 1,
+          "tokens": 5
+        },
+        "stage2/transcribe": {
+          "seqs": 5,
+          "tokens": 25
+        },
+        "lct/offset_0": {
+          "seqs": 1,
+          "tokens": 20
+        },
+        "lct/offset_1": {
+          "seqs": 1,
+          "tokens": 10
+        },
+        "lct/transcribe": {
+          "seqs": 0,
+          "tokens": 0
+        }
+      },
+      "dry_run_stats": "shift-by-one dry run\ntotal_seqs=11\ntotal_tokens=78\n",
+      "files": {
+        "shards/lct_offset_0_shard0000.bin": "5a01b2899ab8201b6e21ceea173356275f98c285697b4e352f287e57f9019a13",
+        "shards/lct_offset_0_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/lct_offset_0_shard0000_seqlens.npy": "ff7da8184e56451b4c7f2289dae8cae6c0e5f8518af1b4b05ae2d0cef949d628",
+        "shards/lct_offset_0_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_0_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_0_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_1_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_1_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_1_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_1_shard0001.bin": "7eab2e7127f5946df7fc4fb0861f8f1916dd175d9918643dc424676a92132f12",
+        "shards/lct_offset_1_shard0001_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/lct_offset_1_shard0001_seqlens.npy": "159cfc9b54c7a79fa0cc3f801eb27933f3d277af68a3e7f673bb16a699b4dced",
+        "shards/lct_transcribe_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_transcribe_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_transcribe_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_transcribe_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_transcribe_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_transcribe_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_0_shard0000.bin": "81e43eec9090cea78c769ed2062816b3b348f568d112907139f0c58fe9484db3",
+        "shards/stage2_offset_0_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/stage2_offset_0_shard0000_seqlens.npy": "a13ce523b4b3f6820d0774c508f6eb167d7e6017b46730ef0a122c746b55db2e",
+        "shards/stage2_offset_0_shard0001.bin": "38bb1a6b993e84591304518b544f20528772a543dd0f408725cfb683fcf0d55f",
+        "shards/stage2_offset_0_shard0001_docidx.npy": "eed7c944a674e7e9a3f4baf8393c37b9f169123e13a884a08b151a39da2adef5",
+        "shards/stage2_offset_0_shard0001_seqlens.npy": "efd7dcf8d561d8b8635469450c8199a302eeb1e3cdeabe2edf7709ee745cb30d",
+        "shards/stage2_offset_1_shard0000.bin": "78ac2838ef64e7dc2eaba201a2e1e1f9a92a1fd4242a03b271138545602e23c6",
+        "shards/stage2_offset_1_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/stage2_offset_1_shard0000_seqlens.npy": "f997bd9efd93713d25a947fcf137dd85e3c80a4f11ccff2cbc630c92ad81e56f",
+        "shards/stage2_offset_1_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_1_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_1_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_transcribe_shard0000.bin": "96cf2a92263dbfe111d465b75ae7d2045edf69d60da82d8918058a02b35d6032",
+        "shards/stage2_transcribe_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/stage2_transcribe_shard0000_seqlens.npy": "f997bd9efd93713d25a947fcf137dd85e3c80a4f11ccff2cbc630c92ad81e56f",
+        "shards/stage2_transcribe_shard0001.bin": "8cec8aaba544df26065f1fea666b0a0113dadcf7d2ff23063daaabedf2253d5e",
+        "shards/stage2_transcribe_shard0001_docidx.npy": "e24087dfc0efa40c8b280f8839dbdac487c5be2456ee63b23a284df057d01a6e",
+        "shards/stage2_transcribe_shard0001_seqlens.npy": "976f91eda5e6654192a9b17fb4ce945fcacd0f5c4b00fc71d81fea5ad5cad6ad",
+        "output/lct/offset_0.bin": "5a01b2899ab8201b6e21ceea173356275f98c285697b4e352f287e57f9019a13",
+        "output/lct/offset_0.idx": "28a065a047bd35f5415210c95b062b358fe9e9d00948c987a657d881d0a84c41",
+        "output/lct/offset_1.bin": "7eab2e7127f5946df7fc4fb0861f8f1916dd175d9918643dc424676a92132f12",
+        "output/lct/offset_1.idx": "6435728368dbc382ad6b823fbecd291d884e55844a8460a1ffa663f1b16b026e",
+        "output/stage2/offset_0.bin": "f4785d2e20dc25c44e6c4c1913dc29acba13fed5782e35cd4d8f995f1e299be0",
+        "output/stage2/offset_0.idx": "494295329d35e1e09dcb526b9bf9ea9f701ce2a19f6a0051942f995fe00faab1",
+        "output/stage2/offset_1.bin": "78ac2838ef64e7dc2eaba201a2e1e1f9a92a1fd4242a03b271138545602e23c6",
+        "output/stage2/offset_1.idx": "dd44ec13f01ae49f9a77c81b1e9289bbf553d763ab3b5cfc9ab5babcaa5995aa",
+        "output/stage2/transcribe.bin": "672d262be22b55da50e3e9fef8ad7f72e5d0389a1cde7849167269496e1fba50",
+        "output/stage2/transcribe.idx": "804ef2a22dda37a7ca880dcb133367d9c25b1f1248503ce0101b9d65122588a9"
+      }
+    },
+    "uint16:9:0.8": {
+      "run_lengths": [
+        4,
+        2,
+        1,
+        5,
+        1
+      ],
+      "converted": [
+        0,
+        1,
+        3
+      ],
+      "counters": {
+        "stage2/offset_0": {
+          "seqs": 0,
+          "tokens": 0
+        },
+        "stage2/offset_1": {
+          "seqs": 0,
+          "tokens": 0
+        },
+        "stage2/transcribe": {
+          "seqs": 12,
+          "tokens": 59
+        },
+        "lct/offset_0": {
+          "seqs": 0,
+          "tokens": 0
+        },
+        "lct/offset_1": {
+          "seqs": 0,
+          "tokens": 0
+        },
+        "lct/transcribe": {
+          "seqs": 1,
+          "tokens": 19
+        }
+      },
+      "dry_run_stats": "shift-by-one dry run\ntotal_seqs=13\ntotal_tokens=78\n",
+      "files": {
+        "shards/lct_offset_0_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_0_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_0_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_0_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_0_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_0_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_1_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_1_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_1_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_offset_1_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_offset_1_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_offset_1_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/lct_transcribe_shard0000.bin": "9faff7317cddc792ff0f029835e3c6c7582c03db286b69e9597ce8e8cf2a3b7e",
+        "shards/lct_transcribe_shard0000_docidx.npy": "edf57b3e7cc4d837db7a3b400e84ffa2cc07b6adc347edef9feabbc11c5183cb",
+        "shards/lct_transcribe_shard0000_seqlens.npy": "14c5e7ad6270a93d81737891c1de9097a74833561019d1582715bb439864e12a",
+        "shards/lct_transcribe_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/lct_transcribe_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/lct_transcribe_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_0_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_0_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_0_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_0_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_0_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_0_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_1_shard0000.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_1_shard0000_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_1_shard0000_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_offset_1_shard0001.bin": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "shards/stage2_offset_1_shard0001_docidx.npy": "f6df0000bed676f0a4b777e2a1d915b6608dab452e11737f82c685cebf0e8ba7",
+        "shards/stage2_offset_1_shard0001_seqlens.npy": "040ce28f7590a34af85fbdb8115c90c9a0529a73b047533889c859c2f2c6e627",
+        "shards/stage2_transcribe_shard0000.bin": "4a7675c183647358016eb1deac81ca67aa433d9f976f415da29d35a4e04372c8",
+        "shards/stage2_transcribe_shard0000_docidx.npy": "dc5de563b86c3210ee39b3adc9c39934ef72b87a5c20f475ccc78e336ea75a7e",
+        "shards/stage2_transcribe_shard0000_seqlens.npy": "2703c829af717f4eb5a8781c67fc4a9d154df8dc599fb0144ec88417f7c5b904",
+        "shards/stage2_transcribe_shard0001.bin": "e41da3f2158decd9435cd727c39cb7f999b2cbc4213936a789f6364afbb937e2",
+        "shards/stage2_transcribe_shard0001_docidx.npy": "f314ddddf18999d4890f4fec8bb6539fc62b6f41861fa85e1c04c98a03097dda",
+        "shards/stage2_transcribe_shard0001_seqlens.npy": "743ee50b8810c6053651b30f51799bd6548513d376c5f6f6f76dfc492870c344",
+        "output/lct/transcribe.bin": "9faff7317cddc792ff0f029835e3c6c7582c03db286b69e9597ce8e8cf2a3b7e",
+        "output/lct/transcribe.idx": "05bca3aab789b872979e035f4b30b13ded101dc36242a29ba59d14e92740c9c7",
+        "output/stage2/transcribe.bin": "83d0eb06332b1a1acc39fc9b31a35bfad6282093f03516bf6c7b58417a3a12ba",
+        "output/stage2/transcribe.idx": "2aaac6ed487eb2318a6e6a4b06e4b5357657554c660a01160c8641bf7a7e3b0b"
+      }
+    }
+  }
+}

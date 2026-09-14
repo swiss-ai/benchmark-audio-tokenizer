@@ -81,7 +81,7 @@ class WavTokenizerAudioText(WavTokenizerAudioOnly):
         sample_rate: int,
         orig_audio_samples: Optional[list] = None,
         pad_audio_samples: Optional[int] = None,
-    ) -> list:
+    ) -> list[np.ndarray]:
         """Tokenize a batch and return per-clip tokens without BOS/EOS.
 
         Reuses ``tokenize_batch()`` which produces::
@@ -93,7 +93,8 @@ class WavTokenizerAudioText(WavTokenizerAudioOnly):
             [audio_start, offset_tokens..., audio_end]
 
         Returns:
-            List of ``list[int]``, one per clip.
+            List of one-dimensional NumPy arrays, one per clip. These views
+            share the batched CPU storage and keep it alive while referenced.
         """
         token_tensors = self.tokenize_batch(
             audios,
@@ -107,4 +108,4 @@ class WavTokenizerAudioText(WavTokenizerAudioOnly):
             return []
         lengths = [t.shape[0] for t in stripped]
         all_cpu = torch.cat(stripped).cpu()
-        return [chunk.tolist() for chunk in all_cpu.split(lengths)]
+        return [chunk.numpy() for chunk in all_cpu.split(lengths)]

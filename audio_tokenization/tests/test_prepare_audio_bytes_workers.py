@@ -1,5 +1,6 @@
 import sys
 import types
+from pathlib import Path
 
 import pytest
 from audio_tokenization.prepare.columnar import (
@@ -50,6 +51,10 @@ class _FakeArrowBatch:
     def __init__(self, rows):
         self._rows = rows
         self.num_rows = len(rows)
+        self.schema = types.SimpleNamespace(names=list(rows[0]) if rows else [])
+
+    def select(self, names):
+        return _FakeArrowBatch([{name: row[name] for name in names} for row in self._rows])
 
     def to_pylist(self):
         return list(self._rows)
@@ -66,6 +71,12 @@ class _FakeArrowBatch:
 
 
 class _FakeArrowReader:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
     def __init__(self, table):
         self._table = table
 
@@ -74,6 +85,12 @@ class _FakeArrowReader:
 
 
 class _FakeParquetFile:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
     def __init__(self, rows):
         self._rows = rows
         self.schema_arrow = types.SimpleNamespace(names=list(rows[0].keys()) if rows else [])
@@ -370,7 +387,7 @@ def test_prepare_hf_worker_accepts_hf_audio_bytes_selector(monkeypatch, tmp_path
     assert written_cuts[0].supervisions[0].text == "hello from nested hf"
 
 
-def test_prepare_hf_worker_requests_atomic_shar_commit(monkeypatch, tmp_path):
+def test_prepare_hf_worker_writes_in_private_partition(monkeypatch, tmp_path):
     written_cuts = []
     writer_kwargs = []
     helper_calls = []
@@ -390,14 +407,14 @@ def test_prepare_hf_worker_requests_atomic_shar_commit(monkeypatch, tmp_path):
     result = prepare_hf_to_shar._convert_worker(_hf_worker_args(tmp_path))
 
     assert result["written"] == 1
-    assert writer_kwargs == [
-        {
-            "output_dir": str(tmp_path / "shar" / "worker_00"),
-            "fields": {"recording": "flac"},
-            "shard_size": 100,
-            "commit": "atomic",
-        }
-    ]
+    assert len(writer_kwargs) == 1
+    writer_options = dict(writer_kwargs[0])
+    staged_dir = Path(writer_options.pop("output_dir"))
+    assert staged_dir.parent == tmp_path / "shar"
+    assert staged_dir != tmp_path / "shar" / "worker_00"
+    assert not staged_dir.exists()
+    assert (tmp_path / "shar" / "worker_00").is_dir()
+    assert writer_options == {"fields": {"recording": "flac"}, "shard_size": 100}
 
 
 def test_prepare_hf_worker_parser_uses_row_ids_not_row_index_as_chunks(monkeypatch, tmp_path):

@@ -15,6 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from audio_tokenization.contracts.artifacts import next_chunk_id, prune_orphan_bin_files
+from audio_tokenization.contracts.token_spans import validate_int32_token_spans
 from audio_tokenization.utils.io import atomic_replace_files, atomic_write_json, fsync_file
 
 
@@ -267,6 +268,28 @@ class AudioTokenCacheWriter:
     def get_state(self) -> int:
         return self.chunk_id
 
+    def abort(self) -> None:
+        """Discard the open chunk while preserving previously committed chunks."""
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        finally:
+            self._fh = None
+            for path in (self._token_tmp_path, self._index_tmp_path):
+                if path is not None:
+                    path.unlink(missing_ok=True)
+            if self._index_final_path is not None and not self._index_final_path.exists():
+                if self._token_final_path is not None:
+                    self._token_final_path.unlink(missing_ok=True)
+            self._rows = []
+            self._seen_audio_ids.clear()
+            self._token_offset = 0
+            self._opened = False
+            self._token_tmp_path = None
+            self._index_tmp_path = None
+            self._token_final_path = None
+            self._index_final_path = None
+
     def _open(self) -> None:
         stem = f"{self.chunk_id:06d}"
         self._token_tmp_path = self.rank_dir / f"audio_tokens.{stem}.bin.tmp"
@@ -284,8 +307,17 @@ def load_audio_token_cache(cache_dir: str | Path) -> AudioTokenCache:
         raise FileNotFoundError(f"No audio token cache index files found under {root}")
 
     spans: dict[str, AudioTokenSpan] = {}
+    file_sizes: dict[str, int] = {}
     for index_path in index_paths:
-        table = pq.read_table(index_path, schema=_INDEX_SCHEMA)
+        table = pq.read_table(index_path, columns=_INDEX_SCHEMA.names)
+        # Check the physical types before Arrow can coerce floats, booleans,
+        # unsigned integers, or strings into apparently valid signed spans.
+        for column in ("token_offset", "token_count"):
+            if not pa.types.is_signed_integer(table.schema.field(column).type):
+                raise ValueError(
+                    f"Audio token cache index {index_path}: {column} must be a signed integer column"
+                )
+        table = table.cast(_INDEX_SCHEMA)
         if table.num_rows == 0:
             continue
 
@@ -299,24 +331,23 @@ def load_audio_token_cache(cache_dir: str | Path) -> AudioTokenCache:
         if duplicate is not None:
             raise ValueError(f"Duplicate audio_id in audio token cache: {duplicate!r}")
 
-        for token_file, required_bytes in sorted(
-            _required_token_file_sizes(
-                token_files=token_files,
-                token_offsets=token_offsets,
-                token_counts=token_counts,
-            ).items()
-        ):
+        for token_file in dict.fromkeys(map(str, token_files)):
+            if token_file in file_sizes:
+                continue
             token_path = root / token_file
             if not token_path.is_file():
                 raise FileNotFoundError(
                     f"Audio token cache index {index_path} points to missing token file {token_path}"
                 )
-            actual_bytes = token_path.stat().st_size
-            if actual_bytes < required_bytes:
-                raise ValueError(
-                    f"Audio token cache file {token_path} is shorter than its "
-                    f"audio-token index requires: {actual_bytes} < {required_bytes} bytes"
-                )
+            file_sizes[token_file] = token_path.stat().st_size
+
+        validate_int32_token_spans(
+            token_offsets,
+            token_counts,
+            np.fromiter((file_sizes[str(path)] for path in token_files), dtype=np.int64),
+            allow_empty=False,
+            context=f"Audio token cache index {index_path}",
+        )
 
         spans.update(
             _build_spans_from_columns(
@@ -331,9 +362,9 @@ def load_audio_token_cache(cache_dir: str | Path) -> AudioTokenCache:
 
 
 def _first_duplicate(audio_ids, *, existing: dict[str, AudioTokenSpan]) -> str | None:
-    seen = set(existing)
+    seen = set()
     for audio_id in audio_ids:
-        if audio_id in seen:
+        if audio_id in existing or audio_id in seen:
             return str(audio_id)
         seen.add(audio_id)
     return None
@@ -364,21 +395,6 @@ def _build_spans_from_columns(
             strict=True,
         )
     }
-
-
-def _required_token_file_sizes(*, token_files, token_offsets, token_counts) -> dict[str, int]:
-    itemsize = np.dtype(np.int32).itemsize
-    sizes: dict[str, int] = {}
-    for token_file, token_offset, token_count in zip(
-        token_files,
-        token_offsets,
-        token_counts,
-        strict=True,
-    ):
-        key = str(token_file)
-        end = int(token_offset) + int(token_count) * itemsize
-        sizes[key] = max(sizes.get(key, 0), end)
-    return sizes
 
 
 def _coerce_optional_float(value) -> float | None:

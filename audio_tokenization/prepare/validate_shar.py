@@ -14,8 +14,8 @@ enough to be the prepare gate:
 3. Every jsonl-backed sidecar parses row-by-row as JSON and stays in exact
    lockstep with ``cuts`` via ``cut_id``.
 
-That is the entire contract callers gate on (e.g. ``mark_partition_success``
-in ``runtime.py`` writes ``_SUCCESS`` only after this returns). Audio
+That is the contract used before atomic partition publication and by final
+stage validation; worker success markers follow partition publication. Audio
 *payload decode* — i.e. ``cut.load_audio()`` — is intentionally NOT part of
 this gate; that's a separate consumer-side smoke tool.
 
@@ -39,6 +39,7 @@ import multiprocessing
 import sys
 import tarfile
 from itertools import zip_longest
+from copy import deepcopy
 from pathlib import Path
 
 from lhotse.serialization import decode_json_line, deserialize_item
@@ -135,7 +136,7 @@ def _iter_jsonl_rows(path: Path):
     """Yield ``(line_no, parsed)`` per non-empty line of a jsonl/jsonl.gz file.
 
     Wraps `json.JSONDecodeError` into `_StructuralReadError` with line context.
-    The shared scaffolding for `_iter_cut_ids` and `_iter_jsonl_sidecar_ids`.
+    The shared reader for cut manifests and JSONL sidecars.
     """
     with open_compressed(path, "rt") as f:
         for line_no, line in enumerate(f, start=1):
@@ -151,19 +152,19 @@ def _iter_jsonl_rows(path: Path):
                 ) from e
 
 
-def _iter_cut_ids(path: Path):
-    """Yield ``cut.id`` per line, after deserializing the full Cut.
+def _iter_validated_cut_rows(path: Path, *, preserve_metadata: bool):
+    """Yield ``(cut.id, payload)`` after deserializing the full Cut.
 
     Each line must parse as JSON AND deserialize via Lhotse's manifest
     dispatch (``deserialize_item``). Construction failures — missing
     required fields, unknown ``type``, wrong shape — are raised as
     ``_StructuralReadError`` and wrapped with shard context by the caller.
-    Returns just the id (the only thing the lockstep check needs); the cut
-    object is dropped after validation.
+    Lhotse mutates dictionaries during construction. Preserve the original
+    parsed row only when it is also needed for planning metadata.
     """
     for line_no, payload in _iter_jsonl_rows(path):
         try:
-            cut = deserialize_item(payload)
+            cut = deserialize_item(deepcopy(payload) if preserve_metadata else payload)
         except (TypeError, ValueError, KeyError, AssertionError) as e:
             raise _StructuralReadError(
                 f"{path} line {line_no}: cannot deserialize cut manifest "
@@ -174,7 +175,7 @@ def _iter_cut_ids(path: Path):
             raise _StructuralReadError(
                 f"{path} line {line_no}: deserialized cut has no usable 'id'."
             )
-        yield cut_id
+        yield cut_id, payload
 
 
 def _iter_jsonl_sidecar_ids(path: Path):
@@ -207,10 +208,32 @@ def _iter_jsonl_sidecar_ids(path: Path):
         yield cut_id
 
 
+def _iterate_tarfile_pairwise_metadata(tar):
+    """Read only JSON metadata, preserving strict SHAR tar pair boundaries."""
+    pending = []
+    for member in tar:
+        if not member.isfile():
+            raise _StructuralReadError(f"Non-regular SHAR tar member: {member.name}")
+        if member.name.endswith((".nodata", ".nometa")) and member.size != 0:
+            raise _StructuralReadError(f"Nonempty SHAR placeholder: {member.name}")
+        metadata = None
+        if member.name.endswith(".json"):
+            with tar.extractfile(member) as source:
+                metadata = source.read()
+            if len(metadata) != member.size:
+                raise _StructuralReadError(f"Truncated SHAR metadata: {member.name}")
+        pending.append((metadata, member.name))
+        if len(pending) == 2:
+            yield pending[0], pending[1]
+            pending.clear()
+    if pending:
+        raise _StructuralReadError("Uneven number of files in SHAR tar; expected data + metadata pairs")
+
+
 def _iter_tar_pair_stems(path: Path):
     """Yield one cut-equivalent stem per (data, metadata) tar member pair.
 
-    Uses Lhotse's metadata-only SHAR tar iterator, which reads ONLY metadata
+    Uses the pipeline's metadata-only SHAR tar iterator, which reads ONLY metadata
     bytes, then deserializes the JSON into a real Lhotse manifest object
     (Recording / Features / Array / …). Malformed metadata, unrecognised
     manifest types, stem mismatches within a pair, or uneven member counts
@@ -218,7 +241,7 @@ def _iter_tar_pair_stems(path: Path):
 
     Lhotse encodes "optional field omitted for this cut" as a paired
     ``.nodata`` data member + ``.nometa`` metadata member (both empty);
-    ``parse_tarinfo_metadata`` returns ``(None, path)`` for both, so they're
+    The metadata iterator returns ``(None, path)`` for both, so they're
     detected by path suffix here, not by metadata presence.
 
     Tar mode is dispatched on extension: ``.tar.gz`` → ``r:gz`` (the only
@@ -226,20 +249,11 @@ def _iter_tar_pair_stems(path: Path):
     ``kind == "tar.gz"``), plain ``.tar`` → ``r:`` (skips a
     compression-probe header read).
     """
-    try:
-        from lhotse.shar import iterate_tarfile_pairwise_metadata
-    except ImportError as exc:
-        raise RuntimeError(
-            "validate_shar requires Lhotse with "
-            "lhotse.shar.iterate_tarfile_pairwise_metadata; source "
-            "scripts/utils/source_lhotse_runtime.sh or set LHOTSE_DIR."
-        ) from exc
-
     lower_name = path.name.lower()
     mode = "r:gz" if lower_name.endswith((".tar.gz", ".tgz")) else "r:"
     with tarfile.open(path, mode=mode) as tar:
         try:
-            pairs = iterate_tarfile_pairwise_metadata(tar)
+            pairs = _iterate_tarfile_pairwise_metadata(tar)
             for (left_meta, left_path), (right_meta, right_path) in pairs:
                 if _member_id(left_path) != _member_id(right_path):
                     raise _StructuralReadError(
@@ -304,10 +318,7 @@ def _iter_tar_pair_stems(path: Path):
         except _StructuralReadError:
             raise
         except RuntimeError as exc:
-            # Upstream raises a plain RuntimeError("Uneven number of files
-            # in the tarfile...") when the archive has odd member counts.
-            # Wrap so _validate_structural_shard sees one canonical
-            # structural-error type instead of bypassing its except list.
+            # Preserve one structural error type for unexpected reader errors.
             raise _StructuralReadError(
                 f"tar archive {path.name} has malformed structure "
                 f"(expected pairs of data + metadata members): {exc}"
@@ -390,13 +401,28 @@ def _validate_structural_shard(
     *,
     shard_name: str,
     slice_fields: dict[str, list[str]],
+    planning_stats: dict | None = None,
 ) -> int:
     cuts_path = Path(slice_fields["cuts"][0])
     try:
         # Materialize once; without this each non-cuts field would
         # re-deserialize every cut from cuts.jsonl.gz, scaling the heaviest
         # per-shard cost (Cut.from_dict via deserialize_item) by M fields.
-        cut_ids = list(_iter_cut_ids(cuts_path))
+        cut_ids = []
+
+        def rows():
+            for cut_id, payload in _iter_validated_cut_rows(
+                cuts_path, preserve_metadata=planning_stats is not None,
+            ):
+                cut_ids.append(cut_id)
+                yield payload
+
+        if planning_stats is None:
+            for _ in rows():
+                pass
+        else:
+            from audio_tokenization.pipelines.lhotse.planning import _scan_cut_metadata
+            planning_stats.update(_scan_cut_metadata(rows()))
         for field_name, paths in slice_fields.items():
             if field_name == "cuts":
                 continue
@@ -467,12 +493,14 @@ def _worker_error_result(
     }
 
 
-def _validate_shard_worker(args: tuple[str, dict[str, list[str]]]) -> dict[str, object]:
-    shard_name, slice_fields = args
+def _validate_shard_worker(args: tuple[str, dict[str, list[str]], bool]) -> dict[str, object]:
+    shard_name, slice_fields, collect_metadata = args
+    stats = {} if collect_metadata else None
     try:
         count = _validate_structural_shard(
             shard_name=shard_name,
             slice_fields=slice_fields,
+            planning_stats=stats,
         )
     except Exception as e:
         return _worker_error_result(
@@ -484,6 +512,7 @@ def _validate_shard_worker(args: tuple[str, dict[str, list[str]]]) -> dict[str, 
         "ok": True,
         "shard_name": shard_name,
         "count": count,
+        "stats": stats,
     }
 
 
@@ -527,14 +556,24 @@ def validate_shar_directory(
     fields = _load_shar_index(shar_dir, index_filename)
     slices = _shard_slices(shar_dir, fields)
 
+    return _validate_shard_slices(slices, verbose=verbose, num_workers=num_workers)
+
+
+def _validate_shard_slices(
+    slices: list[tuple[str, dict[str, list[str]]]], *, verbose: bool = False,
+    num_workers: int | None = None, planning_stats: dict[str, dict] | None = None,
+) -> dict[str, int]:
+    """Share the validator's bounded worker pool with prepare completion."""
     n_workers = resolve_num_workers(num_workers, num_inputs=len(slices))
     if verbose:
         logger.info("validating %d shards (structural, %d workers)", len(slices), n_workers)
 
     counts: dict[str, int] = {}
 
-    def _record(shard_name: str, expected: int) -> None:
+    def _record(shard_name: str, expected: int, stats: dict | None) -> None:
         counts[shard_name] = expected
+        if planning_stats is not None:
+            planning_stats[shard_name] = stats
         if verbose:
             logger.info("validated %s: %d cuts", shard_name, expected)
 
@@ -542,12 +581,15 @@ def validate_shar_directory(
         # Avoid pool overhead and keep tracebacks readable for single-shard
         # debugging.
         for shard_name, slice_fields in slices:
+            stats = {} if planning_stats is not None else None
             _record(
                 shard_name,
                 _validate_structural_shard(
                     shard_name=shard_name,
                     slice_fields=slice_fields,
+                    planning_stats=stats,
                 ),
+                stats,
             )
     else:
         # Default context (fork on Linux) — cheaper than forkserver because
@@ -557,10 +599,11 @@ def validate_shar_directory(
         # imap_unordered streams results as workers finish so the verbose
         # log shows live progress instead of dumping at the end.
         with multiprocessing.Pool(processes=n_workers) as pool:
-            for result in pool.imap_unordered(_validate_shard_worker, slices):
+            args = [(name, fields, planning_stats is not None) for name, fields in slices]
+            for result in pool.imap_unordered(_validate_shard_worker, args):
                 if result.get("ok") is not True:
                     _raise_worker_validation_error(result)
-                _record(str(result["shard_name"]), int(result["count"]))
+                _record(str(result["shard_name"]), int(result["count"]), result["stats"])
     return counts
 
 

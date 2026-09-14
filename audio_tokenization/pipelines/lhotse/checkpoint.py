@@ -3,7 +3,7 @@
 Design decisions:
 - **Micro-shard chunking**: Each rank writes independent chunks named
   ``rank_XXXX_chunk_YYYY.{bin,idx}``.  Chunks are written to ``.tmp``
-  files first and atomically renamed on finalize — no partial files on crash.
+  files first, with the index published last as the commit marker.
 - **WorkerStats** is an inline dataclass (no Ray dependency from base.py).
 - **SimpleWandbLogger**: Plain Python class (rank 0 only), rate-limited
   by a configurable interval.  No Ray actor overhead.
@@ -142,7 +142,11 @@ def open_chunk_writer(
     tmp_idx_path = idx_path + ".tmp"
     cut_id_writer = CutIdSidecarWriter(cut_ids_path)
     dtype = DType.optimal_dtype(vocab_size)
-    builder = IndexedDatasetBuilder(tmp_bin_path, dtype=dtype)
+    try:
+        builder = IndexedDatasetBuilder(tmp_bin_path, dtype=dtype)
+    except BaseException:
+        cut_id_writer.abort()
+        raise
     return (
         builder,
         cut_id_writer,
@@ -153,6 +157,70 @@ def open_chunk_writer(
         idx_path,
         cut_ids_path,
     )
+
+
+class MegatronWriterMixin:
+    """Shared lifecycle for rank-local Megatron output chunks.
+
+    Chunk rotation commits output only; it does not checkpoint sampler state.
+    Aborting discards temporary files while preserving committed chunks.
+    """
+
+    def _setup_megatron_writer(self, output_dir, rank, writer_state, tokenizer):
+        self._output_dir = output_dir
+        self._rank = rank
+        self._chunk_id = int(writer_state)
+        self._vocab_size = len(tokenizer.omni_tokenizer)
+        self._open_megatron_chunk()
+        self.chunk_samples = 0
+
+    def _open_megatron_chunk(self):
+        (
+            self._builder, self._cut_ids, self._tmp_bin, self._tmp_idx,
+            self._tmp_cut_ids, self._bin, self._idx, self._cut_ids_path,
+        ) = open_chunk_writer(
+            self._output_dir, self._rank, self._chunk_id, self._vocab_size,
+        )
+
+    def _finalize_megatron_writer(self):
+        if self.chunk_samples > 0:
+            finalize_shard_writer(
+                self._builder, self._tmp_bin, self._tmp_idx,
+                self._bin, self._idx, self._cut_ids,
+            )
+            self.chunks_written += 1
+            self._chunk_id += 1
+            self.chunk_samples = 0
+        else:
+            self._abort_megatron_writer()
+
+    def _rotate_megatron_writer(self):
+        self._finalize_megatron_writer()
+        self._open_megatron_chunk()
+        return self._chunk_id
+
+    def _abort_megatron_writer(self):
+        builder = getattr(self, "_builder", None)
+        data_file = getattr(builder, "data_file", None)
+        cut_ids = getattr(self, "_cut_ids", None)
+        for close in (data_file.close if data_file else None,
+                      cut_ids.abort if cut_ids else None):
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.exception("Failed to close unfinished Megatron chunk")
+        for name in ("_tmp_bin", "_tmp_idx"):
+            path = getattr(self, name, None)
+            if path is not None:
+                Path(path).unlink(missing_ok=True)
+        marker = getattr(self, "_idx", None)
+        if marker is not None and not Path(marker).exists():
+            for name in ("_bin", "_cut_ids_path"):
+                path = getattr(self, name, None)
+                if path is not None:
+                    Path(path).unlink(missing_ok=True)
+        self.chunk_samples = 0
 
 
 # ---------------------------------------------------------------------------

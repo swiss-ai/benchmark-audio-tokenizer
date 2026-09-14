@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 
 from audio_tokenization.config.schema import PrepareSpec
+from audio_tokenization.contracts.errors import OutputWriteError
+from audio_tokenization.prepare.atomic_shar import atomic_shar_partition
 from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
@@ -28,10 +30,10 @@ from audio_tokenization.prepare.columnar import (
     extract_clip_timestamps,
     extract_interleave_identity,
     extract_row_metadata,
-    _projected_columns,
+    projected_worker_columns,
     validate_columnar_schema_roots,
 )
-from audio_tokenization.prepare.constants import _MISSING, PREPARE_SHAR_COMMIT_MODE
+from audio_tokenization.prepare.constants import _MISSING
 from audio_tokenization.prepare.identity import set_interleave_metadata
 from audio_tokenization.prepare.metadata import (
     load_external_metadata,
@@ -150,29 +152,15 @@ def _convert_worker(args: ColumnarWorkerArgs):
     )
     external_metadata = _EXTERNAL_METADATA
 
-    with SharWriter(
-        output_dir=str(worker_dir),
+    with atomic_shar_partition(worker_dir, fields=("recording",)) as staged_dir, SharWriter(
+        output_dir=str(staged_dir),
         fields={"recording": shar_format},
         shard_size=shard_size,
-        commit=PREPARE_SHAR_COMMIT_MODE,
     ) as writer:
         for pq_path in parquet_paths:
             pq_name = Path(pq_path).name
             logger.info(f"Worker {worker_id}: reading {pq_name}")
-            read_columns = _projected_columns(
-                audio_column,
-                text_column,
-                duration_column,
-                source_id_column,
-                clip_num_column,
-                clip_start_column,
-                clip_end_column,
-                clip_duration_column,
-                chunks_column,
-                id_column,
-                language_column,
-                custom_columns,
-            )
+            read_columns = projected_worker_columns(args)
 
             row_idx = 0
             for row in iter_parquet_rows(
@@ -250,90 +238,98 @@ def _convert_worker(args: ColumnarWorkerArgs):
                             source_id = str(row_id)
 
                         for chunk_idx, chunk in enumerate(chunks):
-                            if not isinstance(chunk, dict):
-                                raise TypeError("chunk entries must be structs")
-                            clip_start_val = _coerce_chunk_float(
-                                chunk, "clip_start_sec"
-                            )
-                            clip_duration_val = _coerce_chunk_float(
-                                chunk, "clip_duration_sec"
-                            )
-                            if clip_duration_val <= 0:
-                                raise ValueError(
-                                    "chunk field 'clip_duration_sec' must be > 0"
+                            try:
+                                if not isinstance(chunk, dict):
+                                    raise TypeError("chunk entries must be structs")
+                                clip_start_val = _coerce_chunk_float(
+                                    chunk, "clip_start_sec"
                                 )
-                            clip_num = _coerce_chunk_num(chunk, chunk_idx)
-                            clip_id = str(
-                                chunk.get("clip_id")
-                                or _stable_chunk_id(
+                                clip_duration_val = _coerce_chunk_float(
+                                    chunk, "clip_duration_sec"
+                                )
+                                if clip_duration_val <= 0:
+                                    raise ValueError(
+                                        "chunk field 'clip_duration_sec' must be > 0"
+                                    )
+                                clip_num = _coerce_chunk_num(chunk, chunk_idx)
+                                clip_id = str(
+                                    chunk.get("clip_id")
+                                    or _stable_chunk_id(
+                                        source_id,
+                                        clip_num,
+                                        clip_start_val,
+                                        clip_duration_val,
+                                    )
+                                )
+                                try:
+                                    subcut = cut.truncate(
+                                        offset=clip_start_val,
+                                        duration=clip_duration_val,
+                                        preserve_id=False,
+                                    )
+                                except TypeError:
+                                    subcut = cut.truncate(
+                                        offset=clip_start_val,
+                                        duration=clip_duration_val,
+                                    )
+
+                                subcut = fastcopy(subcut, id=clip_id)
+                                subcut.custom = dict(custom or {})
+                                subcut.custom["source_recording_id"] = str(row_id)
+                                subcut.custom["global_offset_sec"] = clip_start_val
+                                chunk_lang = chunk.get("lang", lang)
+                                if chunk_lang is not None:
+                                    subcut.custom["lang"] = chunk_lang
+                                if text:
+                                    subcut.supervisions = [SupervisionSegment(
+                                        id=subcut.id,
+                                        recording_id=subcut.recording_id,
+                                        start=0.0,
+                                        duration=subcut.duration,
+                                        text=text,
+                                        language=chunk_lang,
+                                    )]
+
+                                set_interleave_metadata(
+                                    subcut,
                                     source_id,
                                     clip_num,
-                                    clip_start_val,
-                                    clip_duration_val,
+                                    clip_start=clip_start_val,
+                                    clip_duration=clip_duration_val,
                                 )
-                            )
-                            try:
-                                subcut = cut.truncate(
-                                    offset=clip_start_val,
-                                    duration=clip_duration_val,
-                                    preserve_id=False,
+                                subcut, skip, decoded_audio = apply_audio_pipeline(
+                                    subcut,
+                                    target_sr=target_sr,
+                                    tokenize_fn=_tokenize_text,
+                                    runtime_counts=runtime_counts,
                                 )
-                            except TypeError:
-                                subcut = cut.truncate(
-                                    offset=clip_start_val,
-                                    duration=clip_duration_val,
+                                if skip:
+                                    skipped += 1
+                                    continue
+                                write_cut_to_shar(
+                                    writer,
+                                    subcut,
+                                    audio=decoded_audio,
+                                    runtime_counts=runtime_counts,
                                 )
-
-                            subcut = fastcopy(subcut, id=clip_id)
-                            subcut.custom = dict(custom or {})
-                            subcut.custom["source_recording_id"] = str(row_id)
-                            subcut.custom["global_offset_sec"] = clip_start_val
-                            chunk_lang = chunk.get("lang", lang)
-                            if chunk_lang is not None:
-                                subcut.custom["lang"] = chunk_lang
-                            if text:
-                                subcut.supervisions = [SupervisionSegment(
-                                    id=subcut.id,
-                                    recording_id=subcut.recording_id,
-                                    start=0.0,
-                                    duration=subcut.duration,
-                                    text=text,
-                                    language=chunk_lang,
-                                )]
-
-                            set_interleave_metadata(
-                                subcut,
-                                source_id,
-                                clip_num,
-                                clip_start=clip_start_val,
-                                clip_duration=clip_duration_val,
-                            )
-                            subcut, skip, decoded_audio = apply_audio_pipeline(
-                                subcut,
-                                target_sr=target_sr,
-                                tokenize_fn=_tokenize_text,
-                                runtime_counts=runtime_counts,
-                            )
-                            if skip:
-                                skipped += 1
-                                continue
-                            write_cut_to_shar(
-                                writer,
-                                subcut,
-                                audio=decoded_audio,
-                                runtime_counts=runtime_counts,
-                            )
-                            written += 1
-                            total_duration_sec += subcut.duration
-                            next_log_at = maybe_log_worker_progress(
-                                logger=logger,
-                                worker_id=worker_id,
-                                written=written,
-                                skipped=skipped,
-                                errors=errors,
-                                t0=t0,
-                                next_log_at=next_log_at,
-                            )
+                                written += 1
+                                total_duration_sec += subcut.duration
+                                next_log_at = maybe_log_worker_progress(
+                                    logger=logger,
+                                    worker_id=worker_id,
+                                    written=written,
+                                    skipped=skipped,
+                                    errors=errors,
+                                    t0=t0,
+                                    next_log_at=next_log_at,
+                                )
+                            except OutputWriteError:
+                                raise
+                            except Exception as e:
+                                errors += 1
+                                runtime_counts["processing_errors"] += 1
+                                if errors <= 5:
+                                    logger.warning("Worker %s error on %s: %s", worker_id, f"{row_id} chunk {chunk_idx}", e)
                         continue
                     if text:
                         cut.supervisions = [SupervisionSegment(
@@ -398,6 +394,8 @@ def _convert_worker(args: ColumnarWorkerArgs):
                         next_log_at=next_log_at,
                     )
 
+                except OutputWriteError:
+                    raise
                 except Exception as e:
                     errors += 1
                     runtime_counts["processing_errors"] += 1

@@ -26,8 +26,6 @@ from .dtypes import DType
 class IndexedDatasetBuilder:
     """Builder class for the IndexedDataset class
 
-    This is the exact implementation from the reference notebook.
-
     Args:
         bin_path (str): The path to the data (.bin) file
         dtype (Type[np.number], optional): The dtype of the index file. Defaults to np.int32.
@@ -43,37 +41,35 @@ class IndexedDatasetBuilder:
         self.document_indices = [0]
         self.sequence_modes = [] if self.multimodal else None
 
-    def add_item(self, tensor: torch.Tensor, mode: int = 0) -> None:
+    def _write_tokens(self, tensor) -> int:
+        if isinstance(tensor, torch.Tensor):
+            tensor = tensor.detach().cpu().numpy()
+        array = np.ascontiguousarray(tensor, dtype=self.dtype).reshape(-1)
+        self.data_file.write(memoryview(array).cast("B"))
+        return array.size
+
+    def add_item(self, tensor: Union[torch.Tensor, List[int], np.ndarray], mode: int = 0) -> None:
         """Add a single item to the dataset
 
         Args:
-            tensor (torch.Tensor): The item to add to the data file
+            tensor: The tensor, array or token list to add to the data file.
             mode (int, optional): The mode for the item. Defaults to 0.
         """
-        if isinstance(tensor, torch.Tensor):
-            np_array = np.array(tensor.cpu().detach().numpy(), dtype=self.dtype)
-        else:
-            np_array = np.array(tensor, dtype=self.dtype)
-        self.data_file.write(np_array.tobytes(order="C"))
-        self.sequence_lengths.append(np_array.size)
+        self.sequence_lengths.append(self._write_tokens(tensor))
         if self.multimodal:
             self.sequence_modes.append(mode)
 
     def add_document(
-        self, tensor: Union[torch.Tensor, List[int]], lengths: List[int], modes: Optional[List[int]] = None
+        self, tensor: Union[torch.Tensor, List[int], np.ndarray], lengths: List[int], modes: Optional[List[int]] = None
     ) -> None:
         """Add an entire document to the dataset
 
         Args:
-            tensor (torch.Tensor or List[int]): The document to add
+            tensor: The tensor, array or token list containing the document.
             lengths (List[int]): The lengths of each item in the document
             modes (Optional[List[int]], optional): The modes for each item in the document. Defaults to None.
         """
-        if isinstance(tensor, torch.Tensor):
-            np_array = np.array(tensor.cpu().detach().numpy(), dtype=self.dtype)
-        else:
-            np_array = np.array(tensor, dtype=self.dtype)
-        self.data_file.write(np_array.tobytes(order="C"))
+        self._write_tokens(tensor)
         self.sequence_lengths.extend(lengths)
         self.document_indices.append(len(self.sequence_lengths))
         if self.multimodal:
