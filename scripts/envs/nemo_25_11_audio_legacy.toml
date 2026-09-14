@@ -1,5 +1,5 @@
-# Preserve the existing nemo_25_11 profile for preparation and materialization.
-# The unrecovered custom atomic SHAR API still prevents preparation readiness.
+# Explicit legacy runtime fallback. Use LHOTSE_RUNTIME_MODE=legacy and
+# provide the matching legacy dependency overlay when reproducing old tokens.
 image = "/capstor/store/cscs/swissai/infra01/MLLM/containers/nvcr.io#nvidia+nemo+25.11.aarch64.sqsh"
 mounts = ["/capstor", "/iopsstor", "/users"]
 writable = true

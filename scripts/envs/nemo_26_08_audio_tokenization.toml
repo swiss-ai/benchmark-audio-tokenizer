@@ -1,6 +1,6 @@
-# Tokenization only: Lhotse, TorchAudio, and FFmpeg are baked into this image.
-# Image SHA256: 142c2baf8855318d9f5a23f1b7a7aba13d6c0fe19758b65b61ace8a2e804dd0d
-image = "/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/outputs/nemo-audio-image-20260913/revision-2/nemo-audio-tokenization-26.08.aarch64.sqsh"
+# WavTokenizer conversion, tokenization and materialization; dependencies are baked in.
+# Image SHA256: cbfa22f5b019af9fde7bf19c7aa9d8983aa18a87970a123fc8adbbe55cd9020f
+image = "/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/outputs/pipeline-runtime-integration-20260914/image/nemo-audio-tokenization-26.08.aarch64.sqsh"
 mounts = ["/capstor", "/iopsstor", "/users"]
 writable = true
 workdir = "/workspace"

@@ -1,88 +1,126 @@
-# NeMo 26.08 WavTokenizer image
+# NeMo 26.08 WavTokenizer pipeline image
 
-This recipe extends the repaired NeMo 26.08 ARM64 image with the pinned
-Lhotse fork, TorchAudio built for CUDA 13.3 / GH200, five dependency wheels,
-and FFmpeg 7.1.1. `packages.lock.json` records the exact inputs and hashes.
-It supports tokenizing existing SHAR data. The recovered Lhotse sources do
-not include the custom atomic preparation APIs.
+The dataset launchers use one image for conversion, tokenization and
+materialization. It contains our pinned Lhotse wheel, CUDA-enabled TorchAudio,
+SoXR, Polars and FFmpeg. Jobs import installed libraries and do not compile or
+install dependencies at startup. Preparation uses public Lhotse SHAR APIs;
+the pipeline publishes completed partitions atomically.
 
-The build runs through Enroot on a compute host. It verifies the base image
-and offline packages, preserves the NVIDIA Torch/CUDA/cuDNN stack, records
-package inventories, and exports to a new SquashFS. The runtime profile
-must expose `/opt/venv/bin` and `/opt/audio-runtime/ffmpeg/bin`.
+## Lhotse source and version
 
-The validated TorchAudio source build used `pytorch/audio` v2.11.0 commit
-`34c52a67e8941bbd8e6adaca0eb0b9eabec11d78`, inside the repaired image with
-`USE_CUDA=1`, `TORCH_CUDA_ARCH_LIST=9.0`, and RNNT, alignment, and CUDA CTC
-extensions enabled. The build used `pip wheel --no-deps --no-build-isolation`
-and saved the wheel; jobs do not compile or install TorchAudio at startup.
-
-For a fresh build, stage the packages listed in the lock file and their
-`SHA256SUMS` under `OUT/packages`, copy the lock to `OUT/package-manifest.json`,
-and copy this recipe directory to `OUT/recipe`. Then run from this checkout:
+Our fork is the Git submodule at `src/3rdparty/lhotse`:
 
 ```sh
-python scripts/envs/image/launch.py --job-id JOB_ID --out OUT --name build \
-  --script scripts/envs/image/build.sh --cpus 16 --minutes 45
+git submodule update --init src/3rdparty/lhotse
+git -C src/3rdparty/lhotse rev-parse HEAD
 ```
 
-`resume_export.sh` resumes an interrupted metadata-copy/export stage only
-after the installer has passed verification. `update_lhotse_export.sh` is
-the recorded revision-2 operation for this campaign: it updates the Lhotse
-wheel in the retained isolated rootfs and exports a separate image. Its
-parent directory must contain the original `build-work-path.txt`.
+The pin is `89ed3be63756b0f1d87c5cfd0af1e9639527f557` from
+[Alvorecer721/lhotse](https://github.com/Alvorecer721/lhotse/tree/89ed3be63756b0f1d87c5cfd0af1e9639527f557).
+It includes the padded-duration sampler fix, upstream integration and the
+StatelessSampler initialization correction. The package is still named
+`lhotse`; its wheel version is `2.0.0a6.dev0+git.89ed3be6.clean`.
 
-Runtime validation must use the exported image, not the retained rootfs.
-`validate_runtime.py` checks installed module origins, CUDA operations,
-cuDNN, WAV/FLAC/MP3/Opus decoding and soxr. The sampler/SHAR tests run from
-a copied `test/` tree so they import the installed Lhotse wheel.
+The gitlink is an exact commit. Updating a branch in the fork does not update
+this pipeline automatically. To upgrade, publish and test the new fork commit,
+check it out in the submodule, rebuild its wheel, update the image lock, then
+commit the gitlink and matching lock together. Runtime jobs use the baked wheel;
+putting the submodule on `PYTHONPATH` would bypass the tested image pin.
 
-Campaign artifacts, logs, manifests and real-data comparison:
+## Offline build
 
-`/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/outputs/nemo-audio-image-20260913/`
+`packages.lock.json` records the base image, source commits, package filenames,
+versions, sizes and hashes. `prepare.py` rejects an uninitialized or dirty Lhotse
+checkout, a gitlink/lock mismatch, and any incorrect package hash. It publishes
+the staging directory only after all inputs pass.
 
-`/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/.cache/lhotse-nemo2608-sync-20260913/real-data-comparison/`
+The recorded wheels and FFmpeg archive are available under:
 
-The build's failed initial copy and version-check attempts are retained as
-evidence. Follow the final revision's validation report for acceptance.
+`/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/outputs/pipeline-runtime-integration-20260914/packages/`
 
-## Validation and activation status (2026-09-14)
+Use those exact inputs for the recorded build. For a new Lhotse pin, build its
+pure Python wheel from the initialized clean submodule:
 
-Final artifact: `outputs/nemo-audio-image-20260913/revision-2/nemo-audio-tokenization-26.08.aarch64.sqsh`
+```sh
+AUDIO_PACKAGES=/absolute/path/to/offline-packages
+export AUDIO_PACKAGES
+(
+  cd src/3rdparty/lhotse
+  export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+  python -m pip wheel --no-deps --no-build-isolation --wheel-dir "$AUDIO_PACKAGES" .
+)
+```
+
+The lock refers to the recorded wheel bytes. Rebuilding with a different build
+toolchain can change wheel metadata and its hash; record the new input and
+validate it before use. The rebuilt pinned wheel in this campaign matched all
+380 Lhotse package files in the previously validated wheel.
+
+Stage a fresh build directory and launch the existing Enroot recipe on a
+compute host, outside the container:
+
+```sh
+python scripts/envs/image/prepare.py --packages "$AUDIO_PACKAGES" --out "$AUDIO_BUILD_OUT"
+python scripts/envs/image/launch.py --job-id "$AUDIO_JOB_ID" --out "$AUDIO_BUILD_OUT" \
+  --name build --script scripts/envs/image/build.sh --cpus 16 --minutes 45
+```
+
+Set `AUDIO_BUILD_OUT` to a new absolute output path and `AUDIO_JOB_ID` to your
+allocation. The build verifies the base hash and offline inputs, preserves the
+NVIDIA Torch/CUDA/cuDNN stack, compares Python/system inventories, checks added
+packages' dependency closure, and exports a new SquashFS. It refuses to overwrite
+an existing image. `resume_export.sh` can resume export after installation has
+passed verification. The `update_lhotse_*` scripts record the earlier revision-2
+campaign operation; use a fresh build for new dependency sets.
+
+TorchAudio was built from `pytorch/audio` v2.11.0 commit
+`34c52a67e8941bbd8e6adaca0eb0b9eabec11d78` inside the repaired image with
+`USE_CUDA=1`, `TORCH_CUDA_ARCH_LIST=9.0`, and RNNT, alignment and CUDA CTC
+extensions enabled. Its wheel targets CUDA 13.3 on GH200. The rebuild reuses
+that validated binary; it adds Polars and its ARM64 runtime at version 1.44.2.
+
+## Runtime and validation
+
+Active profile: `scripts/envs/nemo_26_08_audio_tokenization.toml`.
+Image: `outputs/pipeline-runtime-integration-20260914/image/nemo-audio-tokenization-26.08.aarch64.sqsh`
 under the canonical audio workspace. SHA256:
-`142c2baf8855318d9f5a23f1b7a7aba13d6c0fe19758b65b61ace8a2e804dd0d`.
+`cbfa22f5b019af9fde7bf19c7aa9d8983aa18a87970a123fc8adbbe55cd9020f`.
 
-The exported image passes CUDA resampling/compiled filtering/cuDNN,
-WAV/FLAC/MP3/Opus decoding, and 608 installed-wheel sampler/SHAR/indexing
-checks (2 skipped, 13 expected failures). The actual stage/runtime helpers
-passed an isolated one-rank, one-worker, three-clip tokenize run, including
-a 94-second final clip, with all 4,219 output tokens read back and zero
-errors/skips. Inherited installation requests were forced off; module
-origins point to the baked packages. This validates the helpers and image,
-not a full multi-node corpus run or the missing preparation APIs.
+The exported image passed all 682 pipeline tests with no dependency overlay,
+CUDA resampling and compiled filtering, cuDNN, WAV/FLAC/MP3/Opus decoding, and
+SoXR resampling. The build inventory contains nine added wheels and no removed
+packages, changed existing versions, or system-package changes.
 
-The controlled old/new eager comparison used the same 11 decoded clips,
-five batches, checkpoint and GH200. Under the original cuDNN TF32 setting,
-20 of 13,890 retained audio codes differ. Disabling only cuDNN TF32 in both
-runtimes yields exact code and binary agreement on this cohort. It changes
-17 positions from the old TF32-enabled baseline and 13 from the new one.
-The pipeline's precision policy has not been changed by this image/launcher
-patch. Use the original image/settings when exact continuation of an
-existing token cache is required. For new caches, the recommended policy
-is this pinned image plus explicit FP32 math; adoption needs a separate
-cache identity. Do not interpret small-cohort parity as a corpus guarantee.
+The actual Suno and AMI launchers ran in bounded steps of allocation 3397131,
+using fresh output paths and baked packages. Music conversion retained both
+real input clips; tokenization produced 6,937 tokens for the 173.44-second clip.
+The 649-second clip was excluded by the smoke configuration's 600-second
+per-clip limit. It was not an inference failure. All twelve AMI turns retained
+their IDs, text and timeline metadata through conversion and tokenization,
+producing 2,384 audio tokens (including audio boundary markers) and 371 text
+tokens. Both normal gap-aware materialization and a separate larger-gap packing
+check matched independent token-sequence references exactly. Runtime error and
+skip counters were zero; the pre-sampler duration filter is separate from those
+counters.
 
-The 23 dataset launchers now select their environment on `srun`. Tokenize
-selects `scripts/envs/nemo_26_08_audio_tokenization.toml`; convert/materialize
-retain `nemo_25_11_audio_legacy.toml`. Submit from this complete checkout or
-export its absolute `REPO_DIR`. Use plain `sbatch` with inherited EDF/Pyxis
-submission settings cleaned, and create the selected log directory before
-submission. Resources, dataset overrides and eager mode are preserved.
-The standalone preparation/normalization jobs outside `scripts/slurm/`
-are outside this migration. The changes are prepared on an isolated local
-branch; no shared default profile or production jobs have been switched.
+SoXR remains the CPU resampler. Conversion decodes once, resamples channels
+sequentially and releases the decoded source after each cut. Conversion thread
+limits apply to baked and legacy runtimes. The pipeline's precision settings
+are unchanged. The prior old/new runtime comparison found 20 differing codes
+among 13,890 with the original cuDNN TF32 setting; disabling cuDNN TF32 in both
+runtimes matched that cohort but changed existing token IDs. Keep image and
+precision settings fixed when continuing an existing cache. This small-run
+certification is not a multi-node throughput or peak-memory guarantee.
 
-Detailed manifests and controlled numerical traces are under
-`.cache/lhotse-nemo2608-sync-20260913/real-data-comparison/` in the canonical
-workspace; `outputs/nemo-audio-image-20260913/` holds image inventories,
-regression XML/logs and launcher validation evidence.
+The stage helper selects the image on `srun`. Submit with plain `sbatch` from
+this checkout or export its absolute `REPO_DIR`; create the chosen Slurm log
+directory first. Set `PIPELINE_ENVIRONMENT=/absolute/profile.toml` to test a
+candidate across all stages. The older `TOKENIZE_ENVIRONMENT` override still
+applies only to tokenization. `LHOTSE_RUNTIME_MODE=legacy` with
+`LEGACY_ENVIRONMENT`, `LHOTSE_DIR` and matching dependency inputs explicitly
+selects the legacy setup. The earlier images and outputs remain available;
+standalone jobs outside `scripts/slurm/` are outside this migration.
+
+Evidence, manifests, exact commands and logs:
+
+`/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/outputs/pipeline-runtime-integration-20260914/`

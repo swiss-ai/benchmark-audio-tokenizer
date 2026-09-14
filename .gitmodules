@@ -34,3 +34,6 @@
 [submodule "src/repos/unicodec"]
 	path = src/repos/unicodec
 	url = https://github.com/mesolitica/UniCodec-fix.git
+[submodule "src/3rdparty/lhotse"]
+	path = src/3rdparty/lhotse
+	url = https://github.com/Alvorecer721/lhotse.git

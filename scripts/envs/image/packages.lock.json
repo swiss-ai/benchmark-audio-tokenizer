@@ -4,10 +4,9 @@
   "source_revisions": {
     "lhotse": "89ed3be63756b0f1d87c5cfd0af1e9639527f557",
     "torchaudio": "34c52a67e8941bbd8e6adaca0eb0b9eabec11d78",
-    "pipeline": "fe8650e7d999b257dae1673df2e509d516be8d7e",
     "wavtokenizer": "5cf440d91ac420ca338f117b7003a77450d64730"
   },
-  "scope": "WavTokenizer inference on existing SHAR; missing custom atomic preparation APIs are not included",
+  "scope": "WavTokenizer conversion, tokenization and materialization with public Lhotse SHAR APIs",
   "ffmpeg_source": "/capstor/store/cscs/swissai/infra01/MLLM/wheelhouse/aarch64/ffmpeg-7.1.1-full-aarch64",
   "packages": [
     {
@@ -31,8 +30,8 @@
     },
     {
       "file": "lhotse-2.0.0a6.dev0+git.89ed3be6.clean-py3-none-any.whl",
-      "bytes": 993030,
-      "sha256": "32725c42d1bbb40dea32c58607a94e95ab4c5df11f5e186460f0e42a083a9a3b",
+      "bytes": 992896,
+      "sha256": "6fb6bfbf3443f51267120cf52d2add31f88bc41601a2bac70719e4455ece558d",
       "name": "lhotse",
       "version": "2.0.0a6.dev0+git.89ed3be6.clean"
     },
@@ -63,6 +62,20 @@
       "sha256": "8bb15ca56353148ddcc4b995d50870541ab5a3ed5daff10cc357973620f19032",
       "name": "torchaudio",
       "version": "2.11.0+nv26.8.cuda13.3"
+    },
+    {
+      "file": "polars-1.44.2-py3-none-any.whl",
+      "bytes": 865768,
+      "sha256": "1bb331f17a40d9d931101533dcd33637b66edc61eb377b07020dac16a0f0377b",
+      "name": "polars",
+      "version": "1.44.2"
+    },
+    {
+      "file": "polars_runtime_32-1.44.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+      "bytes": 46590853,
+      "sha256": "bbf9b45040291dc1c6c588c837019c33557bde25ec536562a9cca9e1f6dfcc45",
+      "name": "polars-runtime-32",
+      "version": "1.44.2"
     }
   ]
 }

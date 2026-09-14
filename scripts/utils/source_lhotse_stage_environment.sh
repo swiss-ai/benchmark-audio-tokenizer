@@ -7,20 +7,28 @@ lhotse_srun() (
     shift
     local stage_environment
     case "${pipeline_stage}" in
-        tokenize)
-            stage_environment="${TOKENIZE_ENVIRONMENT:-${REPO_DIR}/scripts/envs/nemo_26_08_audio_tokenization.toml}"
-            export LHOTSE_RUNTIME_MODE=baked
-            # Keep host Python installations and libraries outside the image.
+        convert|tokenize|materialize) ;;
+        *)
+            echo "ERROR: unsupported pipeline stage: ${pipeline_stage}" >&2
+            return 2
+            ;;
+    esac
+    export LHOTSE_RUNTIME_MODE="${LHOTSE_RUNTIME_MODE:-baked}"
+    case "${LHOTSE_RUNTIME_MODE}" in
+        baked)
+            stage_environment="${PIPELINE_ENVIRONMENT:-${REPO_DIR}/scripts/envs/nemo_26_08_audio_tokenization.toml}"
+            if [ "${pipeline_stage}" = tokenize ] && [ -z "${PIPELINE_ENVIRONMENT:-}" ]; then
+                stage_environment="${TOKENIZE_ENVIRONMENT:-${stage_environment}}"
+            fi
             unset PYTHONPATH PYTHONHOME VIRTUAL_ENV LD_PRELOAD LD_LIBRARY_PATH
             unset PYTORCH_SKIP_CUDNN_COMPATIBILITY_CHECK HF_HUB_ENABLE_HF_TRANSFER
             export INSTALL_TORCHCODEC=0 INSTALL_TORCHAUDIO=0 INSTALL_ONCE_PER_NODE=0
             ;;
-        convert|materialize)
+        legacy)
             stage_environment="${LEGACY_ENVIRONMENT:-${REPO_DIR}/scripts/envs/nemo_25_11_audio_legacy.toml}"
-            export LHOTSE_RUNTIME_MODE=legacy
             ;;
         *)
-            echo "ERROR: unsupported pipeline stage: ${pipeline_stage}" >&2
+            echo "ERROR: unsupported LHOTSE_RUNTIME_MODE=${LHOTSE_RUNTIME_MODE}" >&2
             return 2
             ;;
     esac

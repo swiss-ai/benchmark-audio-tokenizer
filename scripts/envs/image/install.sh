@@ -28,4 +28,4 @@ dpkg-query -W -f='${Package}\t${Version}\n' > dpkg-after.tsv
 cp package-manifest.json base-actual.sha256 package-diff.json /opt/audio-runtime/
 mkdir -p /opt/audio-runtime/build-recipe
 cp recipe/*.sh recipe/*.py /opt/audio-runtime/build-recipe/
-printf '%s\n' 'NeMo 26.08 WavTokenizer inference runtime. Custom atomic SHAR preparation APIs are not included.' > /opt/audio-runtime/README
+printf '%s\n' 'NeMo 26.08 WavTokenizer conversion, tokenization and materialization runtime. Lhotse and Polars are installed from pinned offline wheels.' > /opt/audio-runtime/README
