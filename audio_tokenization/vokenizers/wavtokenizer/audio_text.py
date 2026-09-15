@@ -29,13 +29,27 @@ class WavTokenizerAudioText(WavTokenizerAudioOnly):
         super().__init__(**kwargs)
         self._speech_transcribe_id = None
         self._speech_switch_id = None
+        self._stt_translate_id = None
         self._audio_annotate_id = None
 
     def _cache_special_tokens(self):
         super()._cache_special_tokens()
-        self._speech_transcribe_id = self.omni_tokenizer.convert_tokens_to_ids("<|speech_transcribe|>")
-        self._speech_switch_id = self.omni_tokenizer.convert_tokens_to_ids("<|speech_switch|>")
-        self._audio_annotate_id = self.omni_tokenizer.convert_tokens_to_ids("<|audio_annotate|>")
+
+        # Reuse mapping already loaded by parent (no second file read)
+        st = self._mapping["structure_tokens"]
+
+        required = ["stt_transcribe", "stt_continue", "stt_translate", "audio_annotate"]
+        for key in required:
+            if key not in st:
+                raise ValueError(
+                    f"Task token '{key}' missing from structure_tokens. "
+                    "Rebuild the tokenizer with the latest omnitok modalities.py."
+                )
+
+        self._speech_transcribe_id = st["stt_transcribe"]
+        self._speech_switch_id = st["stt_continue"]
+        self._stt_translate_id = st["stt_translate"]
+        self._audio_annotate_id = st["audio_annotate"]
 
     @property
     def speech_transcribe_id(self) -> int:
@@ -50,6 +64,12 @@ class WavTokenizerAudioText(WavTokenizerAudioOnly):
         return self._speech_switch_id
 
     @property
+    def stt_translate_id(self) -> int:
+        if self._stt_translate_id is None:
+            self._cache_special_tokens()
+        return self._stt_translate_id
+
+    @property
     def audio_annotate_id(self) -> int:
         if self._audio_annotate_id is None:
             self._cache_special_tokens()
@@ -61,7 +81,7 @@ class WavTokenizerAudioText(WavTokenizerAudioOnly):
         sample_rate: int,
         orig_audio_samples: Optional[list] = None,
         pad_audio_samples: Optional[int] = None,
-    ) -> list:
+    ) -> list[np.ndarray]:
         """Tokenize a batch and return per-clip tokens without BOS/EOS.
 
         Reuses ``tokenize_batch()`` which produces::
@@ -73,7 +93,8 @@ class WavTokenizerAudioText(WavTokenizerAudioOnly):
             [audio_start, offset_tokens..., audio_end]
 
         Returns:
-            List of ``list[int]``, one per clip.
+            List of one-dimensional NumPy arrays, one per clip. These views
+            share the batched CPU storage and keep it alive while referenced.
         """
         token_tensors = self.tokenize_batch(
             audios,
@@ -87,4 +108,4 @@ class WavTokenizerAudioText(WavTokenizerAudioOnly):
             return []
         lengths = [t.shape[0] for t in stripped]
         all_cpu = torch.cat(stripped).cpu()
-        return [chunk.tolist() for chunk in all_cpu.split(lengths)]
+        return [chunk.numpy() for chunk in all_cpu.split(lengths)]

@@ -1,0 +1,163 @@
+"""Tests for audio_tokenization.utils.clip_id_parsers."""
+
+import pytest
+
+from audio_tokenization.utils.clip_id_parsers import (
+    get_clip_id_parser,
+    parse_aishell_clip_id,
+    parse_emilia_clip_id,
+    parse_generic_clip_id,
+    parse_libriheavy_clip_id,
+    parse_parlaspeech_clip_id,
+    parse_spc_clip_id,
+    parse_trailing_number_basename_clip_id,
+    parse_trailing_number_clip_id,
+    parse_wenetspeech_clip_id,
+)
+
+
+class TestEmilia:
+    def test_basic(self):
+        assert parse_emilia_clip_id("EN_tKvmUvxYZXI_W000006") == (
+            "EN_tKvmUvxYZXI",
+            6,
+        )
+
+    def test_leading_zeros(self):
+        assert parse_emilia_clip_id("ZH_abc123_W000000") == ("ZH_abc123", 0)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_emilia_clip_id("no_w_suffix")
+
+
+class TestTrailingNumber:
+    def test_with_flac(self):
+        assert parse_trailing_number_clip_id(
+            "forum_SLASH_foo_DOT_mp3_00002.flac"
+        ) == ("forum_SLASH_foo_DOT_mp3", 2)
+
+    def test_without_extension(self):
+        assert parse_trailing_number_clip_id("src_00010") == ("src", 10)
+
+    def test_dedup_suffix(self):
+        assert parse_trailing_number_clip_id("rIa-Qb8EYsA_123-0") == ("rIa-Qb8EYsA", 123)
+
+    def test_coral_style(self):
+        assert parse_trailing_number_clip_id(
+            "conv_07f9708fc0b8316a9dea85d473db112b_00005"
+        ) == ("conv_07f9708fc0b8316a9dea85d473db112b", 5)
+
+    def test_zeroth_korean(self):
+        assert parse_trailing_number_clip_id("187_003_0011") == ("187_003", 11)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_trailing_number_clip_id("no_number")
+
+
+class TestTrailingNumberBasename:
+    def test_with_directory_prefix(self):
+        assert parse_trailing_number_basename_clip_id(
+            "Amirkaye_ziba_Goftegoo/Amrikaye_Ziba_radio-goftego-99_04_12-19_30_86.wav"
+        ) == ("Amrikaye_Ziba_radio-goftego-99_04_12-19_30", 86)
+
+    def test_flat_filename_matches_trailing_number(self):
+        assert parse_trailing_number_basename_clip_id("src_00010.wav") == ("src", 10)
+
+    def test_registry_lookup(self):
+        parser = get_clip_id_parser("trailing_number_basename")
+        assert parser("nested/foo_00002.flac") == ("foo", 2)
+
+
+class TestWenetSpeech:
+    def test_basic(self):
+        assert parse_wenetspeech_clip_id("L_T0000005699_S00003") == (
+            "L_T0000005699",
+            3,
+        )
+
+    def test_dev_split(self):
+        assert parse_wenetspeech_clip_id("DEV_T0000005699_S00000") == (
+            "DEV_T0000005699",
+            0,
+        )
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_wenetspeech_clip_id("missing_S_prefix")
+
+
+class TestSPC:
+    def test_basic(self):
+        assert parse_spc_clip_id("row00000_seg003") == ("row00000", 3)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_spc_clip_id("row00000_003")
+
+
+class TestAishell:
+    def test_basic(self):
+        assert parse_aishell_clip_id("BAC009S0002W0122") == ("BAC009S0002", 122)
+
+    def test_zero(self):
+        assert parse_aishell_clip_id("BAC009S0002W0000") == ("BAC009S0002", 0)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_aishell_clip_id("no_w_marker")
+
+
+class TestLibriHeavy:
+    def test_basic(self):
+        assert parse_libriheavy_clip_id(
+            "large/10018/conquestofcanaan_1710_librivox_64kb_mp3/conquestofcanaan_01_tarkington_64kb_5"
+        ) == ("large/10018/conquestofcanaan_1710_librivox_64kb_mp3/conquestofcanaan_01_tarkington_64kb", 5)
+
+    def test_zero(self):
+        assert parse_libriheavy_clip_id("some_source_0") == ("some_source", 0)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_libriheavy_clip_id("no_trailing_digits")
+
+
+class TestParlaSpeech:
+    def test_basic(self):
+        assert parse_parlaspeech_clip_id(
+            "ParlaMint-RS_2013-07-09-0.u20685_112-143"
+        ) == ("ParlaMint-RS_2013-07-09-0.u20685", 112)
+
+    def test_invalid(self):
+        with pytest.raises(ValueError):
+            parse_parlaspeech_clip_id("no_range_suffix")
+
+
+class TestGeneric:
+    def test_returns_id_and_zero(self):
+        assert parse_generic_clip_id("anything_at_all") == ("anything_at_all", 0)
+
+    def test_empty_string(self):
+        assert parse_generic_clip_id("") == ("", 0)
+
+
+class TestRegistry:
+    def test_all_known_parsers(self):
+        for name in [
+            "trailing_number",
+            "trailing_number_basename",
+            "emilia",
+            "wenetspeech",
+            "spc",
+            "aishell",
+            "libriheavy",
+            "parlaspeech",
+            "generic",
+        ]:
+            parser = get_clip_id_parser(name)
+            assert callable(parser)
+
+    def test_unknown_raises(self):
+        with pytest.raises(ValueError, match="Unknown clip_id_parser"):
+            get_clip_id_parser("nonexistent")

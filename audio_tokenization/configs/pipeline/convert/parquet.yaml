@@ -1,0 +1,15 @@
+defaults:
+  - _common
+  - _self_
+
+family: parquet
+input:
+  parquet_dir: null
+  parquet_glob: "*.parquet"
+output:
+  # Site override: pin the Alps wheelhouse tokenizer for in-cluster runs.
+  text_tokenizer: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json
+metadata:
+  # Parquet inputs ship a "duration" column; pull it through by default
+  # so the planner doesn't have to recompute durations from audio bytes.
+  duration_column: duration

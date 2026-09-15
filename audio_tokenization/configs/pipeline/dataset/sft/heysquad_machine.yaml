@@ -1,0 +1,66 @@
+defaults:
+  - /recipe/parquet_sft_audio@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# HeySQuAD machine: 98,163 spoken questions over SQuAD passages.
+# TTS-synthesized via Amazon Polly Neural Joanna, single timbre.
+# Useful as data augmentation alongside the human variant.
+# License: CC-BY-4.0 (commercial OK).
+#
+# clip_id is derived from audio.path (raw lacks an `id` column).
+# Pre-flattened to /processed/sft/.../data/ by
+# multimodal-data/01-dataset-download/audio/heysquad/convert_to_parquet.py.
+# Same conversation schema as heysquad_human.
+
+name: sft_heysquad_machine
+language: en
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/hf___yijingwu___HeySQuAD_machine/data
+  files: "train-*.parquet"
+
+columns:
+  audio: audio_bytes
+  duration: duration_sec
+  id: clip_id
+  keep:
+    - audio_path
+    - audio_format
+    - sampling_rate
+    - num_frames
+    - question
+    - transcription
+    - context
+    - answer
+  constant:
+    dataset: heysquad_machine_sft
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/sft/heysquad_machine_audio
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft
+  sft_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft/heysquad_machine
+  name: heysquad_machine_audio
+
+tokenizer:
+  path: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok_instruct
+
+conversion:
+  num_workers: 64
+  shard_size: 5000
+  shar_format: flac
+
+tokenization:
+  min_duration: 1.0
+  max_duration: 60.0
+  num_workers: 32
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 1000
+
+materialization:
+  sft:
+    conversations_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/hf___yijingwu___HeySQuAD_machine/examples/qa
+    max_seq_len: 262144
+    seq_threshold: 8192
+    messages_column: messages_json
+    num_workers: 64

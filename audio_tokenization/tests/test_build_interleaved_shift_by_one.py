@@ -1,0 +1,397 @@
+from pathlib import Path
+
+import json
+import numpy as np
+import polars as pl
+import pytest
+import sys
+
+from audio_tokenization.interleave import shift_by_one as sbo
+from audio_tokenization.interleave.common import (
+    _TokenRunView,
+    list_interleave_cache_partitions,
+    load_interleave_cache,
+    prepare_interleave_cache_and_runs,
+)
+from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
+
+
+class _FakeSliceableAccessor:
+    def __init__(self, rows):
+        self._rows = rows
+        self.lengths = np.array([len(row) for row in rows])
+
+    def get(self, idx):
+        return np.asarray(self._rows[idx], dtype=np.int32)
+
+    def slice(self, start: int, length: int):
+        return _TokenRunView(self, start, length)
+
+
+class _FakePreparedCache:
+    def __init__(self, audio_rows, text_rows):
+        self.audio = _FakeSliceableAccessor(audio_rows)
+        self.text = _FakeSliceableAccessor(text_rows)
+
+
+@pytest.mark.parametrize("offset,expected", [
+    (0, [(0, 4, 9), (4, 2, 5), (6, 1, 5)]),
+    (1, [(1, 4, 9), (5, 2, 5)]),
+])
+def test_shift_spans_cover_multiple_interleavings(offset, expected) -> None:
+    assert list(sbo._iter_shift_spans(np.ones(7), np.ones(7), offset, 10)) == expected
+
+
+def test_build_shift_sequence_orders_audio_then_next_text() -> None:
+    seq = sbo._build_shift_sequence(
+        run_audio=[[10, 11], [12], [13, 14], [15]],
+        run_text=[[20], [21, 22], [23], [24, 25]],
+        start=0,
+        count=4,
+        bos_id=1,
+        eos_id=2,
+        stt_continue_id=99,
+        tts_continue_id=97,
+    )
+
+    assert seq.tolist() == [
+        1,
+        10, 11,
+        99, 21, 22,
+        97, 13, 14,
+        99, 24, 25,
+        2,
+    ]
+
+
+def test_shift_spans_tracks_leftovers() -> None:
+    assert list(sbo._iter_shift_spans([1, 1, 1], [1, 1, 1], 0, 100)) == [(0, 2, 5), (2, 1, 5)]
+
+
+def test_shift_run_chunk_emits_offsets_and_transcribe(tmp_path: Path) -> None:
+    sbo._shared_cache = _FakePreparedCache([[10], [11], [12]], [[20], [21], [22]])
+    sbo._shared_run_starts = np.array([0], dtype=np.int64)
+    sbo._shared_run_lengths = np.array([3], dtype=np.int64)
+    sbo._shared_transcribe_only_runs = set()
+
+    try:
+        result = sbo._shift_run_chunk(
+            worker_id=0,
+            run_start=0,
+            run_end=1,
+            all_keys=sbo.OFFSET_KEYS + [sbo.TR_KEY],
+            max_seq_len=100,
+            bos_id=1,
+            eos_id=2,
+            stt_continue_id=99,
+            stt_transcribe_id=98,
+            tts_continue_id=97,
+            dtype=np.int32,
+            tmp_dir=str(tmp_path),
+            seq_threshold=None,
+        )
+    finally:
+        sbo._shared_cache = None
+        sbo._shared_run_starts = None
+        sbo._shared_run_lengths = None
+        sbo._shared_transcribe_only_runs = set()
+
+    assert result["offset_0"]["seqs"] == 1
+    assert result["offset_1"]["seqs"] == 1
+    assert result["transcribe"]["seqs"] == 1
+    assert result["offset_0"]["tokens"] == 5
+    assert result["offset_1"]["tokens"] == 5
+    assert result["transcribe"]["tokens"] == 5
+
+    for key in sbo.OFFSET_KEYS + [sbo.TR_KEY]:
+        prefix = Path(result[key]["shard_prefix"])
+        assert prefix.with_suffix(".bin").exists()
+        assert Path(f"{prefix}_seqlens.npy").exists()
+        assert Path(f"{prefix}_docidx.npy").exists()
+
+
+def test_shift_run_chunk_routes_by_seq_threshold(tmp_path: Path) -> None:
+    sbo._shared_cache = _FakePreparedCache([[10], [11]], [[20], [21]])
+    sbo._shared_run_starts = np.array([0], dtype=np.int64)
+    sbo._shared_run_lengths = np.array([2], dtype=np.int64)
+    sbo._shared_transcribe_only_runs = set()
+
+    try:
+        result = sbo._shift_run_chunk(
+            worker_id=0,
+            run_start=0,
+            run_end=1,
+            all_keys=sbo.OFFSET_KEYS + [sbo.TR_KEY],
+            max_seq_len=100,
+            bos_id=1,
+            eos_id=2,
+            stt_continue_id=99,
+            stt_transcribe_id=98,
+            tts_continue_id=97,
+            dtype=np.int32,
+            tmp_dir=str(tmp_path),
+            seq_threshold=4,
+        )
+    finally:
+        sbo._shared_cache = None
+        sbo._shared_run_starts = None
+        sbo._shared_run_lengths = None
+        sbo._shared_transcribe_only_runs = set()
+
+    assert result["stage2/offset_0"]["seqs"] == 0
+    assert result["lct/offset_0"]["seqs"] == 1
+    assert result["stage2/offset_1"]["seqs"] == 0
+    assert result["lct/offset_1"]["seqs"] == 0
+    assert result["stage2/transcribe"]["seqs"] == 0
+    assert result["lct/transcribe"]["seqs"] == 1
+
+
+def test_shift_run_chunk_consumes_real_v2_cache(tmp_path: Path) -> None:
+    writer = StructuredCacheChunkWriter(str(tmp_path), rank=0, writer_state=0)
+    writer.add_rows([
+        {
+            "clip_id": "s1@000000",
+            "source_id": "s1",
+            "clip_num": 0,
+            "clip_start": 0.0,
+            "clip_duration": None,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "a",
+            "text_tokens": [20],
+            "audio_tokens": [10],
+            "dataset": "ds",
+        },
+        {
+            "clip_id": "s1@000001",
+            "source_id": "s1",
+            "clip_num": 1,
+            "clip_start": 1.0,
+            "clip_duration": None,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "b",
+            "text_tokens": [21],
+            "audio_tokens": [11],
+            "dataset": "ds",
+        },
+        {
+            "clip_id": "s1@000002",
+            "source_id": "s1",
+            "clip_num": 2,
+            "clip_start": 2.0,
+            "clip_duration": None,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "c",
+            "text_tokens": [22],
+            "audio_tokens": [12],
+            "dataset": "ds",
+        },
+    ])
+    writer.finalize()
+
+    partition_dir = list_interleave_cache_partitions(tmp_path)[0]
+    df, reader = load_interleave_cache(partition_dir)
+    cache, starts, lengths, _n_clips, _n_sources = prepare_interleave_cache_and_runs(df, reader)
+
+    sbo._shared_cache = cache
+    sbo._shared_run_starts = starts
+    sbo._shared_run_lengths = lengths
+    sbo._shared_transcribe_only_runs = set()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    try:
+        result = sbo._shift_run_chunk(
+            worker_id=0,
+            run_start=0,
+            run_end=1,
+            all_keys=sbo.OFFSET_KEYS + [sbo.TR_KEY],
+            max_seq_len=100,
+            bos_id=1,
+            eos_id=2,
+            stt_continue_id=99,
+            stt_transcribe_id=98,
+            tts_continue_id=97,
+            dtype=np.int32,
+            tmp_dir=str(out_dir),
+            seq_threshold=None,
+        )
+    finally:
+        sbo._shared_cache = None
+        sbo._shared_run_starts = None
+        sbo._shared_run_lengths = None
+        sbo._shared_transcribe_only_runs = set()
+
+    assert result["offset_0"]["seqs"] == 1
+    assert result["offset_1"]["seqs"] == 1
+    assert result["transcribe"]["seqs"] == 1
+
+
+def test_detect_runs_keeps_small_timestamp_gap_in_same_run() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1"],
+            "clip_num": [1000, 3000],
+            "clip_start": [0.0, 3.0],
+            "clip_duration": [2.5, 2.0],
+        }
+    )
+
+    _, starts, lengths = sbo._detect_runs(df, max_gap_sec=5.0)
+
+    assert starts.tolist() == [0]
+    assert lengths.tolist() == [2]
+
+
+def test_detect_runs_sorts_by_timestamp_when_gap_detection_enabled() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1", "s1"],
+            "clip_num": [2, 0, 1],
+            "clip_start": [2.0, 0.0, 1.0],
+            "clip_duration": [1.0, 1.0, 1.0],
+        }
+    )
+
+    sorted_df, starts, lengths = sbo._detect_runs(df, max_gap_sec=5.0)
+
+    assert sorted_df["clip_start"].to_list() == [0.0, 1.0, 2.0]
+    assert starts.tolist() == [0]
+    assert lengths.tolist() == [3]
+
+
+def test_detect_runs_breaks_run_on_large_timestamp_gap() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1"],
+            "clip_num": [0, 1],
+            "clip_start": [0.0, 12.0],
+            "clip_duration": [2.0, 1.0],
+        }
+    )
+
+    _, starts, lengths = sbo._detect_runs(df, max_gap_sec=5.0)
+
+    assert starts.tolist() == [0, 1]
+    assert lengths.tolist() == [1, 1]
+
+
+def test_detect_runs_requires_clip_duration_for_gap_detection() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1"],
+            "clip_num": [0, 1],
+            "clip_start": [0.0, 12.0],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="requires tokenize cache timing columns"):
+        sbo._detect_runs(df, max_gap_sec=5.0)
+
+
+def test_detect_runs_requires_non_null_timestamps_for_gap_detection() -> None:
+    df = pl.DataFrame(
+        {
+            "source_id": ["s1", "s1"],
+            "clip_num": [0, 1],
+            "clip_start": [0.0, 12.0],
+            "clip_duration": [2.0, None],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="requires non-null clip_start and clip_duration"):
+        sbo._detect_runs(df, max_gap_sec=5.0)
+
+
+def test_shift_main_builds_from_partitioned_root(monkeypatch, tmp_path: Path) -> None:
+    writer = StructuredCacheChunkWriter(
+        str(tmp_path),
+        rank=0,
+        writer_state=0,
+        partitioning={"type": "field", "field": "language"},
+    )
+    writer.add_rows([
+        {
+            "clip_id": "en@000000",
+            "source_id": "en",
+            "clip_num": 0,
+            "clip_start": 0.0,
+            "clip_duration": None,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "a",
+            "text_tokens": [20],
+            "audio_tokens": [10],
+            "dataset": "ds",
+            "_partition_value": "en",
+        },
+        {
+            "clip_id": "en@000001",
+            "source_id": "en",
+            "clip_num": 1,
+            "clip_start": 1.0,
+            "clip_duration": None,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "b",
+            "text_tokens": [21],
+            "audio_tokens": [11],
+            "dataset": "ds",
+            "_partition_value": "en",
+        },
+        {
+            "clip_id": "fr@000000",
+            "source_id": "fr",
+            "clip_num": 0,
+            "clip_start": 0.0,
+            "clip_duration": None,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "c",
+            "text_tokens": [22],
+            "audio_tokens": [12],
+            "dataset": "ds",
+            "_partition_value": "fr",
+        },
+        {
+            "clip_id": "fr@000001",
+            "source_id": "fr",
+            "clip_num": 1,
+            "clip_start": 1.0,
+            "clip_duration": None,
+            "speaker": "",
+            "duration": 1.0,
+            "text": "d",
+            "text_tokens": [23],
+            "audio_tokens": [13],
+            "dataset": "ds",
+            "_partition_value": "fr",
+        },
+    ])
+    writer.finalize()
+
+    monkeypatch.setattr(sbo, "load_token_ids", lambda _path: (1, 2, 99, 98, 97, 256))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "shift_by_one.py",
+            "--parquet-dir", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--tokenizer-path", "ignored",
+            "--max-seq-len", "100",
+            "--num-workers", "1",
+        ],
+    )
+
+    sbo.main()
+
+    assert (tmp_path / "out" / "offset_0.bin").exists()
+    assert (tmp_path / "out" / "offset_0.idx").exists()
+    assert (tmp_path / "out" / "transcribe.bin").exists()
+    assert (tmp_path / "out" / "transcribe.idx").exists()
+    metadata = json.loads((tmp_path / "out" / "metadata.json").read_text())
+    assert metadata["partition_summary"]["num_partitions"] == 2
+    assert metadata["partition_summary"]["total_clips"] == 4

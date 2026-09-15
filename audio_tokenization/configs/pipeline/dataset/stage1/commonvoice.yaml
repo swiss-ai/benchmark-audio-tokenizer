@@ -1,0 +1,49 @@
+defaults:
+  - /recipe/parquet_audio_only@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# Stage-1 CommonVoice25 "other" split rebuild from processed parquet files.
+
+name: stage1_commonvoice
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/commonvoice25
+  files: "*/other.parquet"
+
+columns:
+  audio: audio_bytes
+  text: sentence
+  id: clip_id
+  language_column: locale
+  keep:
+    - client_id
+    - accents
+    - age
+    - gender
+    - locale
+    - segment
+    - sentence_domain
+    - sentence_id
+    - up_votes
+    - down_votes
+    - variant
+    - split
+  constant:
+    dataset: commonvoice25
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1_rebuild/commonvoice25_other
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/stage_1_rebuild
+  name: commonvoice25_other
+
+conversion:
+  num_workers: 128
+  shard_size: 5000
+  read_batch_size: 64
+
+tokenization:
+  min_duration: 2.0
+  max_duration: 200.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000

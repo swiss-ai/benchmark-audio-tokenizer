@@ -6,33 +6,32 @@ Architecture (3 files per mode):
     audio_only.py -- AudioOnlyHandler (Megatron indexed dataset output)
     audio_text.py -- AudioTextHandler (Parquet cache output)
 
-Launch examples::
+Launch through the unified stage graph::
 
-    # Single node, 4 GPUs
-    srun --ntasks-per-node=4 --gpus-per-node=4 \\
-        python -m audio_tokenization.tokenize dataset=peoples_speech_lhotse
-
-    # Multi-node SLURM -- srun spawns all ranks directly (no torchrun, no NCCL)
-    srun --nodes=2 --ntasks-per-node=4 --gpus-per-node=4 --kill-on-bad-exit=0 \\
-        python -m audio_tokenization.tokenize dataset=peoples_speech_lhotse
-
-    # Resume from checkpoint
-    srun --ntasks-per-node=4 --gpus-per-node=4 \\
-        python -m audio_tokenization.tokenize dataset=peoples_speech_lhotse resume=true
+    srun --ntasks-per-node=4 --gpus-per-node=4 --kill-on-bad-exit=0 \\
+        python -m audio_tokenization run dataset=stage1/suno_s1 stage=tokenize
 """
 
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Sequence, assert_never
 
 import torch
+from lhotse.dataset.sampling.dynamic_bucketing import DynamicBucketingSampler
+
+from audio_tokenization.config.schema import TokenizeSpec
+from audio_tokenization.output_layout import (
+    build_tokenize_output_subdir,
+    resolve_tokenize_output_name,
+)
+from audio_tokenization.utils.io import cleanup_tmp_files
 
 from .checkpoint import (
     WorkerStats,
+    _get_rss_gb,
     is_cuda_oom,
-    load_checkpoint,
-    save_checkpoint,
     SimpleWandbLogger,
 )
 from .data import build_cutset
@@ -40,109 +39,307 @@ from .data import build_cutset
 logger = logging.getLogger(__name__)
 
 
+def _format_duration_tag_value(value: Any) -> str:
+    if value is None:
+        return ""
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return str(value).replace(".", "p")
+
+
+def _build_sampler_kwargs(spec: TokenizeSpec) -> dict[str, Any]:
+    """Build DynamicBucketingSampler kwargs from config."""
+    dataloader = spec.dataloader
+    sampler_kwargs = dict(
+        max_duration=dataloader.max_batch_duration,
+        num_buckets=dataloader.num_buckets,
+        buffer_size=dataloader.bucket_buffer_size,
+        shuffle=dataloader.sampler_shuffle,
+        seed=dataloader.sampler_seed,
+        world_size=1,
+        rank=0,
+        drop_last=False,
+    )
+
+    if dataloader.max_batch_cuts is not None:
+        sampler_kwargs["max_cuts"] = dataloader.max_batch_cuts
+
+    if dataloader.quadratic_duration is not None:
+        sampler_kwargs["quadratic_duration"] = dataloader.quadratic_duration
+
+    if dataloader.num_buckets == 1:
+        sampler_kwargs["duration_bins"] = []
+
+    return sampler_kwargs
+
+
+def _cutset_len(cuts) -> int | None:
+    try:
+        return len(cuts)
+    except TypeError:
+        return None
+
+
+def _cap_sampler_buckets_to_cut_count(
+    sampler_kwargs: dict[str, Any],
+    *,
+    cut_count: int | None,
+    rank: int,
+) -> dict[str, Any]:
+    """Keep Lhotse bucketing valid for tiny rank-local assignments."""
+    if cut_count is None or cut_count <= 0:
+        return sampler_kwargs
+    num_buckets = int(sampler_kwargs["num_buckets"])
+    if cut_count < 2:
+        sampler_kwargs = dict(sampler_kwargs)
+        sampler_kwargs["num_buckets"] = 1
+        sampler_kwargs["duration_bins"] = []
+        logger.warning(
+            "[rank %s] Using single duration bucket because only %s cut(s) "
+            "are assigned to this rank.",
+            rank,
+            cut_count,
+        )
+        return sampler_kwargs
+    if num_buckets <= cut_count:
+        return sampler_kwargs
+    sampler_kwargs = dict(sampler_kwargs)
+    sampler_kwargs["num_buckets"] = cut_count
+    logger.warning(
+        "[rank %s] Capping num_buckets from %s to %s because only %s cuts "
+        "are assigned to this rank.",
+        rank,
+        num_buckets,
+        cut_count,
+        cut_count,
+    )
+    return sampler_kwargs
+
+
+def _is_bucket_count_assertion(exc: AssertionError) -> bool:
+    message = str(exc)
+    return (
+        "The number of buckets" in message
+        or "num_buckets > 1" in message
+    )
+
+
+def _create_rank_sampler(cuts, sampler_kwargs: dict[str, Any], *, rank: int):
+    """Create one rank-level sampler, falling back to one bucket for tiny streams."""
+    try:
+        return DynamicBucketingSampler(cuts, **sampler_kwargs), sampler_kwargs
+    except AssertionError as exc:
+        if not _is_bucket_count_assertion(exc):
+            raise
+        fallback_kwargs = dict(sampler_kwargs)
+        fallback_kwargs["num_buckets"] = 1
+        fallback_kwargs["duration_bins"] = []
+        logger.warning(
+            "[rank %s] Dynamic bucket estimation failed for the rank-local "
+            "stream (%s); retrying with a single duration bucket.",
+            rank,
+            exc or "num_buckets invariant",
+        )
+        return DynamicBucketingSampler(cuts, **fallback_kwargs), fallback_kwargs
+
+
+def _flatten_wandb_config(prefix: str, payload: Any) -> dict[str, Any]:
+    """Flatten resolved config into W&B config parameters, not metrics."""
+    if isinstance(payload, dict):
+        flattened: dict[str, Any] = {}
+        for key, value in payload.items():
+            child_key = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_wandb_config(child_key, value))
+        return flattened
+    return {prefix: payload}
+
+
+def _build_wandb_config(
+    spec: TokenizeSpec,
+    *,
+    dataset_name: str,
+    input_shar_dirs: Sequence[str],
+    final_output_dir: Path,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    assigned_cut_count: int | None,
+    sampler_kwargs: dict[str, Any],
+    effective_num_workers: int,
+    effective_prefetch_factor: int | None,
+    max_workers_per_rank: int,
+    dataloader_timeout: int,
+    output_name: str,
+) -> dict[str, Any]:
+    """Build static W&B run config from resolved Hydra/spec values."""
+    resolved = {
+        "dataset_name": dataset_name,
+        "rank": rank,
+        "world_size": world_size,
+        "local_rank": local_rank,
+        "input_shar_dirs": list(input_shar_dirs),
+        "final_output_dir": str(final_output_dir),
+        "assigned_cut_count": assigned_cut_count,
+        "output_name": output_name,
+        "tokenize": spec.model_dump(mode="json"),
+        "effective": {
+            "dataloader": {
+                "num_workers": effective_num_workers,
+                "prefetch_factor": effective_prefetch_factor,
+                "timeout": dataloader_timeout,
+                "persistent_workers": effective_num_workers > 0,
+                "pin_memory": True,
+                "max_workers_per_rank": max_workers_per_rank,
+            },
+            "sampler": dict(sampler_kwargs),
+        },
+    }
+    return _flatten_wandb_config("", resolved)
+
+
+def _build_wandb_tags(
+    configured_tags: Sequence[str],
+    *,
+    dataset_name: str,
+    spec: TokenizeSpec,
+) -> list[str]:
+    """Stable W&B tags for filtering tokenization runs."""
+    automatic = [
+        f"dataset:{dataset_name}",
+        "stage:tokenize",
+        f"mode:{spec.mode}",
+        f"format:{spec.audio_text_format}",
+        f"task:{spec.audio_text_task}",
+    ]
+    tags: list[str] = []
+    for tag in [*configured_tags, *automatic]:
+        if tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _format_writer_state(writer_state: Any) -> str:
+    if isinstance(writer_state, dict):
+        items = ", ".join(f"{k}={v}" for k, v in sorted(writer_state.items()))
+        return "{" + items + "}"
+    return str(writer_state)
+
+
+def _normalize_batch(batch: dict, target_db: float, device: str = "cpu") -> dict:
+    """Peak-normalize audio in a batch dict (works for all handler modes).
+
+    Moves audio to *device* before normalizing for GPU-accelerated peak
+    computation.  Matches WavTokenizer training: SOX ``norm`` to *target_db* dBFS.
+    """
+    from audio_tokenization.prepare.audio_ops import normalize_batch_peak
+
+    if "audio" in batch:
+        batch["audio"] = normalize_batch_peak(batch["audio"].to(device, non_blocking=True), target_db)
+    elif "inputs" in batch:
+        batch["inputs"] = normalize_batch_peak(batch["inputs"].to(device, non_blocking=True), target_db)
+    return batch
+
+
 # ---------------------------------------------------------------------------
 # Main tokenization loop (per-rank)
 # ---------------------------------------------------------------------------
 
 
-def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> Dict[str, Any]:
+def tokenize_loop(
+    spec: TokenizeSpec,
+    *,
+    dataset_name: str,
+    input_shar_dirs: Sequence[str],
+    planned_shar_fields: dict[str, list[str]],
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    final_output_dir: Path,
+    handler,
+    assigned_cut_count: int | None = None,
+) -> dict[str, Any]:
     """Main per-rank tokenization loop.
 
     Steps:
         1. Load prepared Shar CutSet -- see ``data.py``
         2. Create ``DynamicBucketingSampler`` with global bucketing
-        3. Optionally resume from checkpoint
-        4. Wrap in dataset + ``DataLoader`` for CPU/GPU overlap
-        5. Loop over prefetched batches, tokenize on GPU, write output
-        6. Periodically checkpoint (sampler state + chunk boundary)
+        3. Wrap in dataset + ``DataLoader`` for CPU/GPU overlap
+        4. Loop over prefetched batches, tokenize on GPU, write output
+        5. Periodically rotate committed output chunks
     """
-    from lhotse.dataset.sampling.dynamic_bucketing import DynamicBucketingSampler
-
-    output_dir = cfg["output_dir"]
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    output_dir = str(final_output_dir)
+    final_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Clean up stale .tmp files from killed runs (e.g. OOM kill).
-    for tmp in Path(output_dir).glob(f"rank_{rank:04d}_*.tmp"):
-        logger.warning(f"[rank {rank}] Removing stale temp file: {tmp.name}")
-        tmp.unlink()
+    cleanup_tmp_files(
+        final_output_dir,
+        f"rank_{rank:04d}_*.tmp",
+        logger=logger,
+        label=f"rank {rank} stale temp file",
+    )
+
+    cumulative_stats = WorkerStats()
 
     # ------------------------------------------------------------------
     # 1. Build CutSet (prepared Shar load + filters/resample safety-net)
     # ------------------------------------------------------------------
-    cuts = build_cutset(cfg, rank, world_size)
-
-    # ------------------------------------------------------------------
-    # 2. Dynamic bucketing sampler -- each rank's CutSet is already split
-    #    at the shard level (see data.py), so the sampler uses
-    #    world_size=1 to avoid the O(world_size) strided distribution.
-    # ------------------------------------------------------------------
-    max_duration = cfg.get("max_batch_duration", 1500.0)
-    max_cuts = cfg.get("max_batch_cuts")
-    num_buckets = cfg.get("num_buckets", 20)
-    buffer_size = cfg.get("bucket_buffer_size", 20000)
-    shuffle = cfg.get("sampler_shuffle", True)
-    seed = cfg.get("sampler_seed", 42)
-    quadratic_duration = cfg.get("quadratic_duration")
-
-    sampler_kwargs = dict(
-        max_duration=max_duration,
-        num_buckets=num_buckets,
-        buffer_size=buffer_size,
-        shuffle=shuffle,
-        seed=seed,
-        world_size=1,
-        rank=0,
-        drop_last=False,
+    cuts = build_cutset(
+        spec,
+        input_shar_dirs=input_shar_dirs,
+        planned_shar_fields=planned_shar_fields,
+        rank=rank,
+        world_size=world_size,
+        stats=cumulative_stats,
     )
-    if max_cuts is not None:
-        sampler_kwargs["max_cuts"] = max_cuts
-    if quadratic_duration is not None:
-        sampler_kwargs["quadratic_duration"] = quadratic_duration
+    cut_count = assigned_cut_count if assigned_cut_count is not None else _cutset_len(cuts)
+    if cut_count == 0:
+        logger.warning(
+            "[rank %s/%s] no cuts assigned after shard-level distribution; "
+            "writing empty rank stats and exiting cleanly.",
+            rank,
+            world_size,
+        )
+        from .stats_reducer import write_rank_stats, zero_rank_stats
 
-    sampler = DynamicBucketingSampler(cuts, **sampler_kwargs)
-
-    # ------------------------------------------------------------------
-    # 3. Resume from checkpoint -- sampler.load_state_dict() restores
-    #    sampler state via metadata bookkeeping (no audio decoding), so
-    #    recovery is typically fast.
-    # ------------------------------------------------------------------
-    resume = cfg.get("resume", False)
-    start_chunk_id = 0
-    cumulative_stats = WorkerStats()
-
-    if resume:
-        ckpt = load_checkpoint(output_dir, rank)
-        if ckpt is not None:
-            ckpt_ws = ckpt.get("world_size")
-            if ckpt_ws is not None and ckpt_ws != world_size:
-                logger.warning(
-                    f"[rank {rank}] Checkpoint world_size ({ckpt_ws}) != current "
-                    f"world_size ({world_size}). Shard assignment changed — "
-                    f"ignoring checkpoint, starting from scratch."
-                )
-                ckpt = None
-        if ckpt is not None:
-            sampler.load_state_dict(ckpt["sampler_state"])
-            start_chunk_id = ckpt["chunk_id"] + 1
-            prev = ckpt.get("stats", {})
-            cumulative_stats.samples_processed = prev.get("samples_processed", 0)
-            cumulative_stats.tokens_generated = prev.get("tokens_generated", 0)
-            cumulative_stats.text_tokens_generated = prev.get("text_tokens_generated", 0)
-            cumulative_stats.errors = prev.get("errors", 0)
-            cumulative_stats.samples_skipped = prev.get("samples_skipped", 0)
-            logger.info(
-                f"[rank {rank}] Resumed from chunk {start_chunk_id}, "
-                f"samples={cumulative_stats.samples_processed}"
-            )
+        result = zero_rank_stats(rank=rank, world_size=world_size)
+        result.update(cumulative_stats.finalize())
+        result["chunks_written"] = 0
+        result["output_dir"] = output_dir
+        write_rank_stats(output_dir, result)
+        return result
 
     # ------------------------------------------------------------------
-    # 4. DataLoader with prefetching -- worker subprocesses decode audio
+    # 2. Dynamic bucketing sampler -- assignment is per work unit, but sampling
+    #    is rank-level. Keeping those axes separate avoids tiny tail/filter-heavy
+    #    work units violating Lhotse's bucket-count invariants.
+    # ------------------------------------------------------------------
+    sampler_kwargs = _build_sampler_kwargs(spec)
+    sampler_kwargs = _cap_sampler_buckets_to_cut_count(
+        sampler_kwargs,
+        cut_count=cut_count,
+        rank=rank,
+    )
+    sampler, sampler_kwargs = _create_rank_sampler(cuts, sampler_kwargs, rank=rank)
+
+    # ------------------------------------------------------------------
+    # 3. DataLoader with prefetching -- worker subprocesses decode audio
     #    in parallel while the main thread runs GPU tokenization.
     # ------------------------------------------------------------------
     max_workers = os.cpu_count() // max(torch.cuda.device_count(), 1)
-    num_workers = min(cfg.get("num_workers", 4), max_workers)
-    prefetch_factor = cfg.get("prefetch_factor", 4)
-    dataloader_timeout = cfg.get("dataloader_timeout", 300)  # 5 min default
+    num_workers = min(int(spec.dataloader.num_workers), max_workers)
+    prefetch_factor = spec.dataloader.prefetch_factor
+    effective_prefetch_factor = prefetch_factor if num_workers > 0 else None
+    dataloader_timeout = 300  # 5 min default
+    worker_init_fn = None
+    if num_workers > 0:
+        from lhotse.dataset.dataloading import make_worker_init_fn
+
+        worker_init_fn = make_worker_init_fn(
+            rank=rank,
+            world_size=world_size,
+            seed=spec.dataloader.sampler_seed,
+        )
 
     dataset = handler.create_dataset()
     dataloader = torch.utils.data.DataLoader(
@@ -150,23 +347,24 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
         sampler=sampler,
         batch_size=None,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        prefetch_factor=effective_prefetch_factor,
         persistent_workers=num_workers > 0,
         pin_memory=True,
         timeout=dataloader_timeout if num_workers > 0 else 0,
+        worker_init_fn=worker_init_fn,
     )
 
     # ------------------------------------------------------------------
-    # 5. Create tokenizer on GPU
+    # 4. Create tokenizer on GPU
     # ------------------------------------------------------------------
     from audio_tokenization.vokenizers import create_tokenizer
 
-    device = f"cuda:{cfg.get('local_rank', 0)}"
-    tokenizer_path = cfg["tokenizer_path"]
-    mode = cfg.get("mode", "audio_only")
-    torch_compile = cfg.get("torch_compile", True)
-    target_sr = int(cfg.get("target_sample_rate", 24000))
-    trim_last_tokens = cfg.get("trim_last_tokens", 5)
+    device = f"cuda:{local_rank}"
+    tokenizer_path = spec.tokenizer.path
+    mode = spec.mode
+    torch_compile = spec.tokenizer.torch_compile
+    target_sr = int(spec.tokenizer.sampling_rate)
+    trim_last_tokens = spec.tokenizer.trim_last_tokens
 
     tokenizer = create_tokenizer(
         omni_tokenizer_path=tokenizer_path,
@@ -177,152 +375,231 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
     )
 
     # ------------------------------------------------------------------
-    # 6. W&B logger (rank 0 only)
+    # 5. W&B logger (rank 0 only)
     # ------------------------------------------------------------------
     wandb_logger = None
-    wandb_cfg = cfg.get("wandb", {})
+    wandb_cfg = spec.wandb
     if wandb_cfg.get("enabled", False) and rank == 0:
+        # Auto-generate wandb run name: {task}/{dataset}_dur{min}-{max}
+        _wandb_name = wandb_cfg.get("name")
+        _output_name = resolve_tokenize_output_name(spec, dataset_name=dataset_name)
+        if not _wandb_name:
+            _min_d = spec.filter.min_duration
+            _max_d = spec.filter.max_duration
+            _dur_tag = ""
+            if _min_d is not None or _max_d is not None:
+                _dur_tag = (
+                    f"_dur{_format_duration_tag_value(_min_d) or 'min'}-"
+                    f"{_format_duration_tag_value(_max_d) or 'max'}"
+                )
+            _wandb_name = f"{build_tokenize_output_subdir(spec, dataset_name=dataset_name)}{_dur_tag}"
+
         wandb_logger = SimpleWandbLogger(
-            project=wandb_cfg.get("project", "audio-tokenization"),
+            project=wandb_cfg["project"],
             entity=wandb_cfg.get("entity"),
-            name=wandb_cfg.get("name"),
-            tags=wandb_cfg.get("tags", []),
-            config={
-                "rank": rank,
-                "world_size": world_size,
-                "max_batch_duration": max_duration,
-                "num_buckets": num_buckets,
-                "buffer_size": buffer_size,
-                "target_sample_rate": target_sr,
-                **{k: v for k, v in cfg.items() if isinstance(v, (int, float, str, bool))},
-            },
-            log_interval_seconds=wandb_cfg.get("log_interval_seconds", 10.0),
+            name=_wandb_name,
+            tags=_build_wandb_tags(
+                wandb_cfg["tags"],
+                dataset_name=dataset_name,
+                spec=spec,
+            ),
+            config=_build_wandb_config(
+                spec,
+                dataset_name=dataset_name,
+                input_shar_dirs=input_shar_dirs,
+                final_output_dir=final_output_dir,
+                rank=rank,
+                world_size=world_size,
+                local_rank=local_rank,
+                assigned_cut_count=assigned_cut_count,
+                sampler_kwargs=sampler_kwargs,
+                effective_num_workers=num_workers,
+                effective_prefetch_factor=effective_prefetch_factor,
+                max_workers_per_rank=max_workers,
+                dataloader_timeout=dataloader_timeout if num_workers > 0 else 0,
+                output_name=_output_name,
+            ),
+            log_interval_seconds=wandb_cfg["log_interval_seconds"],
         )
 
     # ------------------------------------------------------------------
-    # 7. Main loop -- tokenize batches, write output, checkpoint
+    # 6. Main loop -- tokenize batches and rotate output chunks
     # ------------------------------------------------------------------
-    checkpoint_interval = cfg.get("checkpoint_interval_batches", 500)
-    chunk_id = start_chunk_id
+    checkpoint_interval = spec.dataloader.checkpoint_interval_batches
+    writer_state: Any = 0
     batch_count = 0
 
-    handler.setup_writer(output_dir, rank, chunk_id, tokenizer)
+    handler.setup_writer(output_dir, rank, writer_state, tokenizer)
 
     stats = cumulative_stats
     total_audio_seconds = 0.0
 
     logger.info(
         f"[rank {rank}] Starting tokenization loop "
-        f"(chunk_id={chunk_id}, checkpoint_interval={checkpoint_interval})"
+        f"(writer_state={_format_writer_state(writer_state)}, checkpoint_interval={checkpoint_interval})"
     )
 
-    consecutive_errors = 0
-    max_consecutive_errors = cfg.get("max_consecutive_errors", 50)
     _loop_error = None
+    current_cut_ids = []
+    pending_cut_ids = []
+
+    normalize_peak_db = spec.filter.normalize_peak_db
+    if normalize_peak_db is not None:
+        normalize_peak_db = float(normalize_peak_db)
+        logger.info(f"[rank {rank}] Peak normalization enabled: target {normalize_peak_db} dBFS")
+
+    _t_start = _t_encode_start = _t_encode_end = None
+    if wandb_logger is not None:
+        _t_start = torch.cuda.Event(enable_timing=True)
+        _t_encode_start = torch.cuda.Event(enable_timing=True)
+        _t_encode_end = torch.cuda.Event(enable_timing=True)
+
+    _batch_ready_time = time.monotonic()
+
+    _pbar = None
+    if rank == 0:
+        from tqdm import tqdm
+        _pbar = tqdm(desc="tokenize", unit=" batches", dynamic_ncols=True)
 
     try:
         for batch in dataloader:
-            try:
-                batch_audio_secs = handler.process_batch(
-                    batch, tokenizer, stats, target_sr, device,
-                )
-                total_audio_seconds += batch_audio_secs
-                consecutive_errors = 0  # reset on batch success
+            cuts = batch.get("cuts", batch.get("supervisions", {}).get("cut", []))
+            current_cut_ids = [cut.id for cut in cuts]
+            pending_cut_ids.extend(current_cut_ids)
+            _dataloader_wait_ms = (time.monotonic() - _batch_ready_time) * 1000
 
-            except Exception as batch_err:
-                stats.errors += 1
-                consecutive_errors += 1
+            # Decide whether to capture per-batch timing (only when W&B will flush).
+            _time_this = (
+                wandb_logger is not None and wandb_logger.should_log_now()
+            )
+            if _time_this:
+                _t_start.record()
 
-                # CUDA OOM: free the failed allocation so the next batch can succeed.
-                if is_cuda_oom(batch_err):
-                    torch.cuda.empty_cache()
-                    logger.warning(
-                        f"[rank {rank}] CUDA OOM on batch {batch_count}, freed cache "
-                        f"({consecutive_errors}/{max_consecutive_errors})"
-                    )
-                else:
-                    logger.warning(
-                        f"[rank {rank}] Batch error ({consecutive_errors}/{max_consecutive_errors}): "
-                        f"{batch_err}"
-                    )
+            _host_process_start = time.monotonic()
+            if normalize_peak_db is not None:
+                batch = _normalize_batch(batch, normalize_peak_db, device)
 
-                if consecutive_errors >= max_consecutive_errors:
-                    raise RuntimeError(
-                        f"[rank {rank}] {max_consecutive_errors} consecutive batch errors, aborting"
-                    ) from batch_err
-                continue
+            if _time_this:
+                _t_encode_start.record()
+
+            batch_audio_secs = handler.process_batch(
+                batch, tokenizer, stats, target_sr, device,
+            )
+
+            if _time_this:
+                _t_encode_end.record()
+
+            total_audio_seconds += batch_audio_secs
+            _process_batch_wall_ms = (time.monotonic() - _host_process_start) * 1000
 
             batch_count += 1
 
+            if _pbar is not None:
+                elapsed = time.time() - stats.start_time
+                tok_s = stats.tokens_generated / elapsed if elapsed > 0 else 0
+                _pbar.set_postfix_str(
+                    f"{stats.samples_processed} samples, {tok_s:.0f} tok/s, {stats.errors} err"
+                )
+                _pbar.update(1)
+
             # W&B log (rate-limited by interval inside logger)
             if wandb_logger is not None:
+                metrics = None
+                if _time_this:
+                    _t_encode_end.synchronize()
+                    tokenize_wall_ms = _t_start.elapsed_time(_t_encode_end)
+                    tokenize_gpu_ms = _t_encode_start.elapsed_time(_t_encode_end)
+                    metrics = {
+                        "timing/dataloader_wait_ms": _dataloader_wait_ms,
+                        "timing/tokenize_wall_ms": tokenize_wall_ms,
+                        "timing/tokenize_gpu_ms": tokenize_gpu_ms,
+                        "timing/process_batch_wall_ms": _process_batch_wall_ms,
+                        "memory/rss_gb": _get_rss_gb(),
+                        "memory/cuda_alloc_gb": torch.cuda.memory_allocated() / (1024 ** 3),
+                        "memory/cuda_reserved_gb": torch.cuda.memory_reserved() / (1024 ** 3),
+                    }
                 wandb_logger.log(
                     samples=stats.samples_processed,
                     tokens=stats.tokens_generated,
                     errors=stats.errors,
                     skipped=stats.samples_skipped,
                     batch_audio_seconds=total_audio_seconds,
+                    text_tokens=stats.text_tokens_generated,
+                    metrics=metrics,
                 )
 
-            # Periodic checkpoint: finalize current chunk, save state, open next
+            # Periodic chunk rotation: finalize current chunk and open next.
             if batch_count % checkpoint_interval == 0 and handler.chunk_samples > 0:
-                done_chunk = handler.checkpoint_writer()
+                writer_state = handler.checkpoint_writer()
+                pending_cut_ids = []
                 logger.info(
-                    f"[rank {rank}] Finalized chunk {done_chunk} "
+                    f"[rank {rank}] Rotated writer state {_format_writer_state(writer_state)} "
                     f"({stats.tokens_generated} total tokens)"
                 )
 
-                save_checkpoint(
-                    output_dir,
-                    rank,
-                    sampler_state=sampler.state_dict(),
-                    chunk_id=done_chunk,
-                    stats=stats.to_dict(),
-                    world_size=world_size,
-                )
+            _batch_ready_time = time.monotonic()
+            current_cut_ids = []
 
-                chunk_id = done_chunk + 1
+        handler.finalize_writer()
+        pending_cut_ids = []
 
     except Exception as e:
         logger.error(f"[rank {rank}] Fatal error in tokenization loop: {e}", exc_info=True)
         stats.errors += 1
         _loop_error = e
+        if is_cuda_oom(e):
+            logger.error("[rank %s] CUDA OOM: reduce max_batch_duration; failed cuts: %s",
+                         rank, current_cut_ids[:10])
+        try:
+            handler.abort_writer()
+        except Exception:
+            logger.exception("[rank %s] Failed to clean up uncommitted writer", rank)
 
-    # ------------------------------------------------------------------
-    # 8. Finalize last chunk (always save progress, even on failure)
-    # ------------------------------------------------------------------
-    handler.finalize_writer()
-
-    save_checkpoint(
-        output_dir,
-        rank,
-        sampler_state=sampler.state_dict(),
-        chunk_id=chunk_id,
-        stats=stats.to_dict(),
-        world_size=world_size,
-    )
+    if _pbar is not None:
+        _pbar.close()
 
     result = stats.finalize()
     result["rank"] = rank
-    result["chunks_written"] = chunk_id - start_chunk_id + (1 if handler.chunk_samples > 0 else 0)
+    result["chunks_written"] = handler.chunks_written
 
     if wandb_logger is not None:
-        wandb_logger.finish()
+        try:
+            wandb_logger.finish()
+        except Exception as e:
+            logger.exception("[rank %s] Failed to finish W&B logging", rank)
+            if _loop_error is None:
+                _loop_error = e
+                result["errors"] += 1
 
     text_tok_msg = ""
     if result.get("text_tokens_generated", 0) > 0:
         text_tok_msg = f", {result['text_tokens_generated']} text tokens"
+    rms_msg = ""
+    if result.get("rms_skipped", 0) > 0:
+        rms_msg = f", {result['rms_skipped']} rms_skipped"
     logger.info(
         f"[rank {rank}] Done: {result['samples_processed']} samples, "
         f"{result['tokens_generated']} audio tokens{text_tok_msg}, "
-        f"{result['errors']} errors, {result['elapsed_time']:.1f}s"
+        f"{result['errors']} errors{rms_msg}, {result['elapsed_time']:.1f}s"
     )
 
     result["output_dir"] = output_dir
+    result["success"] = _loop_error is None
+    if _loop_error is not None:
+        result["error"] = f"{type(_loop_error).__name__}: {_loop_error}"
+        result["failed_cut_ids"] = current_cut_ids or pending_cut_ids
+        # Includes cuts since the last completed rotation. A failed multi-file
+        # publication can leave some of these committed; inspect artifacts
+        # before attempting manual recovery. This is not sampler resume state.
+        result["affected_cut_ids"] = pending_cut_ids
 
-    # Re-raise after saving progress so the exit code signals failure.
-    # This MUST come after all cleanup (checkpoint, metadata, wandb) so
-    # partial work is never silently lost.
+    from .stats_reducer import write_rank_stats
+
+    # Rank stats are the distributed success signal; rank 0 aggregates them
+    # after all ranks finish, then ``run_stage`` publishes ``_SUCCESS``.
+    write_rank_stats(output_dir, result)
+
+    # Re-raise after terminal cleanup so the exit code signals failure.
     if _loop_error is not None:
         raise RuntimeError(
             f"[rank {rank}] Tokenization loop failed after processing "
@@ -337,92 +614,36 @@ def tokenize_loop(rank: int, world_size: int, cfg: Dict[str, Any], handler) -> D
 # ---------------------------------------------------------------------------
 
 
-def _build_output_subdir(cfg: Dict[str, Any]) -> str:
-    """Build a dataset-specific subdirectory path.
-
-    Layout::
-
-        audio_only:        audio_only/{output_name}[_dur{min}-{max}]
-        audio_text:  audio_text_{format}/{output_name}[_dur{min}-{max}]
-    """
-    output_name = cfg.get("output_name")
-    if not output_name:
-        raise ValueError("'output_name' is required in the dataset config.")
-
-    mode = cfg.get("mode", "audio_only")
-
-    dur_suffix = ""
-    min_dur = cfg.get("min_duration")
-    max_dur = cfg.get("max_duration")
-    if min_dur is not None or max_dur is not None:
-        def _fmt(v):
-            if v is None:
-                return ""
-            return str(int(v)) if float(v).is_integer() else str(v).replace(".", "p")
-        dur_suffix = f"_dur{_fmt(min_dur) or 'min'}-{_fmt(max_dur) or 'max'}"
-
-    dataset_name = f"{output_name}{dur_suffix}"
-
-    if mode == "audio_text":
-        fmt = cfg.get("audio_text_format", "unknown")
-        return str(Path(f"audio_text_{fmt}") / dataset_name)
-
-    return str(Path(mode) / dataset_name)
-
-
-
-def run_lhotse_pipeline(cfg: Dict[str, Any]) -> Dict[str, Any]:
+def run_lhotse_pipeline(
+    spec: TokenizeSpec,
+    *,
+    dataset_name: str,
+    input_shar_dirs: Sequence[str],
+    planned_shar_fields: dict[str, list[str]],
+    rank: int,
+    world_size: int,
+    local_rank: int,
+    final_output_dir: Path,
+    assigned_cut_count: int | None = None,
+) -> dict[str, Any]:
     """Entry point for the Lhotse tokenization pipeline.
 
     Expects pre-built Shar data (via ``prepare_hf_to_shar`` or
     ``prepare_wds_to_shar``).  Loads the Shar CutSet, tokenizes on GPU,
-    and writes micro-shards with DDP checkpointing.
+    and writes rank-local micro-shards.
     """
-    # torchrun sets RANK/WORLD_SIZE/LOCAL_RANK.
-    # srun (without torchrun) sets SLURM_PROCID/SLURM_NTASKS/SLURM_LOCALID.
-    num_gpus = cfg.get("num_gpus")
-    rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
-    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
-
-    # Cross-check: if num_gpus is set, verify it matches the env-derived world_size.
-    if num_gpus is not None:
-        num_gpus = int(num_gpus)
-        if world_size == 1 and num_gpus > 1:
-            # No env vars set (local run) — use num_gpus as world_size.
-            world_size = num_gpus
-            logger.warning(
-                f"No SLURM/torchrun env vars detected, using num_gpus={num_gpus} as world_size"
-            )
-        elif world_size != num_gpus:
-            raise RuntimeError(
-                f"num_gpus={num_gpus} from config does not match "
-                f"world_size={world_size} from environment. "
-                f"Check SLURM --ntasks-per-node * --nodes matches num_gpus."
-            )
-
-    # Safety: infer LOCAL_RANK from global rank + GPUs per node if env vars
-    # are missing (e.g. bare srun without torchrun on multi-GPU nodes).
-    if "LOCAL_RANK" not in os.environ and "SLURM_LOCALID" not in os.environ:
-        gpus_per_node = torch.cuda.device_count()
-        if gpus_per_node > 0:
-            local_rank = rank % gpus_per_node
-            logger.warning(
-                f"[rank {rank}] LOCAL_RANK not set, inferred {local_rank} "
-                f"from rank % {gpus_per_node} GPUs"
-            )
+    if planned_shar_fields is None:
+        raise RuntimeError(
+            "Tokenization requires a stage-created SHAR assignment. Use "
+            "`python -m audio_tokenization run ... stage=tokenize`; direct "
+            "`run_lhotse_pipeline` calls must pass planned_shar_fields."
+        )
 
     # Only rank 0 logs at INFO; others at WARNING to avoid 160x noise.
     if rank != 0:
         logging.getLogger("audio_tokenization").setLevel(logging.WARNING)
         logging.getLogger("lhotse").setLevel(logging.WARNING)
 
-    cfg["rank"] = rank
-    cfg["world_size"] = world_size
-    cfg["local_rank"] = local_rank
-
-    # Namespace tokenization output to avoid checkpoint collisions.
-    cfg["output_dir"] = str(Path(cfg["output_dir"]) / _build_output_subdir(cfg))
     torch.cuda.set_device(local_rank)
 
     logger.info(
@@ -430,14 +651,34 @@ def run_lhotse_pipeline(cfg: Dict[str, Any]) -> Dict[str, Any]:
         f"no NCCL — each rank is independent)"
     )
 
-    mode = cfg.get("mode", "audio_only")
-    if mode == "audio_only":
+    if spec.mode == "audio_only":
         from .audio_only import AudioOnlyHandler
-        handler = AudioOnlyHandler(cfg)
-    elif mode == "audio_text":
+        handler = AudioOnlyHandler(spec)
+    elif spec.mode == "audio_cache":
+        from .audio_cache import AudioCacheHandler
+        handler = AudioCacheHandler(spec)
+    elif spec.mode == "audio_text":
         from .audio_text import AudioTextHandler
-        handler = AudioTextHandler(cfg)
+        handler = AudioTextHandler(spec, dataset_name=dataset_name)
     else:
-        raise ValueError(f"Unsupported mode: {mode!r}")
+        assert_never(spec.mode)
 
-    return tokenize_loop(rank, world_size, cfg, handler)
+    try:
+        return tokenize_loop(
+            spec,
+            dataset_name=dataset_name,
+            input_shar_dirs=input_shar_dirs,
+            planned_shar_fields=planned_shar_fields,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+            final_output_dir=final_output_dir,
+            assigned_cut_count=assigned_cut_count,
+            handler=handler,
+        )
+    except BaseException:
+        try:
+            handler.abort_writer()
+        except Exception:
+            logger.exception("[rank %s] Failed to clean up unfinished writer", rank)
+        raise

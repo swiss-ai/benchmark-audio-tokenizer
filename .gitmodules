@@ -28,13 +28,12 @@
 [submodule "src/repos/posttraining-data"]
 	path = src/repos/posttraining-data
 	url = https://github.com/swiss-ai/posttraining-data.git
-[submodule "src/repos/benchmark-image-tokenzier"]
-	path = src/repos/benchmark-image-tokenzier
-	url = https://github.com/swiss-ai/benchmark-image-tokenzier.git
-	branch = yxu-tokenization-refactor
 [submodule "src/repos/MiMo-Audio"]
 	path = src/repos/MiMo-Audio
 	url = https://github.com/XiaomiMiMo/MiMo-Audio.git
 [submodule "src/repos/unicodec"]
 	path = src/repos/unicodec
 	url = https://github.com/mesolitica/UniCodec-fix.git
+[submodule "src/3rdparty/lhotse"]
+	path = src/3rdparty/lhotse
+	url = https://github.com/Alvorecer721/lhotse.git

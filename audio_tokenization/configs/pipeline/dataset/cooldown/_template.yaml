@@ -1,0 +1,22 @@
+defaults:
+  - /recipe/parquet_audio_text_interleaved@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+name: cooldown_my_dataset
+language: null
+
+source:
+  path: /path/to/processed/cooldown/my_dataset
+  files: "train-*.parquet"
+
+columns:
+  audio: audio
+  text: text
+  duration: duration
+  id: id
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/my_dataset
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: cooldown_my_dataset

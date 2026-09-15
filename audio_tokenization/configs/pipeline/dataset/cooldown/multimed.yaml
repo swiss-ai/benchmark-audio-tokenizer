@@ -1,0 +1,50 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# MultiMed (ACL 2025) — multilingual medical-domain ASR pairs in 5 languages
+# (zh/en/fr/de/vi). Source parquets organize by language directory, so they
+# were repacked with an explicit `locale` column by
+# `multimodal-data/01-dataset-download/audio/multimed/repack_with_locale.py`.
+# Train split only. Test/eval are held out for downstream evaluation.
+#
+# 5 langs × {1,242 / 25,512 / 1,403 / 1,443 / 4,548} clips = 34,148 clips,
+# ~98.4 h. Each row is one independent (audio, transcript) pair — direct ASR
+# (no source-with-clips structure → not interleavable).
+
+name: cooldown_multimed
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/multimed/data
+  files: "*.parquet"
+
+columns:
+  audio: audio
+  text: text
+  duration: duration
+  id: null
+  language_column: locale
+  id_prefix: multimed
+  keep: []
+  constant:
+    dataset: multimed_train
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/multimed_train
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: multimed_train
+
+conversion:
+  enabled: true
+  num_workers: 5
+  shard_size: 5000
+  read_batch_size: 64
+  mp_start_method: fork
+
+tokenization:
+  # 2 s floor matches the cooldown-wide default.
+  min_duration: 2.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 500

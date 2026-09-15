@@ -1,0 +1,57 @@
+defaults:
+  - /recipe/hf_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# Tuda-De German read-speech (UHH-LT). HF datasets arrow shards on disk; each
+# row is one read sentence (median ~8.5 s, max ~43 s) with speaker / dialect /
+# microphone metadata. Drop-in ASR pairs — no source-with-clips relationship,
+# so direct (not interleaved).
+
+name: cooldown_tuda_de
+language: de
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___uhhlt___Tuda-De/splits/train
+  files: data-*.arrow
+
+columns:
+  audio: audio
+  text: cleaned_sentence
+  duration: null
+  id: null
+  language_column: null
+  id_prefix: tuda_de
+  keep:
+    - sentence
+    - sentence_id
+    - speaker_id
+    - gender
+    - ageclass
+    - microphone
+    - angle
+    - corpus
+    - muttersprachler
+    - bundesland
+  constant:
+    dataset: tuda_de_train
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/tuda_de_train
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: tuda_de_train
+
+conversion:
+  enabled: true
+  num_workers: 30
+  shard_size: 5000
+  read_batch_size: 128
+  mp_start_method: fork
+
+tokenization:
+  # 2 s floor matches the cooldown-wide default. Drops ~25% of cuts but
+  # only ~6% of hours (Tuda has 8% of cuts in 1-2 s).
+  min_duration: 2.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 1000

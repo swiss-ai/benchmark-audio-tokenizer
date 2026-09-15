@@ -1,0 +1,23 @@
+defaults:
+  - /recipe/parquet_audio_text_interleaved@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+name: internal_my_dataset
+language: null
+
+source:
+  path: /path/to/processed/internal/my_dataset
+  files: "*.parquet"
+
+columns:
+  audio: audio
+  text: text
+  duration: duration
+  id: id
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/internal-only/my_dataset
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/internal-only
+  name: internal_my_dataset
+  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/internal-only/my_dataset_interleaved

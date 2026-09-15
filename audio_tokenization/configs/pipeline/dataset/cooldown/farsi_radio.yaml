@@ -1,0 +1,65 @@
+defaults:
+  - /recipe/parquet_audio_text_interleaved@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# farsi-asr radio split — Persian radio program ASR, pre-segmented into
+# short VAD-style clips (mean 4.6 s, max 12 s). audio.path encodes
+# `<show>_<episode>_<clipnum>.wav` (e.g.
+# `Amrikaye_Ziba_radio-goftego-99_04_12-19_30_86.wav`), so source_id + clip_num
+# are parsable via trailing_number_basename: source_id =
+# show+episode+date+air_time, clip_num = trailing integer.
+#
+# YouTube split is INTENTIONALLY excluded — it ships as whole-video opus +
+# WebVTT inside per-channel tarballs and needs a separate tar->parquet
+# extractor with vtt-cue slicing.
+#
+# 331 parquets, 372,553 rows, ~503 h. Strongly interleavable: ~3,000 distinct
+# episodes, median 123 clips per episode (~9 min stitched audio).
+
+name: cooldown_farsi_radio
+language: fa
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___farsi-asr___farsi-asr-dataset/parquet
+  files: "*.parquet"
+
+columns:
+  audio: audio
+  text: transcription
+  duration: null
+  id: audio.path
+  language_column: null
+  id_prefix: farsi_radio
+  keep:
+    - source
+  constant:
+    dataset: farsi_asr_radio
+
+timeline:
+  type: id_parser
+  parser: trailing_number_basename
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/farsi_asr_radio
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: farsi_asr_radio
+  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/farsi_asr_radio_interleaved
+
+conversion:
+  enabled: true
+  num_workers: 128
+  shard_size: 5000
+  read_batch_size: 64
+  mp_start_method: fork
+
+tokenization:
+  min_duration: 1.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000
+
+materialization:
+  # 8 k tokens per sequence — cooldown-wide standard for interleave.
+  max_seq_len: 8192
+  transcribe_ratio: 0.5

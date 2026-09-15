@@ -1,0 +1,21 @@
+defaults:
+  - /recipe/parquet_audio_only@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+name: stage1_my_dataset
+language: null
+
+source:
+  path: /path/to/processed/stage1/my_dataset
+  files: "*.parquet"
+
+columns:
+  audio: audio
+  duration: duration
+  id: id
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/stage_1/my_dataset
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/stage_1
+  name: stage1_my_dataset

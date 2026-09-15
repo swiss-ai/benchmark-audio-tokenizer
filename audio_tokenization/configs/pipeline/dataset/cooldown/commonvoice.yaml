@@ -1,0 +1,65 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# CommonVoice 25 cooldown — train + validated_extra splits across all 54
+# languages. The stage-1 build used the `other` (unvalidated) split; cooldown
+# pulls the validated, higher-quality reads.
+#
+# The convert pipeline takes a single glob, so the view dir at
+# /processed/commonvoice25_cooldown/<lang>/{train,validated_extra}.parquet
+# is built by `multimodal-data/01-dataset-download/audio/commonvoice25/
+# build_cooldown_view_dir.py` as symlinks back to the canonical
+# /processed/commonvoice25/<lang>/ files. `*/*.parquet` then matches exactly
+# the 108 files we want (54 langs × 2 splits) — no risk of pulling in
+# dev/test/other/invalidated.
+#
+# 11.88M rows (5.62M train + 6.26M validated_extra), ~16,247 h, mean clip
+# ~4.92 s. Locale carried per-row via the `locale` column.
+
+name: cooldown_commonvoice
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/commonvoice25_cooldown
+  files: "*/*.parquet"
+
+columns:
+  audio: audio_bytes
+  text: sentence
+  id: clip_id
+  language_column: locale
+  # locale is intentionally NOT in keep — it's already populated as
+  # supervisions[0].language via language_column above. Single source of
+  # truth, no risk of drift.
+  keep:
+    - client_id
+    - accents
+    - age
+    - gender
+    - segment
+    - sentence_domain
+    - sentence_id
+    - up_votes
+    - down_votes
+    - variant
+    - split
+  constant:
+    dataset: commonvoice25_cooldown
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/commonvoice25_train_extra
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: commonvoice25_train_extra
+
+conversion:
+  num_workers: 108
+  shard_size: 5000
+  read_batch_size: 64
+  mp_start_method: fork
+
+tokenization:
+  min_duration: 2.0
+  max_duration: 200.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000

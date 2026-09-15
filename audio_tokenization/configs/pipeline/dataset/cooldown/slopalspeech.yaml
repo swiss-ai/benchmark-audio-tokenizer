@@ -1,0 +1,45 @@
+defaults:
+  - /recipe/parquet_audio_text_interleaved@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# SloPalSpeech — Slovak parliamentary speech aligned to session timestamps.
+# The processed source excludes two sessions with duplicated/overlapping spans:
+# 14_2013-01-31 and 35_2014-06-12. See filter_manifest.json in the source root.
+
+name: cooldown_slopalspeech
+language: sk
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/slopalspeech_no_overlap/data
+  files: train-*.parquet
+
+columns:
+  audio: audio
+  text: text
+  duration: duration
+  id: audio.path
+  keep: [id, session_num, snapshot, segment_number, start_time, end_time]
+  constant:
+    dataset: slopalspeech
+  derived:
+    source_session: "{session_num}_{snapshot}"
+
+timeline:
+  type: id_parser
+  parser: trailing_number_basename
+  clip_start: start_time
+  clip_end: end_time
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/slopalspeech
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: slopalspeech
+  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/slopalspeech_interleaved
+
+materialization:
+  # 8 k tokens per sequence is the cooldown-wide standard for interleave
+  # datasets (matches ccpodcasts; overrides recipe default of 262 k).
+  max_seq_len: 8192
+  max_gap_sec: 5.0
+  transcribe_ratio: 0.5

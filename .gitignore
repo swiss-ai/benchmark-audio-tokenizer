@@ -10,7 +10,17 @@ requirements*-subdeps.txt
 core_*
 samples
 .cursor/
+.codex
 plans/
+
+# Hydra job outputs / wandb runs (artifacts, never source)
+outputs/
+wandb/
+
+# Operator scratch — data dumps from inference / itn experiments
+scripts/_*.jsonl
+scripts/_*manifest.json
+scripts/it[0-9]*manifest.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

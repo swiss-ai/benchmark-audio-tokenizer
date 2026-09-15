@@ -1,0 +1,13 @@
+# Explicit legacy runtime fallback. Use LHOTSE_RUNTIME_MODE=legacy and
+# provide the matching legacy dependency overlay when reproducing old tokens.
+image = "/capstor/store/cscs/swissai/infra01/MLLM/containers/nvcr.io#nvidia+nemo+25.11.aarch64.sqsh"
+mounts = ["/capstor", "/iopsstor", "/users"]
+writable = true
+workdir = "/iopsstor/scratch/cscs/xyixuan"
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"
+
+[env]
+CUDA_CACHE_DISABLE = "1"

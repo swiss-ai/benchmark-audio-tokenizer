@@ -21,6 +21,33 @@ The benchmarking framework focuses on two main objectives:
 - `uv` package manager (recommended, for creating virtual environments)
 - PyTorch NGC 24.11 environment (recommended)
 
+## Production Conversion Defaults
+
+Use `conversion.resampling_backend: soxr` for large SHAR conversion runs. `soxr`
+is a dedicated CPU resampler with high-quality output, predictable performance,
+and less container/ABI coupling than torchaudio. Decode can still dominate
+runtime on compressed audio, so the end-to-end speedup is dataset-dependent, but
+`soxr` is the preferred production default for resampling.
+
+## WavTokenizer pipeline runtime
+
+The WavTokenizer pipeline uses a pinned Lhotse fork at
+[`src/3rdparty/lhotse`](src/3rdparty/lhotse). Initialize it with:
+
+```sh
+git submodule update --init src/3rdparty/lhotse
+```
+
+The gitlink records our tested commit, including the sampler duration fix.
+The Python package remains `lhotse`; its wheel version includes the Git commit.
+Image builds check that the submodule checkout and dependency lock agree.
+Slurm jobs import the wheel baked into the image. They do not install or compile
+Lhotse or TorchAudio at startup.
+
+See the [NeMo 26.08 image recipe](scripts/envs/image/README.md) for offline build
+inputs, validation, and the supported pipeline environment. The environment
+instructions below also cover the separate tokenizer benchmarking tools.
+
 ## Installation
 
 ### 1. Clone the Repository

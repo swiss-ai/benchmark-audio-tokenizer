@@ -1,0 +1,74 @@
+defaults:
+  - /recipe/parquet_sft_audio@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# swissai/yuhei vocalized_sft: TTS-synthesized SFT corpus over 8 source datasets
+# (SlimOrca, WildChat, ultrachat_200k, aya, airoboros-3.1, Capybara, oasst2,
+# Pure-Dove). Audio is 24 kHz int16 mono WAV, multi-speaker TTS (likely XTTS-v2
+# or CosyVoice family).
+#
+# Post-cleanup state (May 17):
+#   * 639,816 conversations, 984,932 audio turns
+#   * Decontaminated against pre-TTS benchmark contam (2,153 dropped)
+#   * Swiss German + Korean filtered out (6,141 dropped)
+#   * 22.6% multi-turn (mostly Capybara, Capybara avg 2.5 turns, ultrachat 3.5)
+#   * 9-11 effective languages, English dominates (78%)
+#   * ~4,236 audio hours total
+#
+# Pre-flattened by:
+#   /tmp/voc_to_parquet.py  (sibling repo not yet committed)
+
+name: sft_vocalized_sft
+language: en  # mixed-language overall; metadata column 'language' preserved per-row
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/swissai___yuhei___vocalized_sft/data
+  files: "train-*.parquet"
+
+columns:
+  audio: audio_bytes
+  duration: duration_sec
+  id: audio_id
+  keep:
+    - audio_path
+    - audio_format
+    - sampling_rate
+    - num_frames
+    - sample_id
+    - turn_index
+    - source_dataset
+    - language
+  constant:
+    dataset: vocalized_sft
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/sft/vocalized_sft_audio
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft
+  sft_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft/vocalized_sft
+  name: vocalized_sft_audio
+
+tokenizer:
+  path: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok_instruct
+
+conversion:
+  num_workers: 64
+  shard_size: 5000
+  shar_format: flac
+
+tokenization:
+  min_duration: 1.0
+  # Per-turn audio max sampled at 58.6s (long-form TTS for verbose LLM replies);
+  # 120s ceiling is generous without being absurd.
+  max_duration: 120.0
+  num_workers: 32
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 1000
+
+materialization:
+  sft:
+    conversations_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/processed/sft/swissai___yuhei___vocalized_sft/conversations
+    max_seq_len: 262144
+    seq_threshold: 8192
+    messages_column: messages_json
+    num_workers: 64

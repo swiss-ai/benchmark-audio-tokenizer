@@ -1,0 +1,46 @@
+defaults:
+  - /recipe/parquet_audio_text_direct@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# VietSpeech is a standalone utterance ASR corpus. The filename is stable per
+# sample, but the dataset does not provide source-timeline metadata, so this is
+# intentionally direct ASR rather than interleaved audio-text.
+#
+# 1,026,047 train clips, ~1,100 hours, Vietnamese, 16 kHz WAV bytes.
+
+name: cooldown_vietspeech
+language: vi
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/hf___NhutP___VietSpeech/data
+  files: train-*.parquet
+
+columns:
+  audio: audio
+  text: transcription
+  duration: null
+  id: audio.path
+  id_prefix: vietspeech
+  constant:
+    dataset: vietspeech
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/vietspeech
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: vietspeech
+
+conversion:
+  num_workers: 288
+  # Convert-time has no CUDA or active dataloader threads; fork avoids
+  # re-importing torch/lhotse in every worker on large CPU-only conversion.
+  mp_start_method: fork
+
+tokenization:
+  # 2 s floor matches the cooldown-wide default. Source was upstream-
+  # filtered to >= 2 s already, so this is a no-op for vietspeech but
+  # keeps the floor consistent if upstream changes.
+  min_duration: 2.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 2000

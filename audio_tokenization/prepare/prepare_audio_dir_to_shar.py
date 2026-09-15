@@ -1,0 +1,373 @@
+"""Convert individual audio files + VAD JSONL to Lhotse Shar format.
+
+Reads audio files from a directory tree and VAD timestamps from JSONL files
+(one per language+year or arbitrary grouping), applies VAD-aware chunking,
+resamples to target SR, and writes to Shar. Designed for sources like
+VoxPopuli where audio is stored as individual files rather than tar shards.
+
+Invocation goes through the Hydra stage adapter:
+``python -m audio_tokenization run dataset=<name> stage=convert`` with a
+``configs/pipeline/dataset/<name>.yaml`` that picks the audio_dir recipe.
+"""
+
+from collections import Counter
+from dataclasses import dataclass
+import logging
+import time
+from pathlib import Path
+
+from audio_tokenization.contracts.errors import OutputWriteError
+from audio_tokenization.prepare.atomic_shar import atomic_shar_partition
+from audio_tokenization.prepare.audio_ops import apply_audio_pipeline, write_cut_to_shar
+from audio_tokenization.prepare.cli import expand_path_patterns
+from audio_tokenization.prepare.identity import set_interleave_metadata
+from audio_tokenization.prepare.runtime import (
+    build_audio_index,
+    distribute_round_robin,
+    init_worker_process,
+    maybe_log_worker_progress,
+    coerce_resolved_inputs,
+    resolve_num_workers,
+    run_pool_and_finalize,
+    setup_partition_dir,
+    validate_prepare_runtime,
+    write_worker_result,
+)
+from audio_tokenization.prepare.preprocess.chunking import (
+    VADChunkingConfig,
+    _parse_vad_jsonl_line,
+    split_cut_by_vad,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(processName)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+_AUDIO_INDEX = None
+
+
+@dataclass(frozen=True, slots=True)
+class AudioDirWorkerArgs:
+    """Typed worker contract for audio-dir VAD prepare.
+
+    ``audio_index`` is ``None`` for fork workers, where the large index is
+    shared through the module global via copy-on-write. Spawn/forkserver workers
+    receive the index explicitly because they do not inherit module globals.
+    """
+
+    worker_id: int
+    jsonl_paths: tuple[str, ...]
+    audio_index: dict[str, str] | None
+    shar_dir: str
+    target_sr: int | None
+    shard_size: int
+    shar_format: str
+    min_sr: int | None
+    mono_downmix: bool
+    vad_max_chunk_sec: float
+    vad_min_chunk_sec: float
+    vad_sample_rate: int
+    vad_max_merge_gap_sec: float
+    vad_max_duration_sec: float | None
+    resampling_backend: str | None
+
+
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+
+def _convert_worker(args: AudioDirWorkerArgs):
+    """Convert a subset of VAD JSONL entries to Shar.
+
+    Each worker writes to its own ``worker_XX/`` directory to avoid contention,
+    and marks completion with ``worker_XX/_SUCCESS``. The stage-level contract
+    is owned by ``run_stage``; partition success is a lower-level signal.
+    """
+    worker_id = args.worker_id
+    jsonl_paths = args.jsonl_paths
+    audio_index = args.audio_index if args.audio_index is not None else _AUDIO_INDEX
+    shar_dir = args.shar_dir
+    target_sr = args.target_sr
+    shard_size = args.shard_size
+    shar_format = args.shar_format
+    min_sr = args.min_sr
+    mono_downmix = args.mono_downmix
+    vad_max_chunk_sec = args.vad_max_chunk_sec
+    vad_min_chunk_sec = args.vad_min_chunk_sec
+    vad_sample_rate = args.vad_sample_rate
+    vad_max_merge_gap_sec = args.vad_max_merge_gap_sec
+    vad_max_duration_sec = args.vad_max_duration_sec
+    resampling_backend = args.resampling_backend
+    if audio_index is None:
+        raise RuntimeError(
+            "audio_dir worker did not receive an audio index. Use fork "
+            "start method for the shared-index path or pass "
+            "AudioDirWorkerArgs.audio_index explicitly."
+        )
+
+    worker_dir = Path(shar_dir) / f"worker_{worker_id:02d}"
+    setup_partition_dir(worker_dir, worker_id=worker_id, logger=logger)
+    init_worker_process(resampling_backend)
+
+    from lhotse import Recording
+    from lhotse.shar import SharWriter
+
+    reason_counts = Counter()
+    runtime_counts = Counter()
+
+    t0 = time.time()
+    written = skipped = errors = 0
+    next_log_at = 1000
+    total_duration_sec = 0.0
+    vad_cfg = VADChunkingConfig(
+        max_chunk_sec=float(vad_max_chunk_sec),
+        min_chunk_sec=float(vad_min_chunk_sec),
+        sample_rate=int(vad_sample_rate),
+        max_merge_gap_sec=float(vad_max_merge_gap_sec),
+        max_duration_sec=(
+            float(vad_max_duration_sec)
+            if vad_max_duration_sec is not None
+            else None
+        ),
+    )
+
+    with atomic_shar_partition(worker_dir, fields=("recording",)) as staged_dir, SharWriter(
+        output_dir=str(staged_dir),
+        fields={"recording": shar_format},
+        shard_size=shard_size,
+    ) as writer:
+        for jsonl_path in jsonl_paths:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parsed = _parse_vad_jsonl_line(
+                        line,
+                        with_duration=True,
+                        with_sample_rate=True,
+                        with_lang=True,
+                    )
+                    if parsed is None:
+                        runtime_counts["parse_failed"] += 1
+                        continue
+
+                    key, timestamps, duration_sec, sr, lang = parsed
+
+                    # Resolve audio path
+                    audio_path = audio_index.get(key)
+                    if audio_path is None:
+                        runtime_counts["missing_audio"] += 1
+                        skipped += 1
+                        continue
+
+                    # Build Lhotse recording from file
+                    try:
+                        recording = Recording.from_file(audio_path)
+                        cut = recording.to_cut()
+                    except Exception as e:
+                        errors += 1
+                        runtime_counts["failed_build_cut"] += 1
+                        if errors <= 5:
+                            logger.warning(
+                                f"Worker {worker_id} error loading {key}: {e}"
+                            )
+                        continue
+
+                    # Min sample rate check
+                    if min_sr and cut.sampling_rate < min_sr:
+                        skipped += 1
+                        runtime_counts["skipped_min_sr"] += 1
+                        continue
+
+                    # Resample if needed
+                    if target_sr and cut.sampling_rate != target_sr:
+                        cut = cut.resample(target_sr)
+                        runtime_counts["resampled"] += 1
+
+                    try:
+                        out_cuts, reason = split_cut_by_vad(
+                            cut=cut,
+                            timestamps=timestamps,
+                            cfg=vad_cfg,
+                            runtime_counts=runtime_counts,
+                        )
+                    except Exception as e:
+                        errors += 1
+                        runtime_counts["processing_errors"] += 1
+                        if errors <= 5:
+                            logger.warning(
+                                f"Worker {worker_id} error chunking {key}: {e}"
+                            )
+                        continue
+                    reason_counts[reason] += 1
+                    if not out_cuts:
+                        skipped += 1
+                        continue
+
+                    for chunk_idx, subcut in enumerate(out_cuts):
+                        try:
+                            subcut.custom = subcut.custom or {}
+                            subcut.custom["lang"] = lang
+                            subcut, skip, decoded_audio = apply_audio_pipeline(
+                                subcut,
+                                target_sr=None,  # already resampled before VAD
+                                mono_downmix=mono_downmix,
+                                tokenize_fn=None,
+                                runtime_counts=runtime_counts,
+                            )
+                            if skip:
+                                skipped += 1
+                                continue
+                            set_interleave_metadata(
+                                subcut,
+                                key,
+                                chunk_idx,
+                                clip_start=subcut.custom.get(
+                                    "global_offset_sec", 0.0,
+                                ),
+                            )
+
+                            write_cut_to_shar(
+                                writer,
+                                subcut,
+                                audio=decoded_audio,
+                                runtime_counts=runtime_counts,
+                            )
+                            written += 1
+                            total_duration_sec += subcut.duration
+                            runtime_counts["cuts_written"] += 1
+                            next_log_at = maybe_log_worker_progress(
+                                logger=logger,
+                                worker_id=worker_id,
+                                written=written,
+                                skipped=skipped,
+                                errors=errors,
+                                t0=t0,
+                                next_log_at=next_log_at,
+                            )
+                        except OutputWriteError:
+                            raise
+                        except Exception as e:
+                            errors += 1
+                            runtime_counts["processing_errors"] += 1
+                            if errors <= 5:
+                                offset = (subcut.custom or {}).get(
+                                    "global_offset_sec", 0.0,
+                                )
+                                logger.warning(
+                                    f"Worker {worker_id} error on chunk "
+                                    f"{key}@{offset:.1f}: {e}"
+                                )
+    if reason_counts:
+        logger.info(f"Worker {worker_id} VAD reasons: {dict(reason_counts)}")
+
+    return write_worker_result(
+        worker_id=worker_id, worker_dir=worker_dir,
+        written=written, skipped=skipped, errors=errors,
+        total_duration_sec=total_duration_sec,
+        runtime_counts=runtime_counts, t0=t0,
+        extra_stats={"reason_counts": dict(reason_counts)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def resolve(spec) -> tuple[list[str], dict]:
+    """Resolve VAD JSONL files for this prepare family."""
+    i = spec.input
+    if not i.jsonl_files:
+        raise ValueError("prepare.input.jsonl_files is required")
+    resolved = expand_path_patterns(i.jsonl_files)
+    if not resolved:
+        raise FileNotFoundError("No audio_dir JSONL files resolved")
+    return resolved, {
+        "family": spec.family,
+        "audio_root": i.audio_root,
+        "audio_ext": i.audio_ext,
+        "jsonl_files": list(i.jsonl_files),
+        "resolved_inputs": resolved,
+    }
+
+
+def preflight(
+    spec,
+    *,
+    runtime_validator=validate_prepare_runtime,
+    resolved_inputs: list[str] | None = None,
+) -> None:
+    """Validate generic audio-dir prepare prerequisites."""
+    del resolved_inputs
+    i, o = spec.input, spec.output
+    audio_root = Path(i.audio_root)
+    if not audio_root.is_dir():
+        raise NotADirectoryError(f"Audio root not found: {audio_root}")
+    runtime_validator(
+        resampling_backend=o.resampling_backend,
+        require_ffmpeg=False,
+        text_tokenizer_path=None,
+    )
+
+
+def run(spec, *, resolved_inputs: list[str] | None = None):
+    """Execute audio_dir prepare for a typed PrepareSpec."""
+    i, o = spec.input, spec.output
+    audio_root = Path(i.audio_root)
+    shar_dir = Path(o.shar_dir)
+
+    resolved_jsonls = coerce_resolved_inputs(spec, resolved_inputs)
+
+    logger.info(f"Building audio index from {audio_root} (*{i.audio_ext}) ...")
+    t_idx = time.time()
+    audio_index = build_audio_index(audio_root, f"**/*{i.audio_ext}")
+    logger.info(f"Indexed {len(audio_index):,} audio files in {time.time() - t_idx:.1f}s")
+    if not audio_index:
+        raise FileNotFoundError(f"No *{i.audio_ext} files found under {audio_root}")
+
+    shar_dir.mkdir(parents=True, exist_ok=True)
+
+    num_workers = resolve_num_workers(o.num_workers, num_inputs=len(resolved_jsonls))
+
+    logger.info(f"Found {len(resolved_jsonls)} JSONL files, using {num_workers} workers")
+    logger.info(f"Output: {shar_dir}")
+
+    worker_jsonls = distribute_round_robin(resolved_jsonls, num_workers)
+
+    use_shared_audio_index = o.mp_start_method == "fork"
+    global _AUDIO_INDEX
+    _AUDIO_INDEX = audio_index if use_shared_audio_index else None
+    worker_args = []
+    for wid, jsonls in enumerate(worker_jsonls):
+        if not jsonls:
+            continue
+        worker_args.append(
+            AudioDirWorkerArgs(
+                worker_id=wid,
+                jsonl_paths=tuple(jsonls),
+                audio_index=None if use_shared_audio_index else audio_index,
+                shar_dir=str(shar_dir),
+                target_sr=o.target_sr,
+                shard_size=o.shard_size,
+                shar_format=o.shar_format,
+                min_sr=i.min_sr,
+                mono_downmix=not i.no_mono_downmix,
+                vad_max_chunk_sec=i.vad_max_chunk_sec,
+                vad_min_chunk_sec=i.vad_min_chunk_sec,
+                vad_sample_rate=i.vad_sample_rate,
+                vad_max_merge_gap_sec=i.vad_max_merge_gap_sec,
+                vad_max_duration_sec=i.vad_max_duration_sec,
+                resampling_backend=o.resampling_backend,
+            )
+        )
+
+    try:
+        run_pool_and_finalize(
+            _convert_worker,
+            worker_args,
+            shar_dir,
+            num_workers,
+            mp_start_method=o.mp_start_method,
+        )
+    finally:
+        _AUDIO_INDEX = None

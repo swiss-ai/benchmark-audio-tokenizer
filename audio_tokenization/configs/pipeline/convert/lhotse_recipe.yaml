@@ -1,0 +1,16 @@
+defaults:
+  - _common
+  - _self_
+
+family: lhotse_recipe
+input:
+  recipe: null
+  corpus_dir: null
+  split: null
+  recipe_kwargs: "{}"
+  min_sample_rate: null
+  trim_to_supervisions: false
+  shar_index_filename: shar_index.json
+output:
+  # Site override: pin the Alps wheelhouse tokenizer for in-cluster runs.
+  text_tokenizer: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok/tokenizer.json

@@ -1,0 +1,32 @@
+defaults:
+  - /recipe/parquet_sft_audio@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+name: sft_my_dataset
+language: null
+
+source:
+  path: /path/to/processed/sft/my_dataset/media/audio
+  files: "audio-*.parquet"
+
+columns:
+  audio: audio_bytes
+  duration: duration_sec
+  id: audio_id
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/sft/my_dataset_audio
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft
+  sft_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/sft/my_dataset
+  name: my_dataset_audio
+
+tokenizer:
+  path: /capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok_instruct
+
+materialization:
+  sft:
+    conversations_dir: /path/to/processed/sft/my_dataset/examples
+    messages_column: messages_json
+    max_seq_len: 262144
+    seq_threshold: 8192

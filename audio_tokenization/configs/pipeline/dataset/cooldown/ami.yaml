@@ -1,0 +1,68 @@
+defaults:
+  - /recipe/parquet_audio_text_interleaved@_here_
+  - /tokenizer/apertus_wavtok@_here_
+  - _self_
+
+# AMI Meeting Corpus, IHM (Individual Headset Mics) split. Each row is a per-
+# turn segment of a multi-party meeting with real begin/end timestamps. The
+# SDM (Single Distant Mic) split contains the same conversations on a different
+# mic and is intentionally NOT included — it would duplicate linguistic content
+# without adding new coverage.
+#
+# 42 parquets, 108,502 turns, ~100 h, mean turn ~3.3 s. Interleaving recovers
+# meeting flow: source_id = meeting_id, ordering by begin_time (clip_num is
+# derived from the timestamp), gap-aware materialize possible.
+
+name: cooldown_ami
+language: en
+
+source:
+  path: /capstor/store/cscs/swissai/infra01/audio-datasets/raw/ami/ihm
+  files: train-*.parquet
+
+columns:
+  audio: audio
+  text: text
+  duration: null
+  id: audio_id
+  language_column: null
+  id_prefix: ami_ihm
+  keep:
+    - meeting_id
+    - audio_id
+    - speaker_id
+    - microphone_id
+    - begin_time
+    - end_time
+  constant:
+    dataset: ami_ihm
+
+timeline:
+  type: clip_num
+  source_id: meeting_id
+  clip_start: begin_time
+  clip_end: end_time
+
+outputs:
+  shar_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/SHAR/cooldown/ami_ihm
+  tokenized_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown
+  name: ami_ihm
+  interleaved_dir: /capstor/store/cscs/swissai/infra01/audio-datasets/tokenized/cooldown/ami_ihm_interleaved
+
+conversion:
+  enabled: true
+  num_workers: 42
+  shard_size: 5000
+  read_batch_size: 64
+  mp_start_method: fork
+
+tokenization:
+  min_duration: 1.0
+  max_duration: 60.0
+  max_batch_duration: 2000.0
+  checkpoint_interval_batches: 500
+
+materialization:
+  interleave:
+    max_gap_sec: 5.0
+    transcribe_ratio: 0.5
