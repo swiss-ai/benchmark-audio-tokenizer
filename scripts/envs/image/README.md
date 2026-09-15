@@ -86,7 +86,7 @@ Image: `outputs/pipeline-runtime-integration-20260914/image/nemo-audio-tokenizat
 under the canonical audio workspace. SHA256:
 `cbfa22f5b019af9fde7bf19c7aa9d8983aa18a87970a123fc8adbbe55cd9020f`.
 
-The exported image passed all 682 pipeline tests with no dependency overlay,
+The exported image passed all 683 pipeline tests with no dependency overlay,
 CUDA resampling and compiled filtering, cuDNN, WAV/FLAC/MP3/Opus decoding, and
 SoXR resampling. The build inventory contains nine added wheels and no removed
 packages, changed existing versions, or system-package changes.
@@ -109,8 +109,26 @@ limits apply to baked and legacy runtimes. The pipeline's precision settings
 are unchanged. The prior old/new runtime comparison found 20 differing codes
 among 13,890 with the original cuDNN TF32 setting; disabling cuDNN TF32 in both
 runtimes matched that cohort but changed existing token IDs. Keep image and
-precision settings fixed when continuing an existing cache. This small-run
-certification is not a multi-node throughput or peak-memory guarantee.
+precision and batching settings fixed when continuing an existing cache.
+
+The September 15 rollout selected 512 real AMI clips (2,072.19 source seconds)
+and prepared 32 SHAR shards. Independent decoding and RMS calculation confirmed
+that the existing -50 dB filter excluded 22 quiet clips, leaving 490 clips.
+Four-rank one-node and eight-rank two-node runs each wrote all 490 clips exactly
+once, with 79,206 audio tokens and 12,283 text tokens and no runtime errors.
+Holding batch shape at one cut gave exact token and metadata equality across
+rank counts; both materialization runs produced the same 411 sequences and
+92,824 tokens. Normal multi-cut batching preserved coverage, lengths, text and
+metadata but changed audio token IDs in 82 of the 490 clips. This comparison
+establishes batch-dependent output variation; it does not isolate the underlying
+numerical operation. Shared JSON publication also has a regression test forcing
+concurrent writers through the rename boundary, using independent temporary
+filenames so equal PIDs on different nodes cannot collide.
+
+These bounded runs validate distributed correctness, not production-scale
+throughput or peak-memory limits. The rollout's first readback incorrectly
+expected quiet clips to survive conversion; correcting that validation-only
+expectation and independently checking every exclusion made readback pass.
 
 The stage helper selects the image on `srun`. Submit with plain `sbatch` from
 this checkout or export its absolute `REPO_DIR`; create the chosen Slurm log
@@ -124,3 +142,7 @@ standalone jobs outside `scripts/slurm/` are outside this migration.
 Evidence, manifests, exact commands and logs:
 
 `/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/outputs/pipeline-runtime-integration-20260914/`
+
+Larger rollout inputs, commands, logs and independent output verification:
+
+`/iopsstor/scratch/cscs/xyixuan/apertus/benchmark-audio-tokenizer/outputs/pr7-merge-validation-20260915/`

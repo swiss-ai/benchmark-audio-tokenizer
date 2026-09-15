@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Iterable
+from uuid import uuid4
 
 from audio_tokenization.contracts.artifacts import SUCCESS_MARKER_FILE
 
@@ -43,7 +44,8 @@ def atomic_write_json(
     the rename.
     """
     final_path = Path(path)
-    tmp_path = final_path.with_suffix(f"{final_path.suffix}.tmp.{os.getpid()}")
+    # PIDs can repeat across nodes, and threads share a PID.
+    tmp_path = final_path.with_suffix(f"{final_path.suffix}.tmp.{uuid4().hex}")
     try:
         data = json.dumps(payload, indent=indent, sort_keys=sort_keys, default=str)
         with open(tmp_path, "w", encoding="utf-8") as f:
