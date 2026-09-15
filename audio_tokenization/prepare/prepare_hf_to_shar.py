@@ -13,6 +13,8 @@ import logging
 import time
 from pathlib import Path
 
+from audio_tokenization.contracts.errors import OutputWriteError
+from audio_tokenization.prepare.atomic_shar import atomic_shar_partition
 from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
@@ -27,9 +29,10 @@ from audio_tokenization.prepare.columnar import (
     extract_clip_timestamps,
     extract_interleave_identity,
     extract_row_metadata,
+    projected_worker_columns,
     validate_columnar_schema_roots,
 )
-from audio_tokenization.prepare.constants import _MISSING, PREPARE_SHAR_COMMIT_MODE
+from audio_tokenization.prepare.constants import _MISSING
 from audio_tokenization.prepare.identity import set_interleave_metadata
 from audio_tokenization.prepare.metadata import (
     load_external_metadata,
@@ -120,18 +123,19 @@ def _convert_worker(args: ColumnarWorkerArgs):
     )
     external_metadata = _EXTERNAL_METADATA
 
-    with SharWriter(
-        output_dir=str(worker_dir),
+    with atomic_shar_partition(worker_dir, fields=("recording",)) as staged_dir, SharWriter(
+        output_dir=str(staged_dir),
         fields={"recording": shar_format},
         shard_size=shard_size,
-        commit=PREPARE_SHAR_COMMIT_MODE,
     ) as writer:
         for arrow_path in arrow_paths:
             arrow_name = Path(arrow_path).name
             arrow_stem = Path(arrow_path).stem
             logger.info(f"Worker {worker_id}: reading {arrow_name}")
             row_idx = 0
-            for row in iter_arrow_rows(arrow_path, batch_size=read_batch_size):
+            for row in iter_arrow_rows(
+                arrow_path, batch_size=read_batch_size, columns=projected_worker_columns(args),
+            ):
                 current_row_idx = row_idx
                 fallback_id = f"{arrow_stem}_{current_row_idx}" if not id_column else None
                 row_idx += 1
@@ -236,6 +240,8 @@ def _convert_worker(args: ColumnarWorkerArgs):
                         next_log_at=next_log_at,
                     )
 
+                except OutputWriteError:
+                    raise
                 except Exception as e:
                     errors += 1
                     runtime_counts["processing_errors"] += 1

@@ -24,13 +24,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+from audio_tokenization.contracts.errors import OutputWriteError
+from audio_tokenization.prepare.atomic_shar import atomic_shar_partition
 from audio_tokenization.prepare.audio_ops import (
     apply_audio_pipeline,
     build_recording_from_audio_bytes,
     write_cut_to_shar,
 )
 from audio_tokenization.prepare.cli import expand_path_patterns
-from audio_tokenization.prepare.constants import PREPARE_SHAR_COMMIT_MODE
 from audio_tokenization.prepare.identity import (
     resolve_input_source_and_clip_num,
     set_interleave_metadata,
@@ -411,11 +412,10 @@ def _convert_worker(args: WdsWorkerArgs):
         custom_fields=custom_fields,
     )
 
-    with SharWriter(
-        output_dir=str(worker_dir),
+    with atomic_shar_partition(worker_dir, fields=("recording",)) as staged_dir, SharWriter(
+        output_dir=str(staged_dir),
         fields={"recording": shar_format},
         shard_size=shard_size,
-        commit=PREPARE_SHAR_COMMIT_MODE,
     ) as writer:
         keep_ids = set(vad_lookup) if use_vad_segmenting else None
         for cut in iter_tar_cuts(tar_paths, provider=provider, stats=runtime_counts, keep_ids=keep_ids, language=language):
@@ -451,49 +451,59 @@ def _convert_worker(args: WdsWorkerArgs):
                 ) if lang_lookup else None
 
                 for chunk_idx, out_cut in enumerate(out_cuts):
-                    if sample_lang is not None:
-                        out_cut.custom = out_cut.custom or {}
-                        out_cut.custom["lang"] = sample_lang
-                    out_cut, skip, decoded_audio = apply_audio_pipeline(
-                        out_cut,
-                        target_sr=None,  # already resampled before VAD
-                        mono_downmix=mono_downmix,
-                        tokenize_fn=_tokenize_text,
-                        runtime_counts=runtime_counts,
-                    )
-                    if skip:
-                        skipped += 1
-                        continue
-                    source_id, clip_num = resolve_input_source_and_clip_num(
-                        cut.recording_id,
-                        chunk_idx=chunk_idx,
-                        input_clip_id_parser=input_clip_id_parser,
-                    )
-                    set_interleave_metadata(
-                        out_cut,
-                        source_id,
-                        clip_num,
-                        clip_start=(out_cut.custom or {}).get("global_offset_sec", 0.0),
-                    )
-                    write_cut_to_shar(
-                        writer,
-                        out_cut,
-                        audio=decoded_audio,
-                        runtime_counts=runtime_counts,
-                    )
-                    written += 1
-                    total_duration_sec += out_cut.duration
-                    runtime_counts["cuts_written"] += 1
-                    next_log_at = maybe_log_worker_progress(
-                        logger=logger,
-                        worker_id=worker_id,
-                        written=written,
-                        skipped=skipped,
-                        errors=errors,
-                        t0=t0,
-                        next_log_at=next_log_at,
-                    )
+                    try:
+                        if sample_lang is not None:
+                            out_cut.custom = out_cut.custom or {}
+                            out_cut.custom["lang"] = sample_lang
+                        out_cut, skip, decoded_audio = apply_audio_pipeline(
+                            out_cut,
+                            target_sr=None,  # already resampled before VAD
+                            mono_downmix=mono_downmix,
+                            tokenize_fn=_tokenize_text,
+                            runtime_counts=runtime_counts,
+                        )
+                        if skip:
+                            skipped += 1
+                            continue
+                        source_id, clip_num = resolve_input_source_and_clip_num(
+                            cut.recording_id,
+                            chunk_idx=chunk_idx,
+                            input_clip_id_parser=input_clip_id_parser,
+                        )
+                        set_interleave_metadata(
+                            out_cut,
+                            source_id,
+                            clip_num,
+                            clip_start=(out_cut.custom or {}).get("global_offset_sec", 0.0),
+                        )
+                        write_cut_to_shar(
+                            writer,
+                            out_cut,
+                            audio=decoded_audio,
+                            runtime_counts=runtime_counts,
+                        )
+                        written += 1
+                        total_duration_sec += out_cut.duration
+                        runtime_counts["cuts_written"] += 1
+                        next_log_at = maybe_log_worker_progress(
+                            logger=logger,
+                            worker_id=worker_id,
+                            written=written,
+                            skipped=skipped,
+                            errors=errors,
+                            t0=t0,
+                            next_log_at=next_log_at,
+                        )
+                    except OutputWriteError:
+                        raise
+                    except Exception as e:
+                        errors += 1
+                        runtime_counts["processing_errors"] += 1
+                        if errors <= 5:
+                            logger.warning("Worker %s error on %s: %s", worker_id, out_cut.id, e)
 
+            except OutputWriteError:
+                raise
             except Exception as e:
                 errors += 1
                 runtime_counts["processing_errors"] += 1

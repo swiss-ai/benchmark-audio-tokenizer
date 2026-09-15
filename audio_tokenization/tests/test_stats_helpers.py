@@ -245,9 +245,7 @@ def test_prepare_pool_reports_workers_as_they_finish(monkeypatch, tmp_path):
         prepare_runtime, "build_shar_index_for_worker_dirs", lambda *_args, **_kwargs: None
     )
 
-    import audio_tokenization.prepare.validate_shar as validate_shar
-
-    monkeypatch.setattr(validate_shar, "validate_shar_directory", lambda _path: {})
+    monkeypatch.setattr(prepare_runtime, "finalize_shar_directory", lambda _path: {})
 
     logger = _CaptureLogger()
     monkeypatch.setattr(prepare_runtime, "logger", logger)
@@ -306,9 +304,7 @@ def test_prepare_pool_indexes_actual_worker_dirs_for_sparse_ids(monkeypatch, tmp
 
     monkeypatch.setattr(prepare_runtime, "build_shar_index_for_worker_dirs", _capture_index)
 
-    import audio_tokenization.prepare.validate_shar as validate_shar
-
-    monkeypatch.setattr(validate_shar, "validate_shar_directory", lambda _path: {})
+    monkeypatch.setattr(prepare_runtime, "finalize_shar_directory", lambda _path: {})
 
     def worker(worker_id):
         worker_dir = tmp_path / f"worker_{worker_id:02d}"

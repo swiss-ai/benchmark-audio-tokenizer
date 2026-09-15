@@ -292,7 +292,7 @@ def test_audio_token_cache_loader_rejects_truncated_token_file(tmp_path):
     with token_path.open("r+b") as f:
         f.truncate(token_path.stat().st_size - 4)
 
-    with pytest.raises(ValueError, match="shorter than its audio-token index requires"):
+    with pytest.raises(ValueError, match="token span exceeds payload bounds"):
         load_audio_token_cache(tmp_path)
 
 

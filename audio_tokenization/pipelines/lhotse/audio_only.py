@@ -3,17 +3,15 @@
 Writes Megatron indexed dataset micro-shards (``rank_XXXX_chunk_YYYY.{bin,idx}``).
 """
 
-import os
-
 import torch
 
 from audio_tokenization.config.schema import TokenizeSpec
 
 from ._unsupervised_batch import tokenize_unsupervised_batch
-from .checkpoint import finalize_shard_writer, open_chunk_writer
+from .checkpoint import MegatronWriterMixin
 
 
-class AudioOnlyHandler:
+class AudioOnlyHandler(MegatronWriterMixin):
     """Handler for audio-only tokenization mode.
 
     Uses WavTokenizer to encode audio into token sequences wrapped in
@@ -30,22 +28,7 @@ class AudioOnlyHandler:
         return UnsupervisedWaveformDataset(collate=True)
 
     def setup_writer(self, output_dir, rank, writer_state, tokenizer):
-        self._output_dir = output_dir
-        self._rank = rank
-        self._chunk_id = int(writer_state)
-        self._vocab_size = len(tokenizer.omni_tokenizer)
-        (
-            self._builder,
-            self._cut_ids,
-            self._tmp_bin,
-            self._tmp_idx,
-            self._tmp_cut_ids,
-            self._bin,
-            self._idx,
-            self._cut_ids_path,
-        ) = \
-            open_chunk_writer(output_dir, rank, self._chunk_id, self._vocab_size)
-        self.chunk_samples = 0
+        self._setup_megatron_writer(output_dir, rank, writer_state, tokenizer)
 
     def process_batch(self, batch, tokenizer, stats, target_sr, device):
         encoded = tokenize_unsupervised_batch(
@@ -55,7 +38,6 @@ class AudioOnlyHandler:
             device=device,
             dtype=torch.int64,
         )
-        stats.errors += encoded.errors
 
         for t, cut in encoded.tokens_and_cuts:
             self._builder.add_item(t)
@@ -68,50 +50,10 @@ class AudioOnlyHandler:
         return encoded.audio_seconds
 
     def checkpoint_writer(self) -> int:
-        finalize_shard_writer(
-            self._builder,
-            self._tmp_bin,
-            self._tmp_idx,
-            self._bin,
-            self._idx,
-            self._cut_ids,
-        )
-        self._chunk_id += 1
-        self.chunk_samples = 0
-        self.chunks_written += 1
-        (
-            self._builder,
-            self._cut_ids,
-            self._tmp_bin,
-            self._tmp_idx,
-            self._tmp_cut_ids,
-            self._bin,
-            self._idx,
-            self._cut_ids_path,
-        ) = \
-            open_chunk_writer(self._output_dir, self._rank, self._chunk_id, self._vocab_size)
-        return self._chunk_id
-
-    def get_writer_state(self) -> int:
-        return self._chunk_id
+        return self._rotate_megatron_writer()
 
     def finalize_writer(self):
-        if self.chunk_samples > 0:
-            finalize_shard_writer(
-                self._builder,
-                self._tmp_bin,
-                self._tmp_idx,
-                self._bin,
-                self._idx,
-                self._cut_ids,
-            )
-            self.chunks_written += 1
-            self._chunk_id += 1
-        else:
-            self._cut_ids.abort()
-            for p in (self._tmp_bin, self._tmp_idx):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
+        self._finalize_megatron_writer()
+
+    def abort_writer(self):
+        self._abort_megatron_writer()

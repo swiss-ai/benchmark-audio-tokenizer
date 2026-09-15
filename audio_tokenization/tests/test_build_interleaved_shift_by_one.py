@@ -8,6 +8,7 @@ import sys
 
 from audio_tokenization.interleave import shift_by_one as sbo
 from audio_tokenization.interleave.common import (
+    _TokenRunView,
     list_interleave_cache_partitions,
     load_interleave_cache,
     prepare_interleave_cache_and_runs,
@@ -18,9 +19,13 @@ from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
 class _FakeSliceableAccessor:
     def __init__(self, rows):
         self._rows = rows
+        self.lengths = np.array([len(row) for row in rows])
+
+    def get(self, idx):
+        return np.asarray(self._rows[idx], dtype=np.int32)
 
     def slice(self, start: int, length: int):
-        return self._rows[start:start + length]
+        return _TokenRunView(self, start, length)
 
 
 class _FakePreparedCache:
@@ -29,38 +34,12 @@ class _FakePreparedCache:
         self.text = _FakeSliceableAccessor(text_rows)
 
 
-def test_shift_by_one_mock_symbols_cover_multiple_interleavings() -> None:
-    sequences_0, leftovers_0 = sbo._accumulate_shift_sequences(
-        run_audio=[["a"], ["b"], ["c"], ["d"], ["e"], ["f"], ["g"]],
-        run_text=[["1"], ["2"], ["3"], ["4"], ["5"], ["6"], ["7"]],
-        offset=0,
-        max_seq_len=10,
-        bos_id="BOS",
-        eos_id="EOS",
-        stt_continue_id="STT",
-        tts_continue_id="TTS",
-    )
-    sequences_1, leftovers_1 = sbo._accumulate_shift_sequences(
-        run_audio=[["a"], ["b"], ["c"], ["d"], ["e"], ["f"], ["g"]],
-        run_text=[["1"], ["2"], ["3"], ["4"], ["5"], ["6"], ["7"]],
-        offset=1,
-        max_seq_len=10,
-        bos_id="BOS",
-        eos_id="EOS",
-        stt_continue_id="STT",
-        tts_continue_id="TTS",
-    )
-
-    assert sequences_0 == [
-        ["BOS", "a", "STT", "2", "TTS", "c", "STT", "4", "EOS"],
-        ["BOS", "e", "STT", "6", "EOS"],
-    ]
-    assert leftovers_0 == [6]
-    assert sequences_1 == [
-        ["BOS", "b", "STT", "3", "TTS", "d", "STT", "5", "EOS"],
-        ["BOS", "f", "STT", "7", "EOS"],
-    ]
-    assert leftovers_1 == []
+@pytest.mark.parametrize("offset,expected", [
+    (0, [(0, 4, 9), (4, 2, 5), (6, 1, 5)]),
+    (1, [(1, 4, 9), (5, 2, 5)]),
+])
+def test_shift_spans_cover_multiple_interleavings(offset, expected) -> None:
+    assert list(sbo._iter_shift_spans(np.ones(7), np.ones(7), offset, 10)) == expected
 
 
 def test_build_shift_sequence_orders_audio_then_next_text() -> None:
@@ -75,7 +54,7 @@ def test_build_shift_sequence_orders_audio_then_next_text() -> None:
         tts_continue_id=97,
     )
 
-    assert seq == [
+    assert seq.tolist() == [
         1,
         10, 11,
         99, 21, 22,
@@ -85,20 +64,8 @@ def test_build_shift_sequence_orders_audio_then_next_text() -> None:
     ]
 
 
-def test_accumulate_shift_sequences_tracks_leftovers() -> None:
-    sequences, leftovers = sbo._accumulate_shift_sequences(
-        run_audio=[[10], [11], [12]],
-        run_text=[[20], [21], [22]],
-        offset=0,
-        max_seq_len=100,
-        bos_id=1,
-        eos_id=2,
-        stt_continue_id=99,
-        tts_continue_id=97,
-    )
-
-    assert sequences == [[1, 10, 99, 21, 2]]
-    assert leftovers == [2]
+def test_shift_spans_tracks_leftovers() -> None:
+    assert list(sbo._iter_shift_spans([1, 1, 1], [1, 1, 1], 0, 100)) == [(0, 2, 5), (2, 1, 5)]
 
 
 def test_shift_run_chunk_emits_offsets_and_transcribe(tmp_path: Path) -> None:

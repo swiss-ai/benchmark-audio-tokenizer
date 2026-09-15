@@ -12,7 +12,45 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 : "${REPO_DIR:=${DEFAULT_REPO_DIR}}"
-: "${LHOTSE_DIR:=/iopsstor/scratch/cscs/xyixuan/dev/lhotse}"
+
+# Pin BLAS/OpenMP to single-threaded for the convert stage. The prepare
+# pipeline forks ~28+ workers per node; without this each forked worker
+# spawns up to $(nproc) BLAS threads, causing 28×288 ≈ 8000 OS threads to
+# thrash 288 cores. Probe 1985333 measured a 76× node-throughput regression
+# without this pinning. Tokenize stages do GPU work and are left untouched.
+if [ "${STAGE:-}" = "convert" ]; then
+  export OMP_NUM_THREADS=1
+  export MKL_NUM_THREADS=1
+  export OPENBLAS_NUM_THREADS=1
+  export NUMEXPR_NUM_THREADS=1
+  export VECLIB_MAXIMUM_THREADS=1
+fi
+
+
+: "${LHOTSE_RUNTIME_MODE:=legacy}"
+case "${LHOTSE_RUNTIME_MODE}" in
+  baked)
+    case "${STAGE:-}" in
+      convert|tokenize|materialize) ;;
+      *) echo "ERROR: unsupported baked runtime stage: ${STAGE:-unset}" >&2; return 2 ;;
+    esac
+    export INSTALL_TORCHCODEC=0 INSTALL_TORCHAUDIO=0 INSTALL_ONCE_PER_NODE=0
+    export PYTHONNOUSERSITE=1
+    export PYTHONPATH="${REPO_DIR}"
+    export PATH="/opt/venv/bin:${PATH}"
+    if [ "${PRINT_LHOTSE_RUNTIME:-1}" = "1" ]; then
+      python -c 'import lhotse, torchaudio; print(f"lhotse={lhotse.__file__}"); print(f"torchaudio={torchaudio.__version__} {torchaudio.__file__}")'
+      command -v ffmpeg
+    fi
+    return 0
+    ;;
+  legacy) ;;
+  *)
+    echo "ERROR: unsupported LHOTSE_RUNTIME_MODE=${LHOTSE_RUNTIME_MODE}" >&2
+    return 2
+    ;;
+esac
+: "${LHOTSE_DIR:=${REPO_DIR}/src/3rdparty/lhotse}"
 : "${WHEELHOUSE_AARCH64:=/capstor/store/cscs/swissai/infra01/MLLM/wheelhouse/aarch64}"
 : "${FFMPEG_ROOT:=${WHEELHOUSE_AARCH64}/ffmpeg-7.1.1-full-aarch64}"
 : "${TORCHCODEC_WHEELSET:=nemo_25_11}"
@@ -27,18 +65,6 @@ export PYTHONPATH="${LHOTSE_DIR}:${REPO_DIR}:${PYTHONPATH:-}"
 export PATH="/opt/venv/bin:${FFMPEG_ROOT}/bin:${PATH}"
 export LD_LIBRARY_PATH="${FFMPEG_ROOT}/lib:${LD_LIBRARY_PATH:-}"
 
-# Pin BLAS/OpenMP to single-threaded for the convert stage. The prepare
-# pipeline forks ~28+ workers per node; without this each forked worker
-# spawns up to $(nproc) BLAS threads, causing 28×288 ≈ 8000 OS threads to
-# thrash 288 cores. Probe 1985333 measured a 76× node-throughput regression
-# without this pinning. Tokenize stages do GPU work and are left untouched.
-if [ "${STAGE:-}" = "convert" ]; then
-  export OMP_NUM_THREADS=1
-  export MKL_NUM_THREADS=1
-  export OPENBLAS_NUM_THREADS=1
-  export NUMEXPR_NUM_THREADS=1
-  export VECLIB_MAXIMUM_THREADS=1
-fi
 
 lhotse_runtime_install() {
   if [ "${INSTALL_TORCHCODEC}" = "1" ]; then

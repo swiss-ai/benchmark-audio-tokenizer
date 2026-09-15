@@ -240,10 +240,10 @@ class StructuredCacheChunkWriter:
                 self._open_chunk()
 
             for row in rows:
-                audio_tokens = np.asarray(row["audio_tokens"], dtype=np.int32)
-                text_tokens = np.asarray(row["text_tokens"], dtype=np.int32)
-                self._audio_fh.write(audio_tokens.tobytes())
-                self._text_fh.write(text_tokens.tobytes())
+                audio_tokens = np.ascontiguousarray(row["audio_tokens"], dtype=np.int32)
+                text_tokens = np.ascontiguousarray(row["text_tokens"], dtype=np.int32)
+                self._audio_fh.write(memoryview(audio_tokens))
+                self._text_fh.write(memoryview(text_tokens))
                 self._rows.append({
                     "clip_id": row["clip_id"],
                     "source_id": row["source_id"],
@@ -315,6 +315,28 @@ class StructuredCacheChunkWriter:
             self._opened = False
             return finalized_id
 
+        def abort(self) -> None:
+            """Discard the current uncommitted chunk, including partial rows."""
+            for handle in (self._audio_fh, self._text_fh):
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        logger.exception("Failed to close unfinished structured cache chunk")
+            paths = [self._audio_tmp_path, self._text_tmp_path, self._clips_tmp_path]
+            if self._clips_final_path is not None and not self._clips_final_path.exists():
+                paths.extend([self._audio_final_path, self._text_final_path])
+            for path in paths:
+                if path is not None:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.exception("Failed to remove unfinished structured cache file %s", path)
+            self._audio_fh = self._text_fh = None
+            self._rows = []
+            self._total_rows = 0
+            self._opened = False
+
         def get_state(self) -> int:
             return self.chunk_id
 
@@ -335,6 +357,7 @@ class StructuredCacheChunkWriter:
         self._partition_writers: Dict[str, StructuredCacheChunkWriter._PartitionShardWriter] = {}
         self._num_rows = 0
         self._chunks_written = 0
+        self._aborted = False
         self._write_layout_metadata(
             self.output_dir,
             {
@@ -436,29 +459,50 @@ class StructuredCacheChunkWriter:
         return self._num_rows
 
     def add_rows(self, rows: List[Dict[str, Any]]) -> None:
-        if not rows:
-            return
-        grouped: Dict[str, List[Dict[str, Any]]] = {}
-        for row in rows:
-            partition_name = self._partition_name_for_row(row)
-            grouped.setdefault(partition_name, []).append(row)
-        for partition_name, part_rows in grouped.items():
-            writer = self._get_partition_writer(partition_name)
-            writer.add_rows(part_rows)
-            self._num_rows += len(part_rows)
+        if self._aborted:
+            raise RuntimeError("Cannot use an aborted structured cache writer")
+        try:
+            if not rows:
+                return
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                partition_name = self._partition_name_for_row(row)
+                grouped.setdefault(partition_name, []).append(row)
+            for partition_name, part_rows in grouped.items():
+                writer = self._get_partition_writer(partition_name)
+                writer.add_rows(part_rows)
+                self._num_rows += len(part_rows)
+        except BaseException:
+            self.abort()
+            raise
 
     def finalize(self) -> Dict[str, int]:
-        done: Dict[str, int] = {}
-        for partition_name, writer in sorted(self._partition_writers.items()):
-            finalized = writer.finalize()
-            if writer.get_state() != finalized:
-                self._chunks_written += 1
-            done[partition_name] = finalized
-        for partition_name, chunk_id in self._initial_writer_state.items():
-            if partition_name != "__default__" and partition_name not in done:
-                done[partition_name] = int(chunk_id)
+        if self._aborted:
+            raise RuntimeError("Cannot use an aborted structured cache writer")
+        try:
+            done: Dict[str, int] = {}
+            for partition_name, writer in sorted(self._partition_writers.items()):
+                finalized = writer.finalize()
+                if writer.get_state() != finalized:
+                    self._chunks_written += 1
+                done[partition_name] = finalized
+            for partition_name, chunk_id in self._initial_writer_state.items():
+                if partition_name != "__default__" and partition_name not in done:
+                    done[partition_name] = int(chunk_id)
+            self._num_rows = 0
+            return done
+        except BaseException:
+            self.abort()
+            raise
+
+    def abort(self) -> None:
+        self._aborted = True
+        for partition_name, writer in self._partition_writers.items():
+            try:
+                writer.abort()
+            except Exception:
+                logger.exception("Failed to abort structured cache partition %s", partition_name)
         self._num_rows = 0
-        return done
 
     def get_state(self) -> Dict[str, int]:
         state = {

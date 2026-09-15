@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import logging
 import os
 import shutil
@@ -70,7 +69,6 @@ def validate_prepare_runtime(
     """Fail fast on runtime prerequisites before worker startup."""
     from audio_tokenization.prepare.text_ops import load_text_tokenizer
 
-    require_lhotse_shar_features()
     init_worker_process(resampling_backend)
 
     if text_tokenizer_path is not None:
@@ -82,59 +80,6 @@ def validate_prepare_runtime(
             "Set PATH/LD_LIBRARY_PATH like the dataset SLURM script, or add a pinned ffmpeg "
             "runtime before starting prepare_parquet_to_shar."
         )
-
-
-def require_lhotse_shar_features() -> None:
-    """Fail early when the runtime is not the dev Lhotse required by prepare.
-
-    Convert now relies on two SHAR APIs that are intentionally owned by our
-    Lhotse fork: metadata-only tar iteration for validation, and atomic SHAR
-    commit for durable writes. Falling back to older packaged Lhotse would
-    silently weaken the stage contract, so make the dependency explicit.
-    """
-    missing: list[str] = []
-    try:
-        from lhotse import CutSet
-        import lhotse.shar as shar
-    except ImportError as exc:
-        raise RuntimeError(_dev_lhotse_error(["lhotse import"])) from exc
-
-    if not hasattr(shar, "iterate_tarfile_pairwise_metadata"):
-        missing.append("lhotse.shar.iterate_tarfile_pairwise_metadata")
-
-    shar_writer = getattr(shar, "SharWriter", None)
-    if shar_writer is None or not _accepts_keyword(shar_writer, "commit"):
-        missing.append("lhotse.shar.SharWriter(commit=...)")
-
-    to_shar = getattr(CutSet, "to_shar", None)
-    if to_shar is None or not _accepts_keyword(to_shar, "commit"):
-        missing.append("lhotse.CutSet.to_shar(commit=...)")
-
-    if missing:
-        raise RuntimeError(_dev_lhotse_error(missing))
-
-
-def _accepts_keyword(fn: Callable[..., Any], keyword: str) -> bool:
-    try:
-        signature = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return False
-    if keyword in signature.parameters:
-        return True
-    return any(
-        param.kind is inspect.Parameter.VAR_KEYWORD
-        for param in signature.parameters.values()
-    )
-
-
-def _dev_lhotse_error(missing: Sequence[str]) -> str:
-    missing_msg = ", ".join(missing)
-    return (
-        "audio-tokenization prepare requires dev Lhotse with SHAR atomic commit "
-        f"support; missing: {missing_msg}. Source "
-        "`scripts/utils/source_lhotse_runtime.sh` before running convert, or set "
-        "`LHOTSE_DIR` to a checkout that provides these APIs."
-    )
 
 
 def get_prepare_runner(spec):
@@ -276,6 +221,77 @@ def build_shar_index_from_parts(
     index_path = shar_root / index_filename
     atomic_write_json(index_path, payload)
     return index_path, len(fields["cuts"])
+
+
+def finalize_shar_directory(
+    shar_dir: Path, *, index_filename: str = SHAR_INDEX_FILENAME,
+) -> dict[str, int]:
+    """Check indexed coverage and reuse unchanged partitions' structural evidence.
+
+    Legacy, copied, or changed partitions get the same exhaustive structural
+    check, collecting planning metadata during that scan. The root manifest
+    records the result so subsequent completion checks need only file metadata.
+    """
+    from audio_tokenization.pipelines.lhotse import planning
+    from audio_tokenization.pipelines.lhotse.data import _read_shar_index_fields
+    from audio_tokenization.prepare.atomic_shar import (
+        PARTITION_INDEX_FILE, PARTITION_MANIFEST_FILE,
+    )
+    from audio_tokenization.prepare.validate_shar import (
+        _shard_slices, _validate_shard_slices,
+    )
+
+    shar_dir = Path(shar_dir).resolve()
+
+    def load_validated(directory, expected_index, filename=planning.SHAR_WORK_MANIFEST_FILE):
+        try:
+            manifest = planning.read_shar_work_manifest(directory / filename, require_validation=True)
+            if (
+                manifest.input_shar_dirs == [str(directory)]
+                and manifest.shar_index_filename == expected_index
+            ):
+                return manifest
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+            logger.debug("Scanning SHAR without reusable validation in %s: %s", directory, exc)
+        return None
+
+    manifest = load_validated(shar_dir, index_filename)
+    if manifest is None:
+        slices = _shard_slices(shar_dir, _read_shar_index_fields(shar_dir / index_filename))
+        by_partition = defaultdict(list)
+        for name, fields in slices:
+            by_partition[Path(fields["cuts"][0]).parent].append((name, fields))
+        stats_by_cut = {}
+        pending = []
+        for directory, partition_slices in by_partition.items():
+            validated = (
+                load_validated(directory, PARTITION_INDEX_FILE, PARTITION_MANIFEST_FILE)
+                if directory != shar_dir else None
+            )
+            units = {unit.fields["cuts"][0]: unit for unit in validated.work_units} if validated else {}
+            if validated and set(units) != {fields["cuts"][0] for _, fields in partition_slices}:
+                raise ValueError(f"Root SHAR index does not cover validated partition: {directory}")
+            for name, fields in partition_slices:
+                cut_path = fields["cuts"][0]
+                if cut_path in units:
+                    unit = units[cut_path]
+                    if unit.fields != fields:
+                        raise ValueError(f"Root SHAR field pairing differs from validated partition: {directory}")
+                    stats = unit.to_json()
+                    for key in ("work_unit_id", "shar_dir", "shard_index", "fields"):
+                        stats.pop(key)
+                    stats_by_cut[cut_path] = stats
+                else:
+                    pending.append((cut_path, fields))
+        if pending:
+            _validate_shard_slices(pending, planning_stats=stats_by_cut)
+        manifest = planning.write_shar_work_manifest(
+            shar_dir, index_name=index_filename, validated_stats=stats_by_cut,
+        )
+    return {
+        str(Path(unit.fields["cuts"][0]).relative_to(shar_dir)): unit.cut_count
+        for unit in manifest.work_units
+    }
 
 
 def build_audio_index(audio_root: Path, pattern: str = "**/*.ogg") -> dict[str, str]:
@@ -510,10 +526,7 @@ def run_pool_and_finalize(
     ]
     build_shar_index_for_worker_dirs(Path(shar_dir), worker_dirs)
 
-    from audio_tokenization.prepare.validate_shar import (
-        validate_shar_directory,
-    )
-    counts = validate_shar_directory(Path(shar_dir))
+    counts = finalize_shar_directory(Path(shar_dir))
     logger.info(
         "Validated SHAR: %d cuts across %d shards", sum(counts.values()), len(counts)
     )

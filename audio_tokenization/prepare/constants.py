@@ -15,4 +15,3 @@ _MISSING = object()
 
 WORKER_STATS_FILE = "worker_stats.json"
 PREPARE_SUMMARY_FILE = "prepare_summary.json"
-PREPARE_SHAR_COMMIT_MODE = "atomic"

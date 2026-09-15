@@ -48,7 +48,6 @@ class AudioCacheHandler:
             trim_prefix_tokens=1,
             trim_suffix_tokens=1,
         )
-        stats.errors += encoded.errors
 
         for tokens, cut in encoded.tokens_and_cuts:
             self._writer.add(
@@ -68,10 +67,11 @@ class AudioCacheHandler:
         self.chunks_written += 1
         return self._writer.get_state()
 
-    def get_writer_state(self) -> int:
-        return self._writer.get_state()
-
     def finalize_writer(self):
         if self.chunk_samples > 0:
             self._writer.finalize()
             self.chunks_written += 1
+
+    def abort_writer(self):
+        if getattr(self, "_writer", None) is not None:
+            self._writer.abort()

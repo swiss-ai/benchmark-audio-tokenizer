@@ -142,6 +142,20 @@ flowchart LR
     style SHAR fill:#fff9c4,stroke:#F9A825
 ```
 
+**SoXR is our chosen CPU resampler.** Keep `resampling_backend: soxr`, the existing [conversion default](./configs/pipeline/convert/_common.yaml). It was faster than Lhotse's Torch resampler in our GH200 preparation measurements:
+
+| Input | SoXR | Torch resampler |
+|---|---:|---:|
+| 60-second stereo WAV, 48 → 24 kHz | **99 ms** | 206 ms |
+| 30-second MP3 excerpt | **53 ms** | 124 ms |
+| 30-second Opus excerpt | **191 ms** | 254 ms |
+
+These are median preparation times in NeMo 25.11 with the current Lhotse/TorchAudio dependencies, one CPU thread, the same optimized pipeline, and transparent huge pages disabled. They include decoding, channel resampling, downmix, and intermediate FLAC encoding; they exclude source-file I/O and GPU tokenization. This comparison supports our CPU performance choice, without making a comparative audio-quality claim.
+
+Single-source multichannel downmix decodes the source once per cut, then uses Lhotse's sequential channel transforms, downmix, and FLAC encoding. The decoded source is released when downmix finishes, including on failure; first-channel fallback retains the original cut. The optimization preserves the existing SoXR output.
+
+On Linux, `run ... stage=convert` disables transparent huge pages before loading stage code, and conversion workers inherit the setting. This avoids large resident-memory jumps on GH200 nodes with 512 MiB huge pages. Set `AUDIO_PREPARE_DISABLE_THP=0` to keep the inherited policy when profiling. Other commands and stages do not set this policy.
+
 ---
 
 ## 4. GPU Audio Tokenization
@@ -299,6 +313,8 @@ Each Parquet row stores one clip:
 
 `stage=materialize` reads the interleave cache and assembles final Megatron training sequences. **No GPU needed** — re-run materialization when sequence policy changes; re-tokenization is not required.
 
+Assembly reads memory-mapped token spans and writes one sequence at a time. Dry-run estimates use the same packing iterator. The indexed writer writes contiguous arrays directly and converts their dtype only when needed.
+
 ```mermaid
 flowchart TD
     PQ[("Parquet Cache")] --> SORT["Sort clips by<br>source_id, clip_num"]
@@ -446,6 +462,10 @@ python -m audio_tokenization run \
 
 Each rank processes an independent planned SHAR work subset — no NCCL, no inter-rank communication. Conversion writes `_shar_work_manifest.json`; tokenization writes `_tokenize_assignment.json` for the current launch. See [`planning.py`](./pipelines/lhotse/planning.py) and [`core.py`](./pipelines/lhotse/core.py).
 
+Durable SHAR work manifests use schema 3: roots are relative to the manifest location, and companion fields are relative to their owning root. The planner validates index digests, field pairing, and coverage of every requested root before reuse. Missing, partial, stale, or legacy schema 2 manifests trigger a metadata scan of all requested roots without rewriting the input dataset. Launch snapshots and assignments remain schema 2 with resolved paths for auditing. Index validation assumes prepared shard contents are immutable; it does not hash audio or cut payloads.
+
+Assignment sorts whole SHAR units by cut path and preserves their declared companion pairs. Loading uses Lhotse's public `CutSet.from_shar` auto reader selection and logs `reader_mode=indexed` or `reader_mode=streaming`. Existing shuffle behavior is preserved: streaming shuffles shards, while indexed inputs use Lhotse's indexed cut shuffle. Worker partitioning remains disabled because each rank already owns its planned units.
+
 ```mermaid
 graph TD
     SHAR[("Shar Directory<br>N shards")] --> PLAN["Duration-Aware<br>Assignment Plan"]
@@ -474,3 +494,10 @@ graph TD
     style R1 fill:#fff3e0,stroke:#EF6C00
     style RN fill:#e8eaf6,stroke:#283593
 ```
+
+
+Tokenization stops on inference, write, or finalization errors, including CUDA OOM. It records failed-rank stats and does not publish `_SUCCESS`. `failed_cut_ids` identifies the failed batch (or pending cuts on final flush); `affected_cut_ids` includes cuts since the last completed writer rotation. Some affected cuts may already have been published if a multi-file commit failed partway through, so processing counters are not durable-output counts. Cleanup removes unfinished chunks and preserves chunks with a commit marker. A partial stage requires a fresh output path or an explicit rebuild with `runtime.overwrite=true`; chunk rotation does not save sampler state.
+
+Preparation uses public Lhotse writers inside a private sibling directory, closes and structurally validates each partition, then publishes it with a directory rename. The SHAR payload format remains `cuts.*.jsonl.gz` and `recording.*.tar`; Lhotse may add `.tar.idx` sidecars. Compressed cuts still use streaming: indexed random access requires uncompressed JSONL and TAR files with matching indexes. Work-manifest schema 3 is independent of the SHAR payload format.
+
+Preparation collects planning statistics during that structural pass. Each nonempty partition stores `shar_index.idx` and `_shar_work_manifest.idx`: JSON completion metadata using the existing index and planning schemas. Their suffix keeps them out of Lhotse's field discovery. Root completion checks coverage and file identities before reusing this metadata, so fresh outputs need one cut-manifest pass. Legacy, copied or changed partitions undergo structural validation again, using the existing worker pool. The standalone validation command always performs a full check.

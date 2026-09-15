@@ -213,9 +213,9 @@ def test_validate_runs_structural_check_on_every_shard(tmp_path, monkeypatch):
     seen = []
 
     real = validate_mod._validate_structural_shard
-    def spy(*, shard_name, slice_fields):
+    def spy(*, shard_name, slice_fields, planning_stats=None):
         seen.append(Path(shard_name).name)
-        return real(shard_name=shard_name, slice_fields=slice_fields)
+        return real(shard_name=shard_name, slice_fields=slice_fields, planning_stats=planning_stats)
 
     monkeypatch.setattr(validate_mod, "_validate_structural_shard", spy)
     # num_workers=1 forces the inline single-process path so the spy
@@ -251,7 +251,7 @@ def test_validate_worker_returns_serializable_error_envelope(tmp_path):
     fields = json.loads((shar / "shar_index.json").read_text())["fields"]
     slice_fields = {name: [str(shar / paths[0])] for name, paths in fields.items()}
 
-    result = _validate_shard_worker(("cuts.000000.jsonl.gz", slice_fields))
+    result = _validate_shard_worker(("cuts.000000.jsonl.gz", slice_fields, False))
 
     json.dumps(result)
     assert result["ok"] is False
@@ -691,11 +691,7 @@ def test_validate_passes_on_nodata_nometa_placeholder_pair(tmp_path):
 
 
 def test_validate_wraps_uneven_tar_in_validation_error(tmp_path):
-    """Upstream ``iterate_tarfile_pairwise_metadata`` raises bare
-    ``RuntimeError("Uneven number of files...")`` on odd member counts.
-    The validator must wrap that as ``SharValidationError`` so the CLI's
-    'FAIL: validation error' path fires instead of a raw traceback.
-    """
+    """Odd member counts must surface as a structured validation error."""
     import tarfile as _tarfile
 
     from audio_tokenization.prepare.validate_shar import (
@@ -727,28 +723,11 @@ def test_validate_raises_on_missing_index(tmp_path):
         validate_shar_directory(empty)
 
 
-def test_tar_pair_iterator_requires_metadata_iterator(monkeypatch, tmp_path):
+def test_tar_pair_iterator_does_not_require_fork_metadata_api(monkeypatch, tmp_path):
     import audio_tokenization.prepare.validate_shar as validate_mod
 
-    fake_shar = types.ModuleType("lhotse.shar")
-
-    monkeypatch.setitem(sys.modules, "lhotse.shar", fake_shar)
-
-    with pytest.raises(RuntimeError, match="iterate_tarfile_pairwise_metadata"):
-        next(validate_mod._iter_tar_pair_stems(tmp_path / "missing.tar"))
-
-
-def test_tar_pair_iterator_only_imports_metadata_iterator(monkeypatch, tmp_path):
-    """The validator's only symbol-level dependency on ``lhotse.shar`` is
-    ``iterate_tarfile_pairwise_metadata``. Faking the module with just that
-    attribute must be enough to reach ``tarfile.open`` (which then fails on
-    a missing path — proving we got past the import gate)."""
-    import audio_tokenization.prepare.validate_shar as validate_mod
-
-    fake_shar = types.ModuleType("lhotse.shar")
-    fake_shar.iterate_tarfile_pairwise_metadata = lambda _tar: iter(())
-    monkeypatch.setitem(sys.modules, "lhotse.shar", fake_shar)
-
+    # No metadata iterator extension: file errors must remain observable.
+    monkeypatch.setitem(sys.modules, "lhotse.shar", types.ModuleType("lhotse.shar"))
     with pytest.raises(FileNotFoundError):
         next(validate_mod._iter_tar_pair_stems(tmp_path / "missing.tar"))
 

@@ -37,6 +37,7 @@ import multiprocessing
 import os
 import shutil
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -82,43 +83,34 @@ def _build_shift_sequence(
     start: int, count: int,
     bos_id: int, eos_id: int,
     stt_continue_id: int, tts_continue_id: int,
-) -> list[int]:
+) -> np.ndarray:
     """Build one shift-by-one sequence: A[start] T[start+1] A[start+2] T[start+3] ...
 
     Always starts with audio and ends with text.
     ``count`` must be even (number of clips consumed).
     """
-    seq = [bos_id]
-    for j in range(count):
-        idx = start + j
-        if j % 2 == 0:
-            # Audio clip
-            if j > 0:
-                seq.append(tts_continue_id)
-            seq.extend(run_audio[idx])
-        else:
-            # Text clip
-            seq.append(stt_continue_id)
-            seq.extend(run_text[idx])
-    seq.append(eos_id)
-    return seq
+    parts = [np.array([bos_id], dtype=np.int32)]
+    for j in range(0, count, 2):
+        if j:
+            parts.append(np.array([tts_continue_id], dtype=np.int32))
+        parts.extend((
+            run_audio[start + j], np.array([stt_continue_id], dtype=np.int32), run_text[start + j + 1],
+        ))
+    parts.append(np.array([eos_id], dtype=np.int32))
+    return np.concatenate(parts, dtype=np.int32)
 
 
-def _accumulate_shift_sequences(
-    run_audio, run_text,
+def _iter_shift_spans(
+    audio_lengths, text_lengths,
     offset: int,
     max_seq_len: int,
-    bos_id: int, eos_id: int,
-    stt_continue_id: int, tts_continue_id: int,
-) -> tuple[list[list[int]], list[int]]:
-    """Accumulate shift-by-one sequences for a single run at a given offset.
+) -> Iterator[tuple[int, int, int]]:
+    """Yield (start, clip count, token length) without reading token payloads.
 
-    Returns (sequences, leftover_indices).
+    A count of one denotes an unpaired tail to transcribe. The first pair is
+    always accepted, even when it exceeds the sequence limit.
     """
-    n = len(run_audio)
-    sequences: list[list[int]] = []
-    leftover_indices: list[int] = []
-
+    n = len(audio_lengths)
     i = offset
     while i + 1 < n:
         # Greedily pack pairs into one sequence
@@ -127,30 +119,19 @@ def _accumulate_shift_sequences(
         est_len = 1  # BOS
 
         while i + 1 < n:
-            a_len = len(run_audio[i])
-            t_len = len(run_text[i + 1])
-            transition_cost = 2 if pairs > 0 else 0  # tts + stt tokens
-            pair_cost = a_len + t_len + transition_cost + (1 if pairs == 0 else 0)  # +1 for first stt
+            pair_cost = int(audio_lengths[i]) + int(text_lengths[i + 1]) + (2 if pairs else 1)
             # +1 for EOS
             if est_len + pair_cost + 1 > max_seq_len and pairs > 0:
                 break
-            est_len += a_len + t_len + (2 if pairs > 0 else 1)  # transitions
+            est_len += pair_cost
             pairs += 1
             i += 2
 
-        if pairs > 0:
-            count = pairs * 2
-            seq = _build_shift_sequence(
-                run_audio, run_text, seq_start, count,
-                bos_id, eos_id, stt_continue_id, tts_continue_id,
-            )
-            sequences.append(seq)
+        yield seq_start, pairs * 2, est_len + 1
 
     # Leftover: single clip at the end that couldn't pair
     if i < n:
-        leftover_indices.append(i)
-
-    return sequences, leftover_indices
+        yield i, 1, 3 + int(audio_lengths[i]) + int(text_lengths[i])
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +189,10 @@ def _shift_run_chunk(
             shard_prefixes[bkey] = sp
 
     def _emit(base_key, seq):
+        # List-to-uint16 conversion rejected out-of-range cache IDs. Check
+        # before the writer narrows the int32 array, which otherwise wraps.
+        if dtype == np.uint16 and (seq.min() < 0 or seq.max() > 65535):
+            raise OverflowError("Interleave token IDs are out of bounds for uint16")
         rk = _route(base_key, len(seq))
         builders[rk].add_item(seq)
         builders[rk].end_document()
@@ -222,45 +207,32 @@ def _shift_run_chunk(
         run_text = cache.text.slice(rs, rl)
 
         # Ratio-adjusted: entire run → individual transcribe
-        if r in transcribe_only_runs:
-            for c in range(rl):
-                seq = [bos_id]
-                seq.extend(run_audio[c])
-                seq.append(stt_transcribe_id)
-                seq.extend(run_text[c])
-                seq.append(eos_id)
-                _emit(TR_KEY, seq)
-            continue
-
-        if rl == 1:
-            seq = [bos_id]
-            seq.extend(run_audio[0])
-            seq.append(stt_transcribe_id)
-            seq.extend(run_text[0])
-            seq.append(eos_id)
-            _emit(TR_KEY, seq)
-            continue
-
-        # Multi-clip run → shift-by-one for each offset
-        all_leftover: set[int] = set()
-
-        for oi, offset in enumerate(OFFSETS):
-            sequences, leftovers = _accumulate_shift_sequences(
-                run_audio, run_text, offset, max_seq_len,
-                bos_id, eos_id, stt_continue_id, tts_continue_id,
-            )
-            for seq in sequences:
-                _emit(OFFSET_KEYS[oi], seq)
-            all_leftover.update(leftovers)
+        if r in transcribe_only_runs or rl == 1:
+            transcribe_indices = range(rl)
+        else:
+            # Multi-clip run → shift-by-one for each offset
+            all_leftover: set[int] = set()
+            for oi, offset in enumerate(OFFSETS):
+                for start, count, _ in _iter_shift_spans(
+                    run_audio.lengths, run_text.lengths, offset, max_seq_len,
+                ):
+                    if count == 1:
+                        all_leftover.add(start)
+                        continue
+                    _emit(OFFSET_KEYS[oi], _build_shift_sequence(
+                        run_audio, run_text, start, count,
+                        bos_id, eos_id, stt_continue_id, tts_continue_id,
+                    ))
+            transcribe_indices = sorted(all_leftover)
 
         # Emit leftovers as transcribe
-        for idx in sorted(all_leftover):
-            seq = [bos_id]
-            seq.extend(run_audio[idx])
-            seq.append(stt_transcribe_id)
-            seq.extend(run_text[idx])
-            seq.append(eos_id)
-            _emit(TR_KEY, seq)
+        for idx in transcribe_indices:
+            _emit(TR_KEY, np.concatenate(
+                (np.array([bos_id], dtype=np.int32), run_audio[idx],
+                 np.array([stt_transcribe_id], dtype=np.int32), run_text[idx],
+                 np.array([eos_id], dtype=np.int32)),
+                dtype=np.int32,
+            ))
 
     # Finalize
     result = {}
@@ -338,19 +310,19 @@ def _dry_run_shift(
     for r in range(n_runs):
         rs = int(run_starts[r])
         rl = int(run_lengths[r])
-        run_a = audio_lens[rs: rs + rl].tolist()
-        run_t = text_lens[rs: rs + rl].tolist()
+        run_a = audio_lens[rs: rs + rl]
+        run_t = text_lens[rs: rs + rl]
 
         if r in transcribe_only_runs:
             for c in range(rl):
-                sl = 3 + run_a[c] + run_t[c]
+                sl = 3 + int(run_a[c]) + int(run_t[c])
                 tr_counter["seqs"] += 1
                 tr_counter["tokens"] += sl
                 tr_seq_lens.append(sl)
             continue
 
         if rl == 1:
-            sl = 3 + run_a[0] + run_t[0]
+            sl = 3 + int(run_a[0]) + int(run_t[0])
             tr_counter["seqs"] += 1
             tr_counter["tokens"] += sl
             tr_seq_lens.append(sl)
@@ -358,31 +330,16 @@ def _dry_run_shift(
 
         all_leftover: set[int] = set()
         for oi, offset in enumerate(OFFSETS):
-            # Simulate accumulation
-            i = offset
-            while i + 1 < rl:
-                seq_start = i
-                pairs = 0
-                est_len = 1  # BOS
-                while i + 1 < rl:
-                    a_len = run_a[i]
-                    t_len = run_t[i + 1]
-                    tc = 2 if pairs > 0 else 1
-                    if est_len + a_len + t_len + tc + 1 > max_seq_len and pairs > 0:
-                        break
-                    est_len += a_len + t_len + tc
-                    pairs += 1
-                    i += 2
-                if pairs > 0:
-                    sl = est_len + 1  # +EOS
-                    offset_counters[OFFSET_KEYS[oi]]["seqs"] += 1
-                    offset_counters[OFFSET_KEYS[oi]]["tokens"] += sl
-                    offset_seq_lens[OFFSET_KEYS[oi]].append(sl)
-            if i < rl:
-                all_leftover.add(i)
+            for start, count, sl in _iter_shift_spans(run_a, run_t, offset, max_seq_len):
+                if count == 1:
+                    all_leftover.add(start)
+                    continue
+                offset_counters[OFFSET_KEYS[oi]]["seqs"] += 1
+                offset_counters[OFFSET_KEYS[oi]]["tokens"] += sl
+                offset_seq_lens[OFFSET_KEYS[oi]].append(sl)
 
         for idx in sorted(all_leftover):
-            sl = 3 + run_a[idx] + run_t[idx]
+            sl = 3 + int(run_a[idx]) + int(run_t[idx])
             tr_counter["seqs"] += 1
             tr_counter["tokens"] += sl
             tr_seq_lens.append(sl)

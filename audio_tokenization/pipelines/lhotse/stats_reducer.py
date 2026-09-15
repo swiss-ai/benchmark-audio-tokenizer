@@ -118,6 +118,11 @@ def wait_for_rank_stats(
             if not path.is_file():
                 continue
             for record in load_json_records([path], required_key="rank", logger=logger):
+                if record.get("success") is not True:
+                    raise RuntimeError(
+                        f"Tokenize ranks reported failure: {[record['rank']]}. "
+                        f"{record.get('error', 'See per-rank stats for details.')}"
+                    )
                 parsed[int(record["rank"])] = record
         if expected <= parsed.keys():
             return [parsed[r] for r in sorted(expected)]

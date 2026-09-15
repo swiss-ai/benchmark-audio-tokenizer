@@ -135,3 +135,44 @@ def test_sample_megatron_marks_missing_reference_unscored(tmp_path, monkeypatch)
 
     assert samples[0].expected_text == ""
     assert samples[0].metadata["reference_text_missing"] is True
+
+
+def test_interleave_samples_own_tokens_without_retaining_mapped_views(monkeypatch, tmp_path):
+    import gc
+    import weakref
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from audio_tokenization.interleave import common
+    from audio_tokenization.pipelines.shard_io import StructuredCacheChunkWriter
+
+    writer = StructuredCacheChunkWriter(
+        str(tmp_path), rank=0, partitioning={"type": "hash", "field": "source_id", "num_buckets": 1},
+    )
+    writer.add_rows([
+        {"clip_id": str(i), "source_id": "a", "clip_num": i, "clip_start": None,
+         "speaker": "", "duration": 1.0, "text": "hello", "dataset": "ds",
+         "audio_tokens": [10, 70000 + i, 11], "text_tokens": [1, 2]}
+        for i in range(16)
+    ])
+    writer.finalize()
+    get = common._MemmapTokenAccessor.get
+    spans = []
+
+    def observe_span(accessor, index):
+        span = get(accessor, index)
+        spans.append(weakref.ref(span))
+        return span
+
+    monkeypatch.setattr(common._MemmapTokenAccessor, "get", observe_span)
+    samples = semantic_audio.sample_interleave_cache(
+        tmp_path, decoder=SimpleNamespace(decode_text=lambda tokens: "hello"),
+        num_samples=16, seed=42, max_audio_seconds=None, context_window=1,
+    )
+    assert len(samples) == 16
+    for sample in samples:
+        np.testing.assert_array_equal(sample.audio_tokens, [10, 70000 + sample.metadata["clip_num"], 11])
+        assert sample.expected_text == "hello"
+    gc.collect()
+    assert spans and all(span() is None for span in spans)

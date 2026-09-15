@@ -435,17 +435,31 @@ def _invoke_pipeline_for_assignment(
             world_size=world_size,
         )
 
-    result = _invoke_pipeline(
-        spec,
-        dataset_name=dataset_name,
-        input_shar_dirs=input_shar_dirs,
-        planned_shar_fields=rank_assignment.fields,
-        rank=rank_assignment.rank,
-        world_size=world_size,
-        local_rank=local_rank,
-        final_output_dir=final_output_dir,
-        assigned_cut_count=rank_assignment.cut_count,
-    ) or {}
+    try:
+        result = _invoke_pipeline(
+            spec,
+            dataset_name=dataset_name,
+            input_shar_dirs=input_shar_dirs,
+            planned_shar_fields=rank_assignment.fields,
+            rank=rank_assignment.rank,
+            world_size=world_size,
+            local_rank=local_rank,
+            final_output_dir=final_output_dir,
+            assigned_cut_count=rank_assignment.cut_count,
+        ) or {}
+    except Exception as exc:
+        from audio_tokenization.pipelines.lhotse.stats_reducer import write_rank_stats, zero_rank_stats
+
+        stats_path = final_output_dir / f"rank_{rank_assignment.rank:04d}_stats.json"
+        failure = zero_rank_stats(rank=rank_assignment.rank, world_size=world_size)
+        try:
+            if stats_path.is_file():
+                failure.update(json.loads(stats_path.read_text()))
+            failure.update(success=False, error=failure.get("error") or f"{type(exc).__name__}: {exc}")
+            write_rank_stats(final_output_dir, failure)
+        except Exception:
+            logger.exception("Unable to publish failure for rank %s", rank_assignment.rank)
+        raise
     _ensure_rank_stats(
         final_output_dir,
         result,

@@ -286,7 +286,7 @@ def extract_clip_timestamps(
 
 
 def _projected_columns(*cols) -> list[str]:
-    """Plan a minimal projection for parquet reading."""
+    """Plan required column selectors, omitting redundant struct children."""
     requested: list[str] = []
     for spec in cols:
         if spec is None:
@@ -304,6 +304,31 @@ def _projected_columns(*cols) -> list[str]:
         if not ancestors.intersection(requested_set):
             out.append(col)
     return out
+
+
+def projected_worker_columns(args: ColumnarWorkerArgs) -> list[str]:
+    """Select row fields consumed by either columnar worker, including templates."""
+    template_fields = tuple(
+        match.group(1)
+        for template in (args.derived_custom or {}).values()
+        for match in _CUSTOM_TEMPLATE_RE.finditer(template)
+        if match.group(1) not in {"id", "row_id"}
+    )
+    return _projected_columns(
+        args.audio_column,
+        args.text_column,
+        args.duration_column,
+        args.source_id_column,
+        args.clip_num_column,
+        args.clip_start_column,
+        args.clip_end_column,
+        args.clip_duration_column,
+        args.chunks_column,
+        args.id_column,
+        args.language_column,
+        args.custom_columns,
+        template_fields,
+    )
 
 
 def required_column_roots(*columns) -> set[str]:

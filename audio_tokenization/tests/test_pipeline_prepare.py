@@ -2,8 +2,6 @@ import json
 import copy
 import gzip
 import subprocess
-import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -201,29 +199,6 @@ def test_source_lhotse_runtime_defaults_repo_dir_to_repo_root():
     )
 
     assert proc.stdout == str(repo)
-
-
-def test_prepare_runtime_requires_dev_lhotse_shar_features(monkeypatch):
-    from audio_tokenization.prepare.runtime import require_lhotse_shar_features
-
-    fake_lhotse = types.ModuleType("lhotse")
-    fake_shar = types.ModuleType("lhotse.shar")
-
-    class _CutSet:
-        def to_shar(self, output_dir):  # pragma: no cover - inspected only
-            raise AssertionError
-
-    class _SharWriter:
-        def __init__(self, output_dir):  # pragma: no cover - inspected only
-            raise AssertionError
-
-    fake_lhotse.CutSet = _CutSet
-    fake_shar.SharWriter = _SharWriter
-    monkeypatch.setitem(sys.modules, "lhotse", fake_lhotse)
-    monkeypatch.setitem(sys.modules, "lhotse.shar", fake_shar)
-
-    with pytest.raises(RuntimeError, match="requires dev Lhotse"):
-        require_lhotse_shar_features()
 
 
 def test_prepare_family_runners_canary_resolve_and_preflight(tmp_path):
@@ -1234,7 +1209,7 @@ def test_plan_without_stage_override_inspects_all_stages(monkeypatch):
         seen["stage"] = stage
         return {"convert": {}, "tokenize": {}, "materialize": {}}
 
-    monkeypatch.setattr(audio_main, "plan_stages", _fake_plan)
+    monkeypatch.setattr("audio_tokenization.stages.plan_stages", _fake_plan)
 
     result = audio_main._execute_command("plan", cfg)
 
@@ -1252,7 +1227,7 @@ def test_run_without_stage_override_fails_before_defaulting_to_convert(monkeypat
             raise ValueError("run requires stage=<convert|tokenize|materialize>")
         raise AssertionError(f"unexpected stage default: {stage!r}")
 
-    monkeypatch.setattr(audio_main, "run_stages", _fake_run)
+    monkeypatch.setattr("audio_tokenization.stages.run_stages", _fake_run)
 
     with pytest.raises(ValueError, match="run requires stage"):
         audio_main._execute_command("run", cfg)

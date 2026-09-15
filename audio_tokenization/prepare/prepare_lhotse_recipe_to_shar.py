@@ -25,7 +25,7 @@ from typing import Optional
 
 from audio_tokenization.contracts.artifacts import SHAR_INDEX_FILENAME
 from audio_tokenization.prepare.audio_ops import make_rms_filter_fn, to_mono
-from audio_tokenization.prepare.constants import PREPARE_SHAR_COMMIT_MODE
+from audio_tokenization.prepare.atomic_shar import atomic_shar_partition
 from audio_tokenization.prepare.identity import assign_interleave_metadata
 from audio_tokenization.prepare.runtime import (
     build_shar_index_from_parts,
@@ -128,14 +128,14 @@ def convert_worker(
 
     cuts = cuts.map(_collect_stats)
 
-    cuts.to_shar(
-        output_dir=str(output_dir),
-        fields={"recording": shar_format},
-        shard_size=shar_shard_size,
-        num_jobs=1,
-        verbose=(rank == 0),
-        commit=PREPARE_SHAR_COMMIT_MODE,
-    )
+    with atomic_shar_partition(output_dir, fields=("recording",)) as staged_dir:
+        cuts.to_shar(
+            output_dir=str(staged_dir),
+            fields={"recording": shar_format},
+            shard_size=shar_shard_size,
+            num_jobs=1,
+            verbose=(rank == 0),
+        )
 
     if stats_dir is not None:
         atomic_write_json(stats_dir / f"part-{rank:05d}.json", stats, indent=None)
@@ -276,8 +276,8 @@ def run(spec, *, resolved_inputs: list[str] | None = None):
 
         build_shar_index(shar_dir, i.shar_index_filename, num_workers)
 
-        from audio_tokenization.prepare.validate_shar import validate_shar_directory
-        counts = validate_shar_directory(shar_dir, index_filename=i.shar_index_filename)
+        from audio_tokenization.prepare.runtime import finalize_shar_directory
+        counts = finalize_shar_directory(shar_dir, index_filename=i.shar_index_filename)
         logger.info(
             "Validated SHAR: %d cuts across %d shards",
             sum(counts.values()), len(counts),
